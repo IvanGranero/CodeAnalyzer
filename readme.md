@@ -62,11 +62,44 @@ pip install -r requirements.txt
 **4. Configure Environment Variables**
 Ensure your `.env` or `config.py` file is populated with your specific database and LLM credentials:
 * `neo4j_uri`, `neo4j_user`, `neo4j_password`
-* `genai_subscription_key`, `strong_model_id`, `strong_base_url`
+* `genai_subscription_key`, `genai_subscription_header`
+* `cheap_model_id`, `cheap_base_url`, `cheap_api_version`
+* `strong_model_id`, `strong_base_url`, `strong_api_version`
+
+The application reports missing or invalid settings before starting the scanner. If `.env` is missing, create it in the project directory. Use `python run.py --help` to view command-line usage without configuring the environment first.
+
+Exploit behavior is configured separately in `exploit/.env`:
+
+* `EXPLOIT_MAX_ATTEMPTS` defaults to `5` payload attempts per vulnerability. The strategist may stop earlier by returning `GIVE_UP` or `VALIDATED`.
+* `EXPLOIT_LLM_TIMEOUT` defaults to `120.0` seconds per exploit-agent request. A timeout is recorded for the current attempt, then the loop continues to the next attempt.
+* `PREFLIGHT_CONNECT_RETRIES` defaults to `3` total connection attempts per vulnerability.
+* `PREFLIGHT_CONNECT_RETRY_DELAY` defaults to `2.0` seconds between failed connection attempts.
+
+A failed connection is retried for the current vulnerability before the exploit queue moves to the next one.
 
 ## 💻 Usage
 
 Run the orchestrator using the main `run.py` script. Point it at the root directory of your AutoSAR source code.
+
+### Command-Line Options
+
+Display the built-in usage information at any time:
+
+```bash
+python run.py --help
+```
+
+Command-line parsing happens before environment configuration is loaded, so `--help` and invalid argument combinations show usage even when the `.env` file is not configured. A valid command that starts the scanner still requires the environment variables described in [Prerequisites](#prerequisites).
+
+| Option | Description |
+| --- | --- |
+| `source_dir` | Optional path to the AutoSAR source directory. Defaults to the current directory (`.`). |
+| `--depth {fast,critical,full}` | Selects the scan scope. Defaults to `critical`. |
+| `--skip-ingest` | Reuses the cached discovery configuration and existing Neo4j graph when available. |
+| `--resume` | Loads completed reports from `scan_cache/` and schedules unfinished scans and UDS exploit validations. |
+| `--exploit-only REPORT.json` | Skips discovery, ingestion, domain selection, and static scanning, then executes the exploit loop for each vulnerability in the supplied JSON report. |
+
+The normal scan flow is discovery, graph ingestion, domain selection, static scanning, and exploit validation for findings that are reachable through UDS/DoIP. The `--exploit-only` option is a separate direct-validation mode and does not require a new scan.
 
 ### Standard Run (Critical Depth)
 Parses the codebase, builds the graph, prompts for a domain, and scans the top 50 targets:
@@ -102,6 +135,27 @@ If a scan was interrupted (e.g., via `Ctrl+C`), you can resume without losing pr
 python run.py ./path/to/AutoSAR_Project/ --depth critical --skip-ingest --resume
 ```
 
+### Direct Exploit Validation
+To validate vulnerabilities from an existing JSON report without running discovery, ingestion, or static analysis:
+
+```bash
+python run.py ./path/to/AutoSAR_Project/ --exploit-only ./path/to/vulnerabilities.json
+```
+
+The report must be a JSON object keyed by function name. Each value should contain the vulnerability fields used by the exploit agents, such as `type`, `description`, and optionally `domain`:
+
+```json
+{
+  "DiagnosticHandler": {
+    "type": "Denial of Service",
+    "description": "Malformed diagnostic input can reach an unsafe parser.",
+    "domain": "diag"
+  }
+}
+```
+
+The domain is inferred from the first report entry and passed to every exploit in direct mode. Exploit results are printed in the final log output; this mode does not write a new consolidated scan report.
+
 ## 🏗️ Architecture Pipeline
 
 * **Phase 1: Architectural Discovery**
@@ -118,8 +172,10 @@ python run.py ./path/to/AutoSAR_Project/ --depth critical --skip-ingest --resume
   * **Triage Agent:** Analyzes the target's graph neighborhood to generate specific attack hypotheses.
   * **Deep-Scan Agent:** Executes an asynchronous, strict-JSON static analysis based on the triage directive.
 
-* **Phase 4: Validation**
-  * Translates static analysis findings into actionable exploit scripts.
+* **Phase 4: Exploit Validation**
+  * For UDS/DoIP-reachable findings, the exploit orchestrator uses a crafter, executor, analyzer, and strategist loop to generate payloads and validate ECU behavior.
+
+When `--exploit-only` is supplied, the normal phases are bypassed and execution starts directly with exploit validation from the supplied report.
 
 ## 📊 Reporting
 

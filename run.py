@@ -7,7 +7,6 @@ import asyncio # --- NEW: Native asyncio ---
 from dataclasses import dataclass
 
 # Configuration and Services
-from config import settings
 from llm.service import LLMService
 from graph.manager import GraphManager
 
@@ -21,7 +20,7 @@ from exploit.orchestrator import ExploitOrchestrator
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -43,6 +42,9 @@ async def main():
     parser.add_argument("--skip-ingest", action="store_true")
     parser.add_argument("--exploit-only", type=str, help="Path to a vulnerability JSON report to exploit directly, bypassing the scan.")
     args = parser.parse_args()
+
+    # Load environment-backed settings only after argparse handles --help/errors.
+    from config import settings
 
     target_directory = os.path.abspath(args.source_dir)
     if not os.path.isdir(target_directory):
@@ -83,8 +85,7 @@ async def main():
         print("="*60)
 
         if not os.path.exists(args.exploit_only):
-            logger.error(f"Report file not found: {args.exploit_only}")
-            sys.exit(1)
+            parser.error(f"report file not found: {args.exploit_only}")
 
         with open(args.exploit_only, 'r') as f:
             pre_existing_report = json.load(f)
@@ -99,7 +100,10 @@ async def main():
         target_domain = pre_existing_report[first_key].get("domain", "all")
         logger.info(f"Target domain inferred as: {target_domain}")
 
-        exploit_orch = ExploitOrchestrator(target_domain=target_domain)
+        exploit_orch = ExploitOrchestrator(
+            target_domain=target_domain,
+            llm_service=app_context.llm
+        )
 
         results = {}
 
@@ -108,10 +112,11 @@ async def main():
             logger.info(f"🛡️ [EXPLOIT-ONLY] Processing vulnerability for {func_name}...")
 
             try:
+                vuln_entry = dict(vuln_entry)
+                vuln_entry["function_name"] = func_name
                 result = await exploit_orch.execute_exploit_loop(
                     vulnerability_report=vuln_entry,   # <-- ONE vulnerability only
-                    target_domain=target_domain,
-                    llm_service=app_context.llm
+                    target_domain=target_domain
                 )
                 results[func_name] = result
 
@@ -241,11 +246,15 @@ async def main():
                     report, func_name, domain = item
                     logger.info(f"🛡️ [EXPLOIT QUEUE] Popped vulnerability for {func_name}. Initiating exploit...")
                     try:
-                        exploit_orch = ExploitOrchestrator(target_domain=domain)
-                        result = await exploit_orch.execute_exploit_loop(
-                            vulnerability_report=report,
+                        exploit_orch = ExploitOrchestrator(
                             target_domain=domain,
                             llm_service=app_context.llm
+                        )
+                        report = dict(report)
+                        report["function_name"] = func_name
+                        result = await exploit_orch.execute_exploit_loop(
+                            vulnerability_report=report,
+                            target_domain=domain
                         )
 
                         report["exploit_validation"] = result                        

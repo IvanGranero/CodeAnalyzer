@@ -1,5 +1,7 @@
 import logging
+import os
 from typing import Optional
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -14,7 +16,7 @@ class AppConfig(BaseSettings):
     # --- GenAI / Auth --------------------------------------------------------
     # No default value means this MUST be present in the .env file
     genai_subscription_key: str 
-    genai_subscription_header: str = "genaiplatform-farm-subscription-key"
+    genai_subscription_header: str = ""
 
     # --- Cheap tier ("orchestrator") -----------------------------------------
     cheap_model_id: str
@@ -50,6 +52,30 @@ class AppConfig(BaseSettings):
 # Initialize the settings globally
 try:
     settings = AppConfig()
+except ValidationError as e:
+    missing = [
+        str(error["loc"][0])
+        for error in e.errors()
+        if error.get("type") == "missing"
+    ]
+    invalid = [
+        str(error["loc"][0])
+        for error in e.errors()
+        if error.get("type") != "missing"
+    ]
+
+    logger.critical("Configuration could not be loaded.")
+    if not os.path.exists(".env"):
+        logger.critical("No .env file was found in the current directory.")
+    if missing:
+        logger.critical("Missing required settings: %s", ", ".join(missing))
+    if invalid:
+        logger.critical("Invalid settings: %s", ", ".join(invalid))
+    logger.critical(
+        "Create or update .env using the configuration variables documented "
+        "in readme.md, then run the command again."
+    )
+    raise SystemExit(2)
 except Exception as e:
-    logger.critical(f"Configuration Error. Missing or invalid environment variables:\n{e}")
-    raise SystemExit(1)
+    logger.critical("Configuration could not be loaded: %s", e)
+    raise SystemExit(2)
