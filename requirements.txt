@@ -1,0 +1,13 @@
+# Graph Database & Validation
+neo4j>=5.14.0
+pydantic>=2.5.0
+#Environment Settings Management
+pydantic-settings>=2.0.0
+
+# AST Parsing (C/C++ AutoSAR Code)
+tree-sitter>=0.21.0
+tree-sitter-c
+tree-sitter-cpp
+
+# LLM Integration (OpenAI-compatible SDK)
+openai>=1.12.0
