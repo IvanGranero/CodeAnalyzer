@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+venv/
+orchestrator_state.json
+reports/
+logs/
+scan_cache/
