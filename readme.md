@@ -118,8 +118,8 @@ python run.py ./path/to/AutoSAR_Project/ --depth critical --skip-ingest --resume
   * **Triage Agent:** Analyzes the target's graph neighborhood to generate specific attack hypotheses.
   * **Deep-Scan Agent:** Executes an asynchronous, strict-JSON static analysis based on the triage directive.
 
-* **Phase 4: Validation (Future)**
-  * Translates static analysis findings into actionable `python-can` exploit scripts for Hardware-in-the-Loop (HIL) testing.
+* **Phase 4: Validation**
+  * Translates static analysis findings into actionable exploit scripts.
 
 ## 📊 Reporting
 
