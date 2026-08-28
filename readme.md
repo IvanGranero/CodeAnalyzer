@@ -1,4 +1,4 @@
-# AutoSAR Multi-Agent Vulnerability Scanner
+# Multi-Agent Vulnerability Scanner
 
 An enterprise-grade, asynchronous SAST (Static Application Security Testing) platform designed specifically for automotive AutoSAR C/C++ codebases. By combining **Neo4j Code Property Graphs (CPG)** with **Asynchronous LLM Agents**, this tool autonomously maps attack surfaces, traces UDS taint, prioritizes critical functions, and mathematically proves vulnerabilities—all while scaling concurrently.
 
@@ -33,8 +33,8 @@ Follow these steps to get your environment set up and ready for scanning:
 Navigate to your desired workspace and clone the project:
 
 ```bash
-git clone https://github.com/your-repo/AutoSAR-CodeAnalyzer.git
-cd AutoSAR-CodeAnalyzer
+git clone https://github.com/IvanGranero/CodeAnalyzer.git
+cd CodeAnalyzer
 ```
 
 **2. Create a Python Virtual Environment**
