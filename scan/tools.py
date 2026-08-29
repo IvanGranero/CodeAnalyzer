@@ -86,29 +86,36 @@ class AnalyzerTools:
     def read_file_span(self, storage_uri: str, byte_span: str) -> str:
         """Reads exactly the requested bytes from a C/C++ source file."""
         if not storage_uri or not byte_span:
+            logger.info("[File Read] Missing storage_uri or byte_span; cannot read snippet")
             return "Error: Must provide both storage_uri and byte_span."
-            
+
         # Check Agent Memory
         if self._check_cache("read_file_span", f"{storage_uri}_{byte_span}"):
+            logger.info(f"[File Read] Skipping already-read file span for '{storage_uri}' '{byte_span}'")
             return "System Note: You have already read this exact file span. It is in your conversation history. Do not request it again."
-            
+
         # Robust Windows/Linux URI parsing
         file_path = storage_uri
         if file_path.startswith("file://"):
             file_path = file_path[7:]
-            
+
         if os.name == 'nt' and file_path.startswith('/') and ':' in file_path:
-            file_path = file_path[1:] 
-            
+            file_path = file_path[1:]
+
+        logger.info(f"[File Read] Reading file span '{byte_span}' from '{file_path}'")
+
         try:
             start_byte, end_byte = map(int, byte_span.split('-'))
             with open(file_path, 'rb') as f:
                 f.seek(start_byte)
                 snippet = f.read(end_byte - start_byte)
+                logger.info(f"[File Read] Loaded {len(snippet)} bytes from '{file_path}'")
                 return snippet.decode('utf-8', errors='ignore')
         except FileNotFoundError:
+            logger.warning(f"[File Read] File not found: '{file_path}'")
             return f"Error: The file {file_path} was not found on disk."
         except Exception as e:
+            logger.warning(f"[File Read] Failed to read '{file_path}': {e}")
             return f"Error reading file from disk: {e}"
 
     def get_callers_and_entry_points(self, func_name: str) -> str:

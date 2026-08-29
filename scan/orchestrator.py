@@ -16,6 +16,122 @@ class ScanOrchestrator:
         # Tools remain synchronous!
         self.tools_engine = AnalyzerTools(graph_manager)
 
+    def _extract_json_object(self, response_text: str) -> Dict[str, Any]:
+        """Extract the first JSON object from an LLM response and parse it."""
+        if not response_text:
+            raise ValueError("Empty response from LLM")
+
+        cleaned = response_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+
+        start_idx = cleaned.find('{')
+        end_idx = cleaned.rfind('}')
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            raise ValueError(f"No JSON object found in response: {response_text[:200]}")
+
+        return json.loads(cleaned[start_idx:end_idx + 1])
+
+    def _fetch_follow_up_artifact(self, request: Dict[str, Any]) -> str:
+        """Fetch a minimal artifact requested by the triage/deep-scan agent."""
+        kind = request.get("kind", "unknown")
+        func_name = request.get("function")
+        symbol = request.get("symbol")
+        file_name = request.get("file")
+        macro = request.get("macro")
+        span = request.get("span") or {}
+
+        logger.info(f"[Follow-up] Requesting artifact kind='{kind}' function='{func_name}' symbol='{symbol}' file='{file_name}' macro='{macro}'")
+
+        if kind in {"caller_impl", "callee_impl", "full_function_body"} and func_name:
+            logger.info(f"[Follow-up] Retrieving source snippet for function '{func_name}'")
+            snippet = self._get_target_source(func_name)
+            return f"FOLLOW-UP ARTIFACT ({kind}):\nFunction: {func_name}\n\n{snippet}"
+
+        if kind == "global_initializer" and symbol:
+            logger.info(f"[Follow-up] Looking up global initializer '{symbol}' in graph")
+            query = """
+            MATCH (n)
+            WHERE n.name = $symbol
+            RETURN n.name AS name, labels(n) AS labels, n.storage_uri AS file, n.byte_span AS span
+            LIMIT 5
+            """
+            try:
+                with self.tools_engine.db.driver.session() as session:
+                    rows = session.run(query, symbol=symbol).data()
+                if rows:
+                    return "FOLLOW-UP ARTIFACT (global_initializer):\n" + json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+            except Exception as exc:
+                logger.warning(f"Failed to resolve global initializer '{symbol}': {exc}")
+            return f"FOLLOW-UP ARTIFACT (global_initializer):\nSymbol {symbol} not found in graph."
+
+        if kind == "header_macro" and macro:
+            logger.info(f"[Follow-up] Fetching macro definition for '{macro}' from '{file_name or 'unknown'}'")
+            return f"FOLLOW-UP ARTIFACT (header_macro):\nMacro requested: {macro}\nFile: {file_name or 'unknown'}\nRelevant span: {json.dumps(span, ensure_ascii=False)}"
+
+        if kind == "build_flag":
+            logger.info("[Follow-up] Build flags requested but unavailable in the repository snapshot")
+            return "FOLLOW-UP ARTIFACT (build_flag):\nBuild flags not available in the repository snapshot; mark as unknown unless explicitly provided."
+
+        if kind == "related_taint_path":
+            logger.info("[Follow-up] Retrieving related taint-path context")
+            return f"FOLLOW-UP ARTIFACT (related_taint_path):\nRequested path context: {json.dumps(request, ensure_ascii=False)}"
+
+        logger.info(f"[Follow-up] Unhandled artifact kind '{kind}'; request requires manual review")
+        return f"FOLLOW-UP ARTIFACT ({kind}):\nNo retriever implemented; request requires manual review."
+
+    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "") -> Dict[str, Any]:
+        """Run the triage agent and parse its structured response."""
+        try:
+            response_text = await self.llm.execute_task(
+                task_name="triage_agent",
+                kwargs={
+                    "graph_json": graph_json,
+                    "graph_summary": graph_summary,
+                    "source_code": source_code,
+                    "directive": directive,
+                    "follow_up_context": follow_up_context,
+                },
+            )
+            return self._extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(f"Triage did not return JSON. Falling back to conservative directive. Error: {exc}")
+            return {
+                "decision": "request_more",
+                "confidence": 0.2,
+                "reason": "Triage output was not valid JSON; requesting more context conservatively.",
+                "follow_up_requests": [],
+            }
+
+    async def _deep_scan_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "") -> Dict[str, Any]:
+        """Run the deep-scan agent and parse its structured response."""
+        try:
+            response_text = await self.llm.execute_task(
+                task_name="deep_scan_agent",
+                kwargs={
+                    "graph_json": graph_json,
+                    "graph_summary": graph_summary,
+                    "source_code": source_code,
+                    "directive": directive,
+                    "follow_up_context": follow_up_context,
+                },
+            )
+            return self._extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(f"Deep scan did not return JSON. Error: {exc}")
+            return {
+                "vulnerability_found": False,
+                "severity": "Informational",
+                "details": "Deep scan failed to return valid JSON; partial analysis only.",
+                "confidence": "low",
+                "needs_human_review": True,
+                "follow_up_requests": [],
+            }
+
     # --- REMAINS SYNCHRONOUS ---
     def _get_target_source(self, func_name: str) -> str:
         query = "MATCH (f:Function {name: $func_name}) RETURN f.storage_uri AS uri, f.byte_span AS span LIMIT 1"
@@ -28,11 +144,11 @@ class ScanOrchestrator:
         except Exception as e:
             return f"// Error retrieving source code: {e}"
 
-    # --- CHANGED: ASYNC (Calls LLM) ---
+    # --- ASYNC (Calls LLM) ---
     async def scan_function(self, target_function_name: str) -> Dict[str, Any]:
-        """Runs the scan pipeline. Awaits the LLM calls to free the event loop."""
+        """Runs the scan pipeline with bounded follow-up loops for targeted missing evidence."""
         logger.info(f"=== Starting Scan for '{target_function_name}' ===")
-        
+
         try:
             def safe_eval(tool_output: str):
                 tool_output = tool_output.strip()
@@ -40,8 +156,7 @@ class ScanOrchestrator:
                     try: return eval(tool_output)
                     except: return None
                 return None
-            
-            # Sync DB calls
+
             metadata_str = self.tools_engine.get_function_metadata(target_function_name)
             metadata_list = safe_eval(metadata_str)
             metadata = metadata_list[0] if isinstance(metadata_list, list) and metadata_list else {}
@@ -56,44 +171,75 @@ class ScanOrchestrator:
             logger.error(f"Failed to build graph context for {target_function_name}: {e}")
             return {"vulnerability_found": False, "details": "Failed during graph context creation.", "metadata": metadata}
 
-        logger.info(f"Generating directive for '{target_function_name}'...")
-        # --- AWAIT LLM CALL ---
-        directive = await self._generate_analysis_directive(graph_json, graph_summary)
-        
-        logger.info(f"Passing compact Neo4j JSON + summary to Deep-Scan Agent for '{target_function_name}'...")
-        try:
-            # --- AWAIT LLM CALL ---
-            response_text = await self.llm.execute_task(
-                task_name="deep_scan_agent",
-                kwargs={
-                    "graph_json": graph_json,
-                    "graph_summary": graph_summary,
-                    "source_code": source_code,
-                    "directive": directive,
-                }
-            )
-            
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}')
-            
-            if start_idx != -1 and end_idx != -1:
-                json_string = response_text[start_idx:end_idx + 1]
-                report = json.loads(json_string)
-                report['metadata'] = metadata
-                return report
-            else:
-                logger.error(f"Deep Scan output for {target_function_name} did not contain JSON.\nRAW RESPONSE:\n{response_text}")
-                return {"vulnerability_found": False, "details": "Scan failed: No JSON object found in response.", "metadata": metadata}
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON for {target_function_name}: {e}")
-            return {"vulnerability_found": False, "details": "Scan failed due to invalid JSON format.", "metadata": metadata}
-        except asyncio.CancelledError:
-            # Handle graceful cancellation!
-            logger.warning(f"Scan for {target_function_name} was cancelled.")
-            raise
-        except Exception as e:
-            return {"vulnerability_found": False, "details": f"Scan failed for {target_function_name}: {e}", "metadata": metadata}
+        triage_budget = 1
+        deep_budget = 3
+        seen_artifacts = set()
+        follow_up_context = ""
+        directive = "Perform a standard check for logic flaws."
+
+        while triage_budget >= 0:
+            logger.info(f"Running triage for '{target_function_name}' (remaining budget: {triage_budget})")
+            triage = await self._triage_target(graph_json, graph_summary, source_code, directive, follow_up_context)
+            decision = triage.get("decision", "escalate")
+            requests = triage.get("follow_up_requests") or []
+
+            if decision in {"ignore", "escalate"}:
+                break
+
+            if decision == "request_more" and requests and triage_budget > 0:
+                triage_budget -= 1
+                request = requests[0]
+                artifact_key = (request.get("kind"), request.get("file"), request.get("function"), request.get("symbol"), request.get("macro"), json.dumps(request.get("span", {}), sort_keys=True))
+                if artifact_key not in seen_artifacts:
+                    seen_artifacts.add(artifact_key)
+                    follow_up_context = self._fetch_follow_up_artifact(request)
+                    directive = triage.get("reason") or directive
+                    continue
+                break
+
+            break
+
+        last_report = None
+        while deep_budget >= 0:
+            logger.info(f"Running deep scan for '{target_function_name}' (remaining budget: {deep_budget})")
+            deep_response = await self._deep_scan_target(graph_json, graph_summary, source_code, directive, follow_up_context)
+            last_report = deep_response
+
+            follow_up_requests = deep_response.get("follow_up_requests") or []
+            if follow_up_requests and deep_budget > 0:
+                deep_budget -= 1
+                request = follow_up_requests[0]
+                artifact_key = (request.get("kind"), request.get("file"), request.get("function"), request.get("symbol"), request.get("macro"), json.dumps(request.get("span", {}), sort_keys=True))
+                if artifact_key not in seen_artifacts:
+                    seen_artifacts.add(artifact_key)
+                    follow_up_context = self._fetch_follow_up_artifact(request)
+                    continue
+
+            if deep_response.get("needs_human_review") or deep_response.get("decision") == "needs_more_context":
+                if deep_budget <= 0:
+                    break
+
+            if not follow_up_requests:
+                break
+
+            if deep_budget <= 0:
+                break
+
+        if last_report is None:
+            last_report = {
+                "vulnerability_found": False,
+                "severity": "Informational",
+                "details": "Scan completed without a final deep-scan verdict.",
+                "confidence": "low",
+                "needs_human_review": True,
+            }
+
+        if isinstance(last_report, dict):
+            last_report["metadata"] = metadata
+            return last_report
+
+        logger.error(f"Deep Scan output for {target_function_name} was not a dictionary: {last_report}")
+        return {"vulnerability_found": False, "details": "Scan failed: invalid final result.", "metadata": metadata}
 
     # --- CHANGED: ASYNC (Calls LLM) ---
     async def _generate_analysis_directive(self, graph_json: str, graph_summary: str) -> str:
@@ -105,7 +251,12 @@ class ScanOrchestrator:
                     "graph_summary": graph_summary,
                 },
             )
+            parsed = self._extract_json_object(directive)
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False)
             return directive if directive.strip() else "Perform a standard check for logic flaws."
+        except (ValueError, json.JSONDecodeError):
+            return "Perform a standard check for logic flaws."
         except asyncio.CancelledError:
             raise
         except Exception:
