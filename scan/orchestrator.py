@@ -12,73 +12,9 @@ logger = logging.getLogger(__name__)
 class ScanOrchestrator:
     def __init__(self, llm_service: LLMService, graph_manager: GraphManager):
         self.llm = llm_service
+        self.graph_resolver = graph_manager.resolver
         # Tools remain synchronous!
         self.tools_engine = AnalyzerTools(graph_manager)
-
-    # --- REMAINS SYNCHRONOUS (Fast DB/File I/O) ---
-    def _build_markdown_dossier(self, func_name: str) -> str:
-        """Deterministically builds a highly-structured Markdown Dossier in milliseconds."""
-        logger.info(f"Gathering Graph Neighborhood Context for '{func_name}'...")
-        
-        def safe_eval(tool_output: str):
-            tool_output = tool_output.strip()
-            if tool_output.startswith('[') or tool_output.startswith('{'):
-                try: return eval(tool_output)
-                except: return None
-            return None
-
-        # Synchronous calls to the DB
-        source_code = self._get_target_source(func_name)
-        metadata = safe_eval(self.tools_engine.get_function_metadata(func_name))
-        callers = safe_eval(self.tools_engine.get_callers_and_entry_points(func_name))
-        callees = safe_eval(self.tools_engine.get_callees(func_name))
-        vars_access = safe_eval(self.tools_engine.get_variable_access(func_name))
-        
-        md = []
-        md.append(f"# VULNERABILITY DOSSIER: `{func_name}`\n")
-        
-        md.append("## 1. SOURCE CODE")
-        md.append("```c\n" + source_code.strip() + "\n```\n")
-        
-        md.append("## 2. ATTACK SURFACE & METADATA")
-        if isinstance(metadata, list) and metadata:
-            meta = metadata[0]
-            md.append(f"- **Tainted by UDS:** {meta.get('TaintedByUDS', False)}")
-            dids = meta.get('DIDs')
-            if dids: md.append(f"- **Reachable DIDs:** {', '.join(dids)}")
-            md.append(f"- **Is Vendor Library:** {meta.get('IsVendorLibrary', False)}\n")
-        else:
-            md.append("- No metadata found.\n")
-            
-        md.append("## 3. UPSTREAM TRIGGERS (Who calls this?)")
-        if isinstance(callers, dict):
-            md.append(f"- **UDS Triggers:** {', '.join(callers.get('UdsTriggers', [])) or 'None'}")
-            md.append(f"- **Network Triggers:** {', '.join(callers.get('NetworkTriggers', [])) or 'None'}")
-            md.append(f"- **Standard C Callers:** {', '.join(callers.get('StandardCallers', [])) or 'None'}")
-            md.append(f"- **Is OS/Hardware Task:** {callers.get('IsHardwareTask', False)}\n")
-        else:
-            md.append("- No upstream context found.\n")
-            
-        md.append("## 4. DOWNSTREAM CALLS (What does this call?)")
-        if isinstance(callees, list) and callees:
-            for c in callees:
-                warn = " (WARNING: Unparsed Stub)" if c.get('IsStubNode') else ""
-                danger = " ⚠️ [DANGEROUS SINK]" if c.get('IsDangerousSink') else ""
-                md.append(f"- `{c.get('CalledFunction')}`{danger}{warn}")
-        else:
-            md.append("- No downstream calls found.")
-        md.append("\n")
-            
-        md.append("## 5. GLOBAL VARIABLE ACCESS")
-        if isinstance(vars_access, list) and vars_access:
-            reads = [v['VariableName'] for v in vars_access if v['AccessType'] == 'READS_VAR']
-            writes = [v['VariableName'] for v in vars_access if v['AccessType'] == 'WRITES_VAR']
-            md.append(f"- **Reads:** {', '.join(reads) or 'None'}")
-            md.append(f"- **Writes:** {', '.join(writes) or 'None'}")
-        else:
-            md.append("- No global variable access found.")
-            
-        return "\n".join(md)
 
     # --- REMAINS SYNCHRONOUS ---
     def _get_target_source(self, func_name: str) -> str:
@@ -114,22 +50,27 @@ class ScanOrchestrator:
             metadata = {}
 
         try:
-            # Sync Dossier build
-            full_dossier = self._build_markdown_dossier(target_function_name)
+            source_code = self._get_target_source(target_function_name)
+            graph_json, graph_summary = self.graph_resolver.serialize_function_neighborhood(target_function_name)
         except Exception as e:
-            logger.error(f"Failed to build dossier for {target_function_name}: {e}")
-            return {"vulnerability_found": False, "details": "Failed during dossier creation.", "metadata": metadata}
+            logger.error(f"Failed to build graph context for {target_function_name}: {e}")
+            return {"vulnerability_found": False, "details": "Failed during graph context creation.", "metadata": metadata}
 
         logger.info(f"Generating directive for '{target_function_name}'...")
         # --- AWAIT LLM CALL ---
-        directive = await self._generate_analysis_directive(full_dossier)
+        directive = await self._generate_analysis_directive(graph_json, graph_summary)
         
-        logger.info(f"Passing Dossier to Deep-Scan Agent for '{target_function_name}'...")
+        logger.info(f"Passing compact Neo4j JSON + summary to Deep-Scan Agent for '{target_function_name}'...")
         try:
             # --- AWAIT LLM CALL ---
             response_text = await self.llm.execute_task(
                 task_name="deep_scan_agent",
-                kwargs={"dossier": full_dossier, "directive": directive}
+                kwargs={
+                    "graph_json": graph_json,
+                    "graph_summary": graph_summary,
+                    "source_code": source_code,
+                    "directive": directive,
+                }
             )
             
             start_idx = response_text.find('{')
@@ -155,63 +96,33 @@ class ScanOrchestrator:
             return {"vulnerability_found": False, "details": f"Scan failed for {target_function_name}: {e}", "metadata": metadata}
 
     # --- CHANGED: ASYNC (Calls LLM) ---
-    async def _generate_analysis_directive(self, dossier: str) -> str:
+    async def _generate_analysis_directive(self, graph_json: str, graph_summary: str) -> str:
         try:
-            directive = await self.llm.execute_task(task_name="triage_agent", kwargs={"dossier": dossier})
+            directive = await self.llm.execute_task(
+                task_name="triage_agent",
+                kwargs={
+                    "graph_json": graph_json,
+                    "graph_summary": graph_summary,
+                },
+            )
             return directive if directive.strip() else "Perform a standard check for logic flaws."
         except asyncio.CancelledError:
             raise
         except Exception:
             return "Perform a standard check for logic flaws."
 
-    # --- CHANGED: ASYNC (Calls LLM) ---
+    # --- ASYNC (Calls LLM) ---
     async def prioritize_targets(self, scan_depth: str, max_targets: int, domain_filter: str = None) -> list:
         logger.info(f"=== Starting Target Prioritization Phase (Depth: {scan_depth.upper()}) ===")
-        
-        cypher_filter = ""
+
         if domain_filter:
-            cypher_filter = f"AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\\\{domain_filter}\\\\')"
             logger.info(f"Applying domain filter: Scanning functions within '{domain_filter}'...")
         else:
             logger.info("Extracting metrics for ALL active candidates from Neo4j...")
-        
-        query = f"""
-        MATCH (f:Function)
-        WHERE coalesce(f.is_vendor_code, false) = false 
-          AND coalesce(f.is_dead_code, false) = false
-          AND NOT f:Stub
-          {cypher_filter}
-          
-        OPTIONAL MATCH (f)-[:CALLS*1..3]->(sink:Function {{is_dangerous_sink: true}})
-        OPTIONAL MATCH (f)-[w:WRITES_VAR]->(v:GlobalVariable)
-        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
-        OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
-        
-        WITH f, 
-             count(DISTINCT sink) AS DangerousSinksReached,
-             count(DISTINCT w) AS GlobalVariableWrites,
-             count(DISTINCT uds) > 0 AS IsDirectUdsHandler,
-             count(DISTINCT net) > 0 AS IsDirectNetworkHandler
-             
-        WHERE coalesce(f.tainted_by_uds, false) = true OR DangerousSinksReached > 0 OR GlobalVariableWrites > 0
-        
-        RETURN {{
-            FunctionName: f.name,
-            TaintedByUDS: coalesce(f.tainted_by_uds, false),
-            IsUdsHandler: IsDirectUdsHandler,
-            IsNetworkHandler: IsDirectNetworkHandler,
-            DangerousSinksReached: DangerousSinksReached,
-            GlobalVariableWrites: GlobalVariableWrites
-        }} AS Metrics
-        ORDER BY DangerousSinksReached DESC, GlobalVariableWrites DESC, coalesce(f.tainted_by_uds, false) DESC
-        """
-        
+
         try:
-            # Synchronous DB query
-            with self.tools_engine.db.driver.session() as session:
-                results = session.run(query).data()
-                metrics_list = [r["Metrics"] for r in results]
-                
+            metrics_list = self.graph_resolver.get_candidate_metrics(domain_filter=domain_filter)
+
             if not metrics_list:
                 logger.warning("No dangerous candidate functions found in the graph for the selected domain.")
                 return []

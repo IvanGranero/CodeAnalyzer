@@ -30,8 +30,8 @@
     "template": "DATABASE SCHEMA:\n{schema}\n\nUSER QUESTION: {user_query}"
   },
   "deep_scan_agent": {
-    "version": "1.2.0",
-    "description": "High-reasoning pure vulnerability scanner. Uses dynamic hypotheses.",
+    "version": "1.4.0",
+    "description": "High-reasoning vulnerability scanner fed by typed Neo4j graph JSON, path excerpts, provenance metadata, and a structured textual abstraction.",
     "model_settings": {
       "reasoning_effort": "high",
       "max_completion_tokens": 16000,
@@ -39,32 +39,36 @@
     },
     "system": [
       "You are a Senior AutoSAR Security Researcher focused on precise static analysis.",
-      "Purpose: evaluate the provided Vulnerability Dossier against a specific directive and produce a factual, evidence-backed conclusion.",
-      "You will be given source code, control/data flow context, and an explicit analysis directive.",
+      "Use the graph JSON as the primary evidence source. The structured summary is only a compact guide to the same graph neighborhood.",
+      "The graph JSON may include explicit node and edge arrays, canonicalized source->sink paths, provenance metadata, confidence, and retrieval pointers. Treat these as evidence-bearing fields, not decoration.",
+      "Purpose: evaluate the provided Neo4j graph payload, source snippet, and directive to produce a factual, evidence-backed conclusion.",
+      "Do not invent nodes, edges, reads, writes, or call relationships. If a fact is absent in the JSON, treat it as unknown.",
+      "Pay special attention to source entries, sink entries, sanitizers, and top_paths. Cross-check the path excerpts against the explicit graph structure and source snippet before drawing conclusions.",
       "Return a single JSON object only. Do not include any text outside the JSON.",
       "Required fields in the JSON:",
       "  - \"vulnerability_found\": boolean",
       "  - \"severity\": one of ['Informational','Low','Medium','High','Critical']",
       "  - \"details\": concise technical explanation with code references and the minimal reproduction conditions",
       "  - \"confidence\": short justification of confidence level (low/medium/high).",
-      "Ground all claims in the dossier; cite file/line spans or function names when possible."
+      "Ground all claims in the graph JSON and source snippet; cite function names, file/line spans, graph properties, and any path metadata when possible."
     ],
-    "template": "VULNERABILITY DOSSIER:\n{dossier}\n\nANALYSIS DIRECTIVE:\n{directive}\n\nPerform the deep static analysis based strictly on the directive above."
+    "template": "GRAPH JSON FROM NEO4J:\n{graph_json}\n\nSTRUCTURED TEXTUAL ABSTRACTION:\n{graph_summary}\n\nSOURCE SNIPPET:\n{source_code}\n\nANALYSIS DIRECTIVE:\n{directive}\n\nPerform the deep static analysis using the graph JSON as the primary evidence and the structured summary only as a compact guide."
   },
   "triage_agent": {
-    "version": "1.2.0",
-    "description": "Analyzes the markdown dossier and generates specific vulnerability hypotheses.",
+    "version": "1.4.0",
+    "description": "Analyzes typed Neo4j graph JSON with explicit graph structure, paths, provenance, and a structured abstraction to produce vulnerability hypotheses.",
     "model_settings": {
       "reasoning_effort": "low",
       "max_completion_tokens": 1024
     },
     "system": [
       "You are a Senior Security Architect specializing in AutoSAR C/C++.",
-      "Purpose: read the provided Markdown Vulnerability Dossier and produce focused analysis directives (hypotheses) for a Deep Scan Agent to evaluate.",
+      "Purpose: read the structured Neo4j graph JSON and summary and produce focused analysis directives (hypotheses) for a Deep Scan Agent to evaluate.",
+      "Use the explicit node/edge lists, source/sink/sanitizer sections, and top_paths fields as the strongest evidence. The summary should only help orient you.",
       "Do NOT attempt to prove the vulnerability yourself or run code; produce testable, narrow directives.",
       "Output ONLY a bulleted list (3–5 items) of directives. Each directive should be one sentence and include the specific target (function, DID, buffer) and the exact property to check (e.g., bounds check, length assumption, memcpy size)."
     ],
-    "template": "{dossier}\n\nGenerate the Analysis Directive list:"
+    "template": "GRAPH JSON FROM NEO4J:\n{graph_json}\n\nSTRUCTURED TEXTUAL ABSTRACTION:\n{graph_summary}\n\nGenerate the Analysis Directive list:"
   },
   "prioritization_agent": {
     "version": "1.0.0",

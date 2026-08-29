@@ -1,4 +1,6 @@
+import json
 import logging
+from typing import Any, Dict, List, Optional, Tuple
 from graph.manager import GraphManager
 
 logger = logging.getLogger(__name__)
@@ -9,8 +11,309 @@ class GraphResolver:
     Bakes semantic meaning (taint, data flow, dead code) directly into Neo4j.
     """
     
-    def __init__(self, graph_manager: GraphManager):
-        self.db = graph_manager.db
+    def __init__(self, db: Any):
+        self.db = db
+
+    def serialize_function_neighborhood(
+        self,
+        func_name: str,
+        verbosity: str = "medium",
+        retrieval_pointer: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Query a function neighborhood from Neo4j and serialize it as structured graph JSON."""
+        query = """
+        MATCH (f:Function {name: $func_name})
+        OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+        OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+        OPTIONAL MATCH (f)-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
+        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
+        OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
+        OPTIONAL MATCH (san:Function)-[:CALLS]->(f)
+        WHERE san.name =~ '.*(sanitize|validate|check|clean|strip|guard).*'
+        RETURN {
+            function: {
+                id: id(f),
+                name: f.name,
+                file: f.storage_uri,
+                tainted_by_uds: coalesce(f.tainted_by_uds, false),
+                reachable_dids: coalesce(f.reachable_from_dids, []),
+                is_vendor_library: coalesce(f.is_vendor_code, false)
+            },
+            upstream: {
+                uds_triggers: collect(DISTINCT {
+                    id: id(uds),
+                    type: labels(uds)[0],
+                    name: coalesce(uds.name, 'UDS_' + uds.did),
+                    did: uds.did
+                }),
+                network_triggers: collect(DISTINCT {
+                    id: id(net),
+                    type: labels(net)[0],
+                    name: net.name
+                }),
+                standard_callers: collect(DISTINCT {
+                    id: id(caller),
+                    type: labels(caller)[0],
+                    name: caller.name
+                })
+            },
+            downstream: collect(DISTINCT {
+                id: id(callee),
+                type: labels(callee)[0],
+                called_function: callee.name,
+                is_dangerous_sink: coalesce(callee.is_dangerous_sink, false),
+                is_stub_node: CASE WHEN callee:Stub THEN true ELSE false END
+            }),
+            variable_access: collect(DISTINCT {
+                id: id(v),
+                type: labels(v)[0],
+                variable_name: v.name,
+                access_type: type(r)
+            }),
+            sanitizers: collect(DISTINCT {
+                id: id(san),
+                type: labels(san)[0],
+                name: san.name
+            })
+        } AS payload
+        LIMIT 1
+        """
+
+        def _node_record(name: str, kind: str, node_id: Any = None, **props) -> Dict[str, Any]:
+            record = {"id": node_id, "type": kind, "name": name}
+            record.update(props)
+            return record
+
+        def _path_excerpt(source_name: str, sink_name: str) -> str:
+            if source_name and sink_name:
+                return f"{source_name} -> {func_name} -> {sink_name}"
+            if source_name:
+                return f"{source_name} -> {func_name}"
+            if sink_name:
+                return f"{func_name} -> {sink_name}"
+            return func_name
+
+        try:
+            with self.db.driver.session() as session:
+                records = session.run(query, func_name=func_name).data()
+
+            if not records:
+                payload = {
+                    "function": {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False},
+                    "upstream": {"uds_triggers": [], "network_triggers": [], "standard_callers": []},
+                    "downstream": [],
+                    "variable_access": [],
+                    "sanitizers": []
+                }
+            else:
+                payload = records[0].get("payload", {})
+
+            if payload.get("function") is None:
+                payload["function"] = {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False}
+
+            nodes = []
+            edges = []
+            target = payload["function"]
+            nodes.append(_node_record(target.get("name"), "Function", target.get("id"), file=target.get("file"), tainted_by_uds=target.get("tainted_by_uds", False), reachable_dids=target.get("reachable_dids", []), is_vendor_library=target.get("is_vendor_library", False)))
+
+            for caller in payload.get("upstream", {}).get("standard_callers", []) or []:
+                caller_name = caller.get("name")
+                if caller_name:
+                    nodes.append(_node_record(caller_name, caller.get("type", "Function"), caller.get("id"), source_kind="caller"))
+                    edges.append({"id": f"edge:{caller_name}->{func_name}", "type": "CALLS", "from": caller.get("id"), "to": target.get("id"), "properties": {"direction": "inbound"}})
+
+            for uds in payload.get("upstream", {}).get("uds_triggers", []) or []:
+                uds_name = uds.get("name") or f"UDS_{uds.get('did', 'unknown')}"
+                nodes.append(_node_record(uds_name, uds.get("type", "UdsService"), uds.get("id"), did=uds.get("did"), source_kind="uds"))
+                edges.append({"id": f"edge:{uds_name}->{func_name}", "type": "HANDLES_UDS", "from": uds.get("id"), "to": target.get("id"), "properties": {"did": uds.get("did")}})
+
+            for net in payload.get("upstream", {}).get("network_triggers", []) or []:
+                net_name = net.get("name")
+                if net_name:
+                    nodes.append(_node_record(net_name, net.get("type", "NetworkSignal"), net.get("id"), source_kind="signal"))
+                    edges.append({"id": f"edge:{net_name}->{func_name}", "type": "RECEIVES_SIGNAL", "from": net.get("id"), "to": target.get("id"), "properties": {"source": "network"}})
+
+            for callee in payload.get("downstream", []) or []:
+                callee_name = callee.get("called_function")
+                if callee_name:
+                    nodes.append(_node_record(callee_name, callee.get("type", "Function"), callee.get("id"), is_dangerous_sink=callee.get("is_dangerous_sink", False), is_stub_node=callee.get("is_stub_node", False)))
+                    edges.append({"id": f"edge:{func_name}->{callee_name}", "type": "CALLS", "from": target.get("id"), "to": callee.get("id"), "properties": {"is_dangerous_sink": callee.get("is_dangerous_sink", False)}})
+
+            for var in payload.get("variable_access", []) or []:
+                var_name = var.get("variable_name")
+                if var_name:
+                    nodes.append(_node_record(var_name, var.get("type", "GlobalVariable"), var.get("id"), access_type=var.get("access_type")))
+                    edges.append({"id": f"edge:{func_name}->{var_name}", "type": var.get("access_type", "READS_VAR"), "from": target.get("id"), "to": var.get("id"), "properties": {"access_type": var.get("access_type")}})
+
+            for sanitizer in payload.get("sanitizers", []) or []:
+                sanitizer_name = sanitizer.get("name")
+                if sanitizer_name:
+                    nodes.append(_node_record(sanitizer_name, sanitizer.get("type", "Function"), sanitizer.get("id"), sanitizer_kind="sanitizer"))
+                    edges.append({"id": f"edge:{sanitizer_name}->{func_name}", "type": "CALLS", "from": sanitizer.get("id"), "to": target.get("id"), "properties": {"role": "sanitizer"}})
+
+            source_names = [
+                item.get("name") or item.get("did")
+                for item in (payload.get("upstream", {}).get("uds_triggers", []) or [])
+            ] + [
+                item.get("name")
+                for item in (payload.get("upstream", {}).get("network_triggers", []) or [])
+                if item.get("name")
+            ] + [
+                item.get("name")
+                for item in (payload.get("upstream", {}).get("standard_callers", []) or [])
+                if item.get("name")
+            ]
+            uds_dids = [
+                item.get("did")
+                for item in (payload.get("upstream", {}).get("uds_triggers", []) or [])
+                if item.get("did") is not None
+            ]
+            sink_names = [
+                item.get("called_function")
+                for item in (payload.get("downstream", []) or [])
+                if item.get("is_dangerous_sink")
+            ]
+
+            # Canonicalized path excerpts for downstream taint/source -> sink investigations.
+            path_candidates = []
+            for source_name in source_names[:5]:
+                for sink_name in sink_names[:5]:
+                    path_candidates.append({
+                        "type": "source_to_sink",
+                        "path": _path_excerpt(source_name, sink_name),
+                        "source": source_name,
+                        "sink": sink_name,
+                        "confidence": "medium" if source_name and sink_name else "low",
+                    })
+            if not path_candidates:
+                for sink_name in sink_names[:5]:
+                    path_candidates.append({"type": "internal_sink", "path": _path_excerpt(None, sink_name), "source": None, "sink": sink_name, "confidence": "low"})
+
+            # Deduplicate and keep a compact top-k path list.
+            seen_paths = set()
+            top_paths = []
+            for item in path_candidates:
+                if item["path"] not in seen_paths:
+                    seen_paths.add(item["path"])
+                    top_paths.append(item)
+                if len(top_paths) >= 5:
+                    break
+
+            provenance = {
+                "retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}",
+                "query": "MATCH (f:Function {name: $func_name}) ... neighborhood",
+                "evidence": {
+                    "node_count": len(nodes),
+                    "edge_count": len(edges),
+                    "source_count": len(source_names),
+                    "sink_count": len(sink_names),
+                    "sanitizer_count": len(payload.get("sanitizers", []) or [])
+                },
+                "confidence": "high" if payload.get("function", {}).get("tainted_by_uds") or sink_names else "medium",
+            }
+
+            payload = {
+                "schema_version": "1.1",
+                "verbosity": verbosity,
+                "function": target,
+                "graph": {
+                    "nodes": nodes,
+                    "edges": edges,
+                    "paths": top_paths,
+                },
+                "sources": {
+                    "uds": [item for item in (payload.get("upstream", {}).get("uds_triggers", []) or [])],
+                    "network": [item for item in (payload.get("upstream", {}).get("network_triggers", []) or [])],
+                    "callers": [item for item in (payload.get("upstream", {}).get("standard_callers", []) or [])],
+                },
+                "sinks": [item for item in (payload.get("downstream", []) or []) if item.get("is_dangerous_sink")],
+                "sanitizers": payload.get("sanitizers", []) or [],
+                "variable_access": payload.get("variable_access", []) or [],
+                "provenance": provenance,
+                "confidence": provenance["confidence"],
+            }
+
+            if verbosity == "full":
+                payload["graph"]["all_paths"] = top_paths
+                payload["graph"]["node_types"] = sorted({node["type"] for node in nodes})
+                payload["graph"]["edge_types"] = sorted({edge["type"] for edge in edges})
+            elif verbosity == "compact":
+                payload["graph"] = {"nodes": nodes[:10], "edges": edges[:20], "paths": top_paths}
+
+            json_data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            summary_lines = [
+                f"Function: {func_name}",
+                f"- tainted_by_uds: {str(target.get('tainted_by_uds', False)).lower()}",
+                f"- reachable_dids: {', '.join(str(did) for did in (target.get('reachable_dids', []) or [])) if target.get('reachable_dids') else 'none'}",
+                f"- uds_sources: {', '.join(str(did) for did in uds_dids) if uds_dids else 'none'}",
+                f"- sources: {', '.join(source_names) if source_names else 'none'}",
+                f"- sinks: {', '.join(sink_names) if sink_names else 'none'}",
+                f"- sanitizers: {', '.join(item.get('name', '') for item in (payload.get('sanitizers', []) or []) if item.get('name')) or 'none'}",
+                f"- top_paths: {', '.join(item['path'] for item in top_paths) if top_paths else 'none'}",
+                f"- confidence: {provenance['confidence']}",
+                f"- retrieval_pointer: {provenance['retrieval_pointer']}",
+            ]
+            return json_data, "\n".join(summary_lines)
+        except Exception as e:
+            logger.warning(f"Failed to serialize graph neighborhood for {func_name}: {e}")
+            fallback = {
+                "schema_version": "1.1",
+                "verbosity": verbosity,
+                "function": {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False},
+                "graph": {"nodes": [], "edges": [], "paths": []},
+                "sources": {"uds": [], "network": [], "callers": []},
+                "sinks": [],
+                "sanitizers": [],
+                "variable_access": [],
+                "provenance": {"retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}", "query": "MATCH ...", "evidence": {"node_count": 0, "edge_count": 0, "source_count": 0, "sink_count": 0, "sanitizer_count": 0}, "confidence": "low"},
+                "confidence": "low",
+            }
+            return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
+
+    def get_candidate_metrics(self, domain_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Query the graph for high-risk candidate metrics without any LLM orchestration."""
+        cypher_filter = ""
+        if domain_filter:
+            cypher_filter = f"AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\{domain_filter}\\')"
+
+        query = f"""
+        MATCH (f:Function)
+        WHERE coalesce(f.is_vendor_code, false) = false 
+          AND coalesce(f.is_dead_code, false) = false
+          AND NOT f:Stub
+          {cypher_filter}
+
+        OPTIONAL MATCH (f)-[:CALLS*1..3]->(sink:Function {{is_dangerous_sink: true}})
+        OPTIONAL MATCH (f)-[w:WRITES_VAR]->(v:GlobalVariable)
+        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
+        OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
+
+        WITH f,
+             count(DISTINCT sink) AS DangerousSinksReached,
+             count(DISTINCT w) AS GlobalVariableWrites,
+             count(DISTINCT uds) > 0 AS IsDirectUdsHandler,
+             count(DISTINCT net) > 0 AS IsDirectNetworkHandler
+
+        WHERE coalesce(f.tainted_by_uds, false) = true OR DangerousSinksReached > 0 OR GlobalVariableWrites > 0
+
+        RETURN {{
+            FunctionName: f.name,
+            TaintedByUDS: coalesce(f.tainted_by_uds, false),
+            IsUdsHandler: IsDirectUdsHandler,
+            IsNetworkHandler: IsDirectNetworkHandler,
+            DangerousSinksReached: DangerousSinksReached,
+            GlobalVariableWrites: GlobalVariableWrites
+        }} AS Metrics
+        ORDER BY DangerousSinksReached DESC, GlobalVariableWrites DESC, coalesce(f.tainted_by_uds, false) DESC
+        """
+
+        try:
+            with self.db.driver.session() as session:
+                results = session.run(query).data()
+            return [r["Metrics"] for r in results]
+        except Exception as e:
+            logger.error(f"Failed to extract candidate metrics from Neo4j: {e}")
+            return []
 
     def run_all_passes(self):
         """Executes the full suite of resolution passes."""

@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 
 from graph.db import GraphDB
 from graph.retriever import GraphRetriever
+from graph.resolver import GraphResolver
 from graph.nl2cypher import NL2CypherEngine
 from graph.models import GraphNode, GraphEdge, IngestBatch
 
@@ -21,6 +22,7 @@ class GraphManager:
         
         # 2. Initialize Sub-modules
         self.retriever = GraphRetriever(self.db)
+        self.resolver = GraphResolver(self.db)
         self.nl_engine = NL2CypherEngine(self.db, llm_client) if llm_client else None
         
         # Ensure schema/indexes exist (runs idempotently)
