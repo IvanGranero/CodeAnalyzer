@@ -10,15 +10,21 @@ class EdgeType(str, Enum):
     RECEIVES_SIGNAL = "RECEIVES_SIGNAL"
     SENDS_SIGNAL = "SENDS_SIGNAL"
     IMPLEMENTS_TASK = "IMPLEMENTS_TASK" 
+    DEPENDS_ON_TYPE = "DEPENDS_ON_TYPE"  
+    USES_MACRO = "USES_MACRO"          
 
 class NodeLabel(str, Enum):
     GRAPH_NODE = "GraphNode" 
     FUNCTION = "Function"
-    VARIABLE = "Variable"
     GLOBAL_VARIABLE = "GlobalVariable"
     VULNERABILITY = "Vulnerability"
     UDS_SERVICE = "UdsService"
     NETWORK_SIGNAL = "NetworkSignal"
+    TYPE_DEFINITION = "TypeDefinition" 
+    MACRO_DEFINITION = "MacroDefinition"
+    OS_TASK = "OsTask"
+    OS_ISR = "OsIsr"
+    OS_RESOURCE = "OsResource"    
 
 class GraphNode(BaseModel):
     model_config = ConfigDict(extra="forbid")

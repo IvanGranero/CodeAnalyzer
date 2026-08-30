@@ -1,7 +1,6 @@
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-from graph.manager import GraphManager
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +173,6 @@ class GraphResolver:
                 if item.get("is_dangerous_sink")
             ]
 
-            # Canonicalized path excerpts for downstream taint/source -> sink investigations.
             path_candidates = []
             for source_name in source_names[:5]:
                 for sink_name in sink_names[:5]:
@@ -189,7 +187,6 @@ class GraphResolver:
                 for sink_name in sink_names[:5]:
                     path_candidates.append({"type": "internal_sink", "path": _path_excerpt(None, sink_name), "source": None, "sink": sink_name, "confidence": "low"})
 
-            # Deduplicate and keep a compact top-k path list.
             seen_paths = set()
             top_paths = []
             for item in path_candidates:
@@ -270,59 +267,142 @@ class GraphResolver:
             }
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
 
-    def get_candidate_metrics(self, domain_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Query the graph for high-risk candidate metrics without any LLM orchestration."""
+    def get_prioritized_targets(self, max_targets: int, domain_filter: Optional[str] = None, file_filter: Optional[str] = None) -> List[str]:
         cypher_filter = ""
         if domain_filter:
-            cypher_filter = f"AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\{domain_filter}\\')"
-
+            cypher_filter += f" AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\\\{domain_filter}\\\\')"
+        if file_filter:
+            safe_file = file_filter.replace('\\', '/')
+            cypher_filter += f" AND f.storage_uri CONTAINS '{safe_file}'"
+            
         query = f"""
         MATCH (f:Function)
         WHERE coalesce(f.is_vendor_code, false) = false 
-          AND coalesce(f.is_dead_code, false) = false
+          AND coalesce(f.is_dead_code, false) = false 
           AND NOT f:Stub
           {cypher_filter}
-
         OPTIONAL MATCH (f)-[:CALLS*1..3]->(sink:Function {{is_dangerous_sink: true}})
-        OPTIONAL MATCH (f)-[w:WRITES_VAR]->(v:GlobalVariable)
-        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
-        OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
-
+        OPTIONAL MATCH (f)-[:WRITES_VAR]->(w:GlobalVariable)
         WITH f,
-             count(DISTINCT sink) AS DangerousSinksReached,
-             count(DISTINCT w) AS GlobalVariableWrites,
-             count(DISTINCT uds) > 0 AS IsDirectUdsHandler,
-             count(DISTINCT net) > 0 AS IsDirectNetworkHandler
-
-        WHERE coalesce(f.tainted_by_uds, false) = true OR DangerousSinksReached > 0 OR GlobalVariableWrites > 0
-
-        RETURN {{
-            FunctionName: f.name,
-            TaintedByUDS: coalesce(f.tainted_by_uds, false),
-            IsUdsHandler: IsDirectUdsHandler,
-            IsNetworkHandler: IsDirectNetworkHandler,
-            DangerousSinksReached: DangerousSinksReached,
-            GlobalVariableWrites: GlobalVariableWrites
-        }} AS Metrics
-        ORDER BY DangerousSinksReached DESC, GlobalVariableWrites DESC, coalesce(f.tainted_by_uds, false) DESC
+             (CASE WHEN coalesce(f.tainted_by_uds, false) THEN 100 ELSE 0 END) +
+             (CASE WHEN coalesce(f.is_hardware_entry, false) THEN 80 ELSE 0 END) +
+             (CASE WHEN coalesce(f.has_data_race_risk, false) THEN 200 ELSE 0 END) +
+             (count(DISTINCT sink) * 50) +
+             (count(DISTINCT w) * 10) AS RiskScore
+        WHERE RiskScore > 0
+        RETURN f.name AS FunctionName, RiskScore
+        ORDER BY RiskScore DESC, f.name ASC
         """
-
+        if max_targets > 0:
+            query += f"\nLIMIT {max_targets}"
+            
         try:
             with self.db.driver.session() as session:
                 results = session.run(query).data()
-            return [r["Metrics"] for r in results]
+            return [r["FunctionName"] for r in results]
         except Exception as e:
-            logger.error(f"Failed to extract candidate metrics from Neo4j: {e}")
+            logger.error(f"Failed to extract prioritized targets from Neo4j: {e}")
             return []
 
     def run_all_passes(self):
-        """Executes the full suite of resolution passes."""
+        """Executes the full suite of resolution passes in the correct order."""
         logger.info("=== Starting Graph Resolution & Completion Passes ===")
+        self._prune_local_variable_stubs()
+        self._bind_runnables_to_tasks()
+        self._resolve_os_concurrency()
         self._resolve_uds_taint()
         self._flag_dead_code()
         self._resolve_rte_data_flow()
         self._flag_dangerous_sinks()
+        self._resolve_data_races()
         logger.info("=== Graph Resolution Complete ===")
+
+    def _resolve_data_races(self):
+        """
+        Flags functions that write to a global variable concurrently with another
+        function across different task/ISR contexts without an exclusive lock.
+        """
+        logger.info("Flagging functions with potential data races...")
+        query = """
+        MATCH (v:GlobalVariable)
+        WHERE size((v)<-[:WRITES_VAR]-(:Function)) > 1
+        MATCH (f:Function)-[:WRITES_VAR]->(v)
+        WHERE EXISTS {
+            MATCH (other_f:Function)-[:WRITES_VAR]->(v)
+            WHERE f <> other_f
+            OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(t1:OsTask)
+            OPTIONAL MATCH (other_f)-[:IMPLEMENTS_TASK]->(t2:OsTask)
+            WHERE (t1 IS NULL OR t2 IS NULL OR t1 <> t2)
+              AND NOT EXISTS {
+                (f)-[:OS_LOCK_ACTION]->(:OsResource)<-[:OS_LOCK_ACTION]-(other_f)
+            }
+        }
+        SET f.has_data_race_risk = true
+        """
+        try:
+            with self.db.driver.session() as session:
+                session.run(query)
+        except Exception as e:
+            logger.error(f"Failed to detect Data Races: {e}")
+
+    def _bind_runnables_to_tasks(self):
+        logger.info("Binding RTE Runnables to Functions...")
+        query = """
+        MATCH (s:Stub)-[r:IMPLEMENTS_TASK]->(t)
+        WHERE s.name STARTS WITH 'Rte_' OR s.name STARTS WITH 'Runnable_'
+        MATCH (f:Function {name: s.name})
+        MERGE (f)-[rel:IMPLEMENTS_TASK]->(t)
+        SET rel = properties(r)
+        DELETE r, s
+        """
+        try:
+            with self.db.driver.session() as session:
+                session.run(query)
+        except Exception as e:
+            logger.error(f"Failed to bind Runnables to Tasks: {e}")
+
+    def _prune_local_variable_stubs(self):
+        """
+        Runs after ingestion. Any 'Stub' node that only has READS/WRITES edges 
+        and never got upgraded to a GlobalVariable is a local variable.
+        We delete them to keep the graph lean.
+        """
+        logger.info("Pruning local variable stubs to optimize graph size...")
+        query = """
+        MATCH (n:Stub)
+        // If the stub is only connected via READS_VAR or WRITES_VAR edges, it's local.
+        WHERE NOT ()-[:CALLS]->(n) AND NOT ()-[:DEPENDS_ON_TYPE]->(n)
+        DETACH DELETE n
+        RETURN count(n) as deleted_count
+        """
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query).single()
+                count = result["deleted_count"] if result else 0
+                logger.info(f"Deleted {count} useless local variable stubs.")
+        except Exception as e:
+            logger.error(f"Failed to prune local variables: {e}")
+
+    def _resolve_os_concurrency(self):
+        logger.info("Resolving AutoSAR OS Concurrency Primitives...")
+        query = """
+        MATCH (f:Function)-[c:CALLS]->(api:Function)
+        WHERE api.name IN [
+            'GetResource', 'SuspendAllInterrupts', 'DisableAllInterrupts',
+            'ReleaseResource', 'ResumeAllInterrupts', 'EnableAllInterrupts'
+        ]
+        WITH f, c, api,
+             CASE WHEN size(c.arguments) > 0 THEN c.arguments[0] ELSE 'GLOBAL_INTERRUPT' END AS resource_name,
+             CASE WHEN api.name STARTS WITH 'Get' OR api.name STARTS WITH 'Suspend' OR api.name STARTS WITH 'Disable'
+                  THEN 'ACQUIRES_LOCK' ELSE 'RELEASES_LOCK' END AS lock_action
+        MERGE (res:OsResource {name: resource_name}) ON CREATE SET res:GraphNode
+        MERGE (f)-[l:OS_LOCK_ACTION {action: lock_action}]->(res)
+        """
+        try:
+            with self.db.driver.session() as session:
+                session.run(query)
+        except Exception as e:
+            logger.error(f"Failed to resolve OS concurrency: {e}")
 
     def _resolve_uds_taint(self):
         """
@@ -330,24 +410,17 @@ class GraphResolver:
         and traces the taint down the call stack.
         """
         logger.info("Resolving UDS Attack Surface Entry Points...")
-        
-        # Step 1: Find functions with _DID_ or _RID_ in their name and wire them up
         map_uds_query = """
         MATCH (f:Function)
         WHERE f.name CONTAINS "_DID_" OR f.name CONTAINS "_RID_"
-        
-        // Extract the 4-character Hex code (e.g., F081)
         WITH f, 
              CASE 
                 WHEN f.name CONTAINS "_DID_" THEN substring(split(f.name, "_DID_")[1], 0, 4)
                 ELSE substring(split(f.name, "_RID_")[1], 0, 4)
              END AS uds_hex
         WHERE uds_hex <> ""
-        
-        // Create the External UDS Node and link it
         MERGE (u:UdsService {did: uds_hex})
         ON CREATE SET u:GraphNode, u.name = "UDS_" + uds_hex
-        
         MERGE (f)-[:HANDLES_UDS]->(u)
         RETURN count(f) AS linked_uds
         """
@@ -360,14 +433,10 @@ class GraphResolver:
             logger.error(f"Failed to map UDS entry points: {e}")
 
         logger.info("Propagating Taint Downstream...")
-        
-        # Step 2: Propagate the Taint down the newly connected call trees
         taint_query = """
-        // Start the path at length 0 so the Entry Point itself gets tagged
         MATCH path = (u:UdsService)<-[:HANDLES_UDS]-(entry:Function)-[:CALLS*0..10]->(downstream:Function)
         WITH DISTINCT downstream, u.did AS source_did
         SET downstream.tainted_by_uds = true
-        // Use DISTINCT to prevent massive duplicate arrays if multiple paths exist
         WITH downstream, collect(DISTINCT source_did) AS uds_sources
         SET downstream.reachable_from_dids = uds_sources
         RETURN count(downstream) AS tainted_count
@@ -381,27 +450,18 @@ class GraphResolver:
             logger.error(f"Failed to propagate UDS Taint: {e}")
 
     def _flag_dead_code(self):
-        """
-        Finds isolated functions (no callers, no UDS links, no Network links, no Hardware entries).
-        """
+        """Finds isolated functions (no callers, no UDS links, no Network links, no Hardware entries)."""
         logger.info("Flagging Unreachable / Dead Code...")
         query = """
-        // 1. Match all functions
         MATCH (f:Function)
-        
-        // 2. Ensure NO incoming CALLS, NO UDS links, NO Network links, and NOT an OS/Hardware entry
         WHERE NOT ()-[:CALLS]->(f)
           AND NOT (f)-[:HANDLES_UDS]->()
           AND NOT (f)-[:RECEIVES_SIGNAL]->()
           AND NOT (f)-[:SENDS_SIGNAL]->()
           AND coalesce(f.is_hardware_entry, false) = false
-          
-        // 3. Mark them!
         SET f.is_dead_code = true
-        
         RETURN count(f) AS dead_count
         """
-        
         try:
             with self.db.driver.session() as session:
                 result = session.run(query).single()
@@ -411,26 +471,17 @@ class GraphResolver:
             logger.error(f"Failed to flag Dead Code: {e}")
 
     def _resolve_rte_data_flow(self):
-        """
-        Connects Runnables via RTE. If Func A writes to 'PortX', and Func B reads from 'PortX',
-        this creates a direct semantic data flow edge between them.
-        """
+        """Connects Runnables via RTE port data flow."""
         logger.info("Resolving RTE Port Data Flows...")
         query = """
-        // Find functions calling Rte_Write and Rte_Read for the same port/element
         MATCH (writer:Function)-[:CALLS]->(w_api:Function)
         WHERE w_api.name STARTS WITH "Rte_Write_"
-        
         MATCH (reader:Function)-[:CALLS]->(r_api:Function)
         WHERE r_api.name STARTS WITH "Rte_Read_"
-        
-        // Extract the Port_Element part of the name (e.g., Rte_Write_BatteryPort_Voltage)
         WITH writer, reader, w_api, r_api,
              substring(w_api.name, 10) AS write_port,
              substring(r_api.name, 9) AS read_port
         WHERE write_port = read_port
-        
-        // Connect the writer directly to the reader
         MERGE (writer)-[r:RTE_DATA_FLOW {port: write_port}]->(reader)
         RETURN count(r) AS rte_flows
         """
@@ -443,18 +494,16 @@ class GraphResolver:
             logger.error(f"Failed to resolve RTE data flow: {e}")
 
     def _flag_dangerous_sinks(self):
-        """Flags functions that are known vulnerability sinks (libc + AutoSAR variants)."""
+        """Flags functions that are known vulnerability sinks."""
         logger.info("Flagging Dangerous Memory and NVM Sinks...")
         query = """
         MATCH (f:Function)
-        // Catch standard libc AND AutoSAR wrappers like VStdLib_MemCpy, TRNmemcpy, etc.
         WHERE toLower(f.name) CONTAINS 'memcpy'
            OR toLower(f.name) CONTAINS 'memcopy'
            OR toLower(f.name) CONTAINS 'memset'
            OR toLower(f.name) CONTAINS 'memmove'
            OR toLower(f.name) CONTAINS 'strcpy'
            OR toLower(f.name) CONTAINS 'sprintf'
-           // Catch AutoSAR NVM / Flash operations
            OR f.name STARTS WITH 'NvM_Write' 
            OR f.name STARTS WITH 'Fls_Write'
         SET f.is_dangerous_sink = true

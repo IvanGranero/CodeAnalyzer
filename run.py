@@ -3,7 +3,7 @@ import sys
 import argparse
 import logging
 import json
-import asyncio # --- NEW: Native asyncio ---
+import asyncio
 from dataclasses import dataclass
 
 # Configuration and Services
@@ -18,7 +18,6 @@ from scan.orchestrator import ScanOrchestrator
 from scan.reporter import ScanReporter
 from exploit.orchestrator import ExploitOrchestrator
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -36,14 +35,17 @@ class AppContext:
 async def main():
     parser = argparse.ArgumentParser(description="AutoSAR Vulnerability Scanner Orchestrator")
     parser.add_argument("source_dir", nargs='?', default=".", help="Path to the AutoSAR source code directory")
-    parser.add_argument("--depth", choices=["fast", "critical", "full"], default="critical")
+    
+    # --- NEW: Deterministic Scope & Limit Arguments ---
+    parser.add_argument("--limit", type=int, default=50, help="Maximum number of top-risk functions to scan (default: 50).")
+    parser.add_argument("--scan-all", action="store_true", help="Scan all discovered targets in scope, bypassing the limit.")
+    parser.add_argument("--target-file", type=str, help="Restrict the scan to a specific file (e.g., 'bsw/Com.c').")
 
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--skip-ingest", action="store_true")
-    parser.add_argument("--exploit-only", type=str, help="Path to a vulnerability JSON report to exploit directly, bypassing the scan.")
+    parser.add_argument("--resume", action="store_true", help="Resume from cached scans.")
+    parser.add_argument("--skip-ingest", action="store_true", help="Skip the graph building phase.")
+    parser.add_argument("--exploit-only", type=str, help="Path to a vulnerability JSON report to exploit directly.")
     args = parser.parse_args()
 
-    # Load environment-backed settings only after argparse handles --help/errors.
     from config import settings
 
     target_directory = os.path.abspath(args.source_dir)
@@ -51,8 +53,7 @@ async def main():
         logger.error(f"The directory '{target_directory}' does not exist.")
         sys.exit(1)
 
-    target_limits = {"fast": 10, "critical": 50, "full": 9999}
-    scan_limit = target_limits[args.depth]
+    scan_limit = 0 if args.scan_all else args.limit
     
     logger.info("Initializing Core Services...")
     try:
@@ -60,13 +61,15 @@ async def main():
             api_key=settings.genai_subscription_key,
             model_name=settings.strong_model_id,
             base_url=settings.strong_base_url,
-            api_version=settings.strong_api_version
+            api_version=settings.strong_api_version,
+            api_key_header=settings.genai_subscription_header
         )
         graph = GraphManager(
             uri=settings.neo4j_uri, 
             user=settings.neo4j_user, 
             password=settings.neo4j_password
         )
+        graph.resolver = GraphResolver(graph.db)
     except Exception as e:
         logger.error(f"Failed to initialize core services: {e}")
         sys.exit(1)
@@ -75,65 +78,40 @@ async def main():
     orchestrator = ScanOrchestrator(app_context.llm, app_context.graph)
     reporter = ScanReporter(output_dir="reports")
 
-
     # ==========================================
     # --- PHASE 0 DIRECT EXPLOIT BYPASS ---
     # ==========================================
     if args.exploit_only:
+        # (Exploit only logic remains exactly the same...)
         logger.info("\n" + "="*60)
         logger.info(f"🚀 DIRECT EXPLOIT MODE: Loading {args.exploit_only}")
         print("="*60)
-
         if not os.path.exists(args.exploit_only):
             parser.error(f"report file not found: {args.exploit_only}")
-
         with open(args.exploit_only, 'r') as f:
             pre_existing_report = json.load(f)
-
-        # Build a queue of (func_name, vuln_entry)
         vuln_queue = asyncio.Queue()
         for func_name, vuln_entry in pre_existing_report.items():
             vuln_queue.put_nowait((func_name, vuln_entry))
-
-        # Infer domain from first entry
         first_key = next(iter(pre_existing_report))
         target_domain = pre_existing_report[first_key].get("domain", "all")
-        logger.info(f"Target domain inferred as: {target_domain}")
-
-        exploit_orch = ExploitOrchestrator(
-            target_domain=target_domain,
-            llm_service=app_context.llm
-        )
-
+        exploit_orch = ExploitOrchestrator(target_domain=target_domain, llm_service=app_context.llm)
         results = {}
-
         while not vuln_queue.empty():
             func_name, vuln_entry = await vuln_queue.get()
-            logger.info(f"🛡️ [EXPLOIT-ONLY] Processing vulnerability for {func_name}...")
-
             try:
                 vuln_entry = dict(vuln_entry)
                 vuln_entry["function_name"] = func_name
-                result = await exploit_orch.execute_exploit_loop(
-                    vulnerability_report=vuln_entry,   # <-- ONE vulnerability only
-                    target_domain=target_domain
-                )
+                result = await exploit_orch.execute_exploit_loop(vulnerability_report=vuln_entry, target_domain=target_domain)
                 results[func_name] = result
-
                 if result.get("status") == "success":
                     logger.info(f"💀 [PWNED] {func_name} exploit validated!")
                 else:
-                    logger.info(f"🛡️ [MITIGATED] {func_name} exploit failed: {result.get('rationale')}")
-
+                    logger.info(f"🛡️ [MITIGATED] {func_name} exploit failed.")
             except Exception as e:
                 logger.error(f"Exploit-only mode crashed on {func_name}: {e}")
-
-        logger.info(f"Final Exploit Results: {json.dumps(results, indent=2)}")
-
         app_context.graph.close()
         return
-
-    # ==========================================
 
     try:
         CACHE_DIR = "scan_cache"
@@ -161,10 +139,17 @@ async def main():
                 logger.error("Discovery LLM did not return valid JSON. Cannot proceed.")
                 sys.exit(1)
 
+            found_configs = config_json.get('config_files', [])
+            if found_configs:
+                logger.info(f"Discovery found {len(found_configs)} system configuration files.")
+
             logger.info("\n--- PHASE 2: Starting Graph Ingestion & Resolution ---")
-            # These remain synchronous as planned
-            IngestionPipeline(target_directory, app_context.graph).run(vendor_folders=config_json.get('vendor_folders', []))
-            GraphResolver(app_context.graph).run_all_passes()
+            IngestionPipeline(target_directory, app_context.graph).run(
+                vendor_folders=config_json.get('vendor_folders', []),
+                config_files=found_configs
+            )            
+            
+            app_context.graph.resolver.run_all_passes()
         
         # ==========================================
         # PHASE 2.5: INTERACTIVE DOMAIN SELECTION
@@ -172,8 +157,11 @@ async def main():
         app_domains = config_json.get('app_domains', [])
         selected_domain = None
 
-        if args.depth == "full":
-            logger.info("Depth 'full' selected. Bypassing domain selection to scan all domains automatically.")
+        # Only ask for a domain if the user didn't hardcode a specific target file
+        if args.target_file:
+            logger.info(f"Target file '{args.target_file}' specified. Bypassing domain selection.")
+        elif args.scan_all:
+            logger.info("--scan-all specified. Bypassing domain selection to scan everything globally.")
         elif app_domains:
             print("\n" + "="*60)
             logger.info("Discovered the following application domains:")
@@ -181,9 +169,7 @@ async def main():
                 print(f"  {i}. {domain}")
             print(f"  {len(app_domains) + 1}. all (Scan all domains)")
             print("="*60)
-
             try:
-                # Use standard synchronous input() here, it's fine for blocking startup config
                 choice = input(f"Which domain would you like to scan? (1-{len(app_domains) + 1}): ")
                 choice_idx = int(choice) - 1
                 if 0 <= choice_idx < len(app_domains):
@@ -197,7 +183,8 @@ async def main():
         # ==========================================
         # PHASE 3: MULTI-AGENT VULNERABILITY SCAN
         # ==========================================
-        logger.info(f"\n--- PHASE 3: Multi-Agent Vulnerability Scan (Depth: {args.depth.upper()}) ---")
+        mode_str = "ALL" if args.scan_all else str(args.limit)
+        logger.info(f"\n--- PHASE 3: Multi-Agent Vulnerability Scan (Limit: {mode_str}) ---")
         
         all_reports = {}
         if args.resume:
@@ -209,10 +196,11 @@ async def main():
                         all_reports[func_name] = json.load(f)
             logger.info(f"Successfully loaded {len(all_reports)} completed scans.")
 
+        # --- NEW: Pass the target_file and clean limit to the orchestrator ---
         top_targets = await orchestrator.prioritize_targets(
-            scan_depth=args.depth, 
             max_targets=scan_limit,
-            domain_filter=selected_domain
+            domain_filter=selected_domain,
+            file_filter=args.target_file
         )
         
         targets_to_scan = [t for t in top_targets if t not in all_reports]
@@ -220,9 +208,9 @@ async def main():
         if not targets_to_scan:
             logger.info("✅ All prioritized targets have already been scanned or no targets were found.")
         else:
-            if args.depth == "full":
+            if args.scan_all:
                 print("\n" + "="*70)
-                logger.warning(f"ATTENTION: A 'full' depth scan has identified {len(targets_to_scan)} new targets.")
+                logger.warning(f"ATTENTION: A global scan-all has identified {len(targets_to_scan)} targets.")
                 logger.warning("This may take a significant amount of time and incur API costs.")
                 print("="*70)
                 try:
@@ -236,31 +224,21 @@ async def main():
             exploit_queue = asyncio.Queue()
 
             async def exploit_worker():
-                """Processes exploits sequentially to prevent UDS session collisions."""
                 while True:
                     item = await exploit_queue.get()
-                    if item is None:  # Sentinel value to shut down
+                    if item is None:
                         exploit_queue.task_done()
                         break
-                    
                     report, func_name, domain = item
                     logger.info(f"🛡️ [EXPLOIT QUEUE] Popped vulnerability for {func_name}. Initiating exploit...")
                     try:
-                        exploit_orch = ExploitOrchestrator(
-                            target_domain=domain,
-                            llm_service=app_context.llm
-                        )
+                        exploit_orch = ExploitOrchestrator(target_domain=domain, llm_service=app_context.llm)
                         report = dict(report)
                         report["function_name"] = func_name
-                        result = await exploit_orch.execute_exploit_loop(
-                            vulnerability_report=report,
-                            target_domain=domain
-                        )
-
+                        result = await exploit_orch.execute_exploit_loop(vulnerability_report=report, target_domain=domain)
                         report["exploit_validation"] = result                        
                         with open(os.path.join(CACHE_DIR, f"{func_name}.json"), 'w') as f:
                             json.dump(report, f)
-
                         if result.get("status") == "success":
                             logger.info(f"💀 [PWNED] {func_name} exploit validated!")
                         else:
@@ -270,7 +248,6 @@ async def main():
                     finally:
                         exploit_queue.task_done()
 
-            # Start the single background worker task
             exploit_worker_task = asyncio.create_task(exploit_worker())
 
             MAX_CONCURRENT_SCANS = 5 
@@ -297,19 +274,15 @@ async def main():
                         
                         if report.get("vulnerability_found"):
                             logger.warning(f"⚠️ [VULNERABILITY FOUND] -> {target_func} ({report.get('severity')})")
-                            
                             is_uds = report.get("metadata", {}).get("TaintedByUDS") is True
-                            
                             if is_uds:
                                 domain_to_use = selected_domain if selected_domain else "all"
                                 await exploit_queue.put((report, target_func, domain_to_use))
                             else:
                                 logger.info(f"⏭️ [SKIPPED EXPLOIT] -> {target_func} is not reachable via UDS/DoIP.")
-                            
                         else:
                             logger.info(f"✔ [CLEAN] -> {target_func}")
                         return report
-                        
                     except asyncio.CancelledError:
                         logger.warning(f"Scan task for {target_func} was cancelled.")
                         raise
@@ -317,21 +290,15 @@ async def main():
                         logger.error(f"Scan for {target_func} crashed: {exc}")
                         return None                            
 
-            # Create tasks
             tasks = [asyncio.create_task(bounded_scan(t)) for t in targets_to_scan]
             
             try:
-                # Await all tasks concurrently
                 await asyncio.gather(*tasks)
-
                 if not exploit_queue.empty():
                     logger.info("⏳ Scans complete. Waiting for remaining exploits to finish...")
-                await exploit_queue.join()  # Blocks until all items are processed
-                
-                # Shut down the worker gracefully
+                await exploit_queue.join() 
                 await exploit_queue.put(None)
                 await exploit_worker_task
-                                
             except asyncio.CancelledError:
                 logger.warning("\nGathering was cancelled. Shutting down gracefully...")
 
@@ -360,10 +327,8 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Windows specific fix for asyncio EventLoop Policy
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("\nProcess interrupted by user (Ctrl+C). Exiting.")

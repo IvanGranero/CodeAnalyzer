@@ -10,7 +10,6 @@ class AnalyzerTools:
     
     def __init__(self, graph_manager: GraphManager):
         self.db = graph_manager.db
-        # --- NEW: Agent Memory Cache ---
         self._cache = set()
 
     def _check_cache(self, tool_name: str, cache_key: str) -> bool:
@@ -28,111 +27,104 @@ class AnalyzerTools:
 
         query = """
         MATCH (f:Function {name: $func_name})
-        RETURN f.storage_uri AS FilePath, 
-               f.byte_span AS ByteSpan, 
-               f.tainted_by_uds AS TaintedByUDS, 
-               f.reachable_from_dids AS DIDs,
-               coalesce(f.is_vendor_code, false) AS IsVendorLibrary,
-               f:Stub AS IsStubNode
+        RETURN f.storage_uri AS FilePath, f.byte_span AS ByteSpan, 
+               f.tainted_by_uds AS TaintedByUDS, f.reachable_from_dids AS DIDs,
+               coalesce(f.is_vendor_code, false) AS IsVendorLibrary, f:Stub AS IsStubNode
         """
         try:
             with self.db.driver.session() as session:
                 result = session.run(query, func_name=func_name).data()
-                if not result:
-                    return f"Function {func_name} not found in graph."
-                
-                # Format the results for the LLM
+                if not result: return f"Function {func_name} not found in graph."
                 for r in result:
-                    # 1. Truncate massive DID arrays
                     dids = r.get("DIDs")
-                    if dids and len(dids) > 10:
-                        r["DIDs"] = dids[:10] + [f"... and {len(dids) - 10} more"]
-                        
-                    # 2. If it's a stub, append a warning for the LLM
-                    if r.get("IsStubNode"):
-                        r["WARNING"] = "This is a Stub node (external library or macro). It has no source code available to read."
-                
+                    if dids and len(dids) > 10: r["DIDs"] = dids[:10] + [f"... and {len(dids) - 10} more"]
+                    if r.get("IsStubNode"): r["WARNING"] = "This is a Stub node. It has no source code available."
                 return str(result)
         except Exception as e:
             return f"Error executing tool: {e}"
 
+    # --- NEW: Tool to get the definition of a struct, enum, or typedef ---
+    def get_type_definition(self, type_name: str) -> str:
+        """Returns the source code snippet for a struct, enum, or typedef definition."""
+        if self._check_cache("get_type_definition", type_name):
+            return f"System Note: You have already requested the definition for type '{type_name}'."
+        
+        query = "MATCH (t:TypeDefinition {name: $type_name}) RETURN t.storage_uri AS uri, t.byte_span AS span LIMIT 1"
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query, type_name=type_name).single()
+                if not result:
+                    return f"Type '{type_name}' not found in the graph."
+            return self.read_file_span(result["uri"], result["span"])
+        except Exception as e:
+            return f"Error executing tool: {e}"
+
+    # --- NEW: Tool to get the definition of a preprocessor macro ---
+    def get_macro_definition(self, macro_name: str) -> str:
+        """Returns the '#define' value of a macro."""
+        if self._check_cache("get_macro_definition", macro_name):
+            return f"System Note: You have already requested the definition for macro '{macro_name}'."
+
+        query = "MATCH (m:MacroDefinition {name: $macro_name}) RETURN m.value AS value LIMIT 1"
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query, macro_name=macro_name).single()
+                if not result:
+                    return f"Macro '{macro_name}' not found in the graph."
+            return f"#define {macro_name} {result['value']}"
+        except Exception as e:
+            return f"Error executing tool: {e}"
+
     def get_callees(self, func_name: str) -> str:
-        """Retrieves everything this function calls (downstream), indicating dangerous sinks."""
+        # (This function remains the same)
         if self._check_cache("get_callees", func_name):
             return f"System Note: Callees for '{func_name}' are already in your conversation history."
-
         query = """
         MATCH (f:Function {name: $func_name})-[:CALLS]->(callee:Function)
-        RETURN callee.name AS CalledFunction, 
-               callee.is_vendor_code AS IsVendorLibrary, 
-               callee.is_dangerous_sink AS IsDangerousSink,
-               callee:Stub AS IsStubNode
+        RETURN callee.name AS CalledFunction, callee.is_vendor_code AS IsVendorLibrary, 
+               callee.is_dangerous_sink AS IsDangerousSink, callee:Stub AS IsStubNode
         """
         try:
             with self.db.driver.session() as session:
                 result = session.run(query, func_name=func_name).data()
-                if not result:
-                    return "No callees found."
-                    
-                # Format the results for the LLM
+                if not result: return "No callees found."
                 for r in result:
-                    if r.get("IsStubNode"):
-                        r["WARNING"] = "Stub node. No source code available."
-                        
+                    if r.get("IsStubNode"): r["WARNING"] = "Stub node. No source code available."
                 return str(result)
         except Exception as e:
             return f"Error executing tool: {e}"
 
     def read_file_span(self, storage_uri: str, byte_span: str) -> str:
-        """Reads exactly the requested bytes from a C/C++ source file."""
+        # (This function remains the same)
         if not storage_uri or not byte_span:
-            logger.info("[File Read] Missing storage_uri or byte_span; cannot read snippet")
             return "Error: Must provide both storage_uri and byte_span."
-
-        # Check Agent Memory
         if self._check_cache("read_file_span", f"{storage_uri}_{byte_span}"):
-            logger.info(f"[File Read] Skipping already-read file span for '{storage_uri}' '{byte_span}'")
-            return "System Note: You have already read this exact file span. It is in your conversation history. Do not request it again."
-
-        # Robust Windows/Linux URI parsing
+            return "System Note: You have already read this exact file span."
         file_path = storage_uri
-        if file_path.startswith("file://"):
-            file_path = file_path[7:]
-
-        if os.name == 'nt' and file_path.startswith('/') and ':' in file_path:
-            file_path = file_path[1:]
-
-        logger.info(f"[File Read] Reading file span '{byte_span}' from '{file_path}'")
-
+        if file_path.startswith("file://"): file_path = file_path[7:]
+        if os.name == 'nt' and file_path.startswith('/') and ':' in file_path: file_path = file_path[1:]
         try:
             start_byte, end_byte = map(int, byte_span.split('-'))
             with open(file_path, 'rb') as f:
                 f.seek(start_byte)
                 snippet = f.read(end_byte - start_byte)
-                logger.info(f"[File Read] Loaded {len(snippet)} bytes from '{file_path}'")
                 return snippet.decode('utf-8', errors='ignore')
         except FileNotFoundError:
-            logger.warning(f"[File Read] File not found: '{file_path}'")
             return f"Error: The file {file_path} was not found on disk."
         except Exception as e:
-            logger.warning(f"[File Read] Failed to read '{file_path}': {e}")
             return f"Error reading file from disk: {e}"
 
     def get_callers_and_entry_points(self, func_name: str) -> str:
-        """Retrieves upstream callers, or direct Hardware/UDS triggers."""
+        # (This function remains the same)
         if self._check_cache("get_callers", func_name):
             return f"System Note: Callers for '{func_name}' are already in your conversation history."
-
         query = """
         MATCH (f:Function {name: $func_name})
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-        RETURN 
-            collect(DISTINCT uds.did) AS UdsTriggers,
-            collect(DISTINCT net.name) AS NetworkTriggers,
-            collect(DISTINCT caller.name) AS StandardCallers,
-            f.is_hardware_entry AS IsHardwareTask
+        RETURN collect(DISTINCT uds.did) AS UdsTriggers, collect(DISTINCT net.name) AS NetworkTriggers,
+               collect(DISTINCT caller.name) AS StandardCallers, f.is_hardware_entry AS IsHardwareTask
         """
         try:
             with self.db.driver.session() as session:
@@ -142,14 +134,12 @@ class AnalyzerTools:
             return f"Error executing tool: {e}"
 
     def get_variable_access(self, func_name: str) -> str:
-        """Retrieves the global variables this function reads or writes."""
+        # (This function remains the same)
         if self._check_cache("get_vars", func_name):
             return f"System Note: Variable access for '{func_name}' is already in your conversation history."
-
         query = """
         MATCH (f:Function {name: $func_name})-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
-        RETURN v.name AS VariableName, 
-               type(r) AS AccessType
+        RETURN v.name AS VariableName, type(r) AS AccessType
         """
         try:
             with self.db.driver.session() as session:
