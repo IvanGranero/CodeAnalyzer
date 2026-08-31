@@ -13,8 +13,8 @@ class LLMService:
                  base_url: str, 
                  api_version: str, 
                  api_key_header: str = "",
-                 usd_per_1k_input: float = None,
-                 usd_per_1k_output: float = None):
+                 usd_input: float = None,
+                 usd_output: float = None):
         self.client = LLMClient(
             api_key=api_key, 
             model_name=model_name, 
@@ -25,8 +25,8 @@ class LLMService:
         self.prompts = self._load_prompts()
         self.tracker = TokenTracker(
             model_name=model_name, 
-            usd_per_1k_input=usd_per_1k_input, 
-            usd_per_1k_output=usd_per_1k_output
+            usd_input=usd_input, 
+            usd_output=usd_output
         )    
 
     def _load_prompts(self) -> dict:

@@ -64,8 +64,8 @@ async def main():
             base_url=settings.strong_base_url,
             api_version=settings.strong_api_version,
             api_key_header=settings.genai_subscription_header,
-            usd_per_1k_input=settings.strong_usd_input,
-            usd_per_1k_output=settings.strong_usd_output
+            usd_input=settings.strong_usd_input,
+            usd_output=settings.strong_usd_output
         )
         graph = GraphManager(
             uri=settings.neo4j_uri, 

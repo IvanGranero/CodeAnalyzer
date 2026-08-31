@@ -169,9 +169,12 @@ class ScanOrchestrator:
             requests = triage.get("follow_up_requests") or []
 
             # If Triage decides to escalate, it MUST provide the dynamic threat model
+            # If Triage decides to escalate, it MUST provide the dynamic threat model
             if decision == "escalate":
                 deep_scan_directive = triage.get("investigation_directive", "Perform a standard check for logic flaws.")
-                logger.info(f"Triage Escalated. Generated Threat Model Directive: {deep_scan_directive}")
+                preview = deep_scan_directive[:60].replace('\n', ' ') + "..." if len(deep_scan_directive) > 60 else deep_scan_directive
+                logger.info(f"Triage Escalated -> Threat Model: '{preview}'")
+                logger.debug(f"Full Threat Model Directive:\n{deep_scan_directive}")
                 break
 
             if decision == "ignore":

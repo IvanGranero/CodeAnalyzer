@@ -129,7 +129,10 @@ class LLMClient:
             raise RuntimeError("Frontier model returned no assistant message.")
 
         self._audit_log(final_kwargs, final_text, used_endpoint)
-        logger.info(f"[LLM response via {used_endpoint}] {final_text[:100]}...")
+        response_preview = final_text[:75].replace('\n', ' ') + "..." if len(final_text) > 75 else final_text
+        logger.info(f"[LLM Response] {response_preview}")
+        logger.debug(f"[Full LLM Response]\n{final_text}")
+
         return final_text
         
     async def _execute_legacy_chat(self, client, system_prompt, user_prompt, model_settings):
@@ -156,7 +159,9 @@ class LLMClient:
                 raise RuntimeError("Legacy model returned no assistant message.")
                 
             self._audit_log(kwargs_chat, final_text, used_endpoint)
-            logger.info(f"[LLM response via {used_endpoint}] {final_text[:100]}...")
+            response_preview = final_text[:75].replace('\n', ' ') + "..." if len(final_text) > 75 else final_text
+            logger.info(f"[LLM Response] {response_preview}")
+            logger.debug(f"[Full LLM Response]\n{final_text}")
             return final_text
             
         except Exception as e:
