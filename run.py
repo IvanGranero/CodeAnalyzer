@@ -17,6 +17,7 @@ from graph.resolver import GraphResolver
 from scan.orchestrator import ScanOrchestrator
 from scan.reporter import ScanReporter
 from exploit.orchestrator import ExploitOrchestrator
+from exploit.config import exploit_settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +45,7 @@ async def main():
 
     parser.add_argument("--resume", action="store_true", help="Resume from cached scans.")
     parser.add_argument("--skip-ingest", action="store_true", help="Skip the graph building phase.")
+    parser.add_argument("--skip-exploit", action="store_true", help="Skip the dynamic exploit validation phase.")
     parser.add_argument("--exploit-only", type=str, help="Path to a vulnerability JSON report to exploit directly.")
     args = parser.parse_args()
 
@@ -64,8 +66,8 @@ async def main():
             base_url=settings.strong_base_url,
             api_version=settings.strong_api_version,
             api_key_header=settings.genai_subscription_header,
-            usd_input=settings.strong_usd_input,
-            usd_output=settings.strong_usd_output
+            usd_per_1m_input=settings.strong_usd_input,
+            usd_per_1m_output=settings.strong_usd_output
         )
         graph = GraphManager(
             uri=settings.neo4j_uri, 
@@ -191,7 +193,7 @@ async def main():
         # PHASE 3: MULTI-AGENT VULNERABILITY SCAN
         # ==========================================
         mode_str = "ALL" if args.scan_all else str(args.limit)
-        logger.info(f"\n--- PHASE 3: Multi-Agent Vulnerability Scan (Limit: {mode_str}) ---")
+        logger.info(f"\n--- PHASE 3: Multi-Agent Vulnerability Scan ---")
         
         all_reports = {}
         if args.resume:
@@ -255,7 +257,12 @@ async def main():
                     finally:
                         exploit_queue.task_done()
 
-            exploit_worker_task = asyncio.create_task(exploit_worker())
+            # Start Exploit background task
+            if not args.skip_exploit:
+                exploit_worker_task = asyncio.create_task(exploit_worker())
+            else:
+                exploit_worker_task = None
+                logger.info("Exploitation phase disabled via --skip-exploit.")
 
             MAX_CONCURRENT_SCANS = 5 
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
@@ -264,9 +271,10 @@ async def main():
                 for func_name, report in all_reports.items():
                     is_uds = report.get("metadata", {}).get("TaintedByUDS") is True
                     if report.get("vulnerability_found") and "exploit_validation" not in report and is_uds:
-                        domain_to_use = selected_domain if selected_domain else report.get("domain", "all")
-                        exploit_queue.put_nowait((report, func_name, domain_to_use))
-                        resumed_exploits += 1
+                        if not args.skip_exploit:  # <--- NEW CHECK
+                            domain_to_use = selected_domain if selected_domain else report.get("domain", "all")
+                            exploit_queue.put_nowait((report, func_name, domain_to_use))
+                            resumed_exploits += 1
 
                 if resumed_exploits > 0:
                     logger.info(f"🔄 Resumed {resumed_exploits} pending exploit(s) from cache.")
@@ -281,12 +289,37 @@ async def main():
                         
                         if report.get("vulnerability_found"):
                             logger.warning(f"⚠️ [VULNERABILITY FOUND] -> {target_func} ({report.get('severity')})")
-                            is_uds = report.get("metadata", {}).get("TaintedByUDS") is True
+                            
+                            # --- FIX 1: Robust Boolean Parsing ---
+                            taint_val = report.get("metadata", {}).get("TaintedByUDS", False)
+                            is_uds = taint_val is True or str(taint_val).lower() == "true"
+                            
                             if is_uds:
-                                domain_to_use = selected_domain if selected_domain else "all"
-                                await exploit_queue.put((report, target_func, domain_to_use))
+                                if args.skip_exploit:
+                                    logger.info(f"⏭️ [SKIPPED EXPLOIT] -> {target_func} (--skip-exploit flag active).")
+                                else:                                
+                                    domain_to_use = selected_domain
+                                    
+                                    if not domain_to_use:
+                                        # Normalize the file path to use forward slashes
+                                        file_path = report.get("metadata", {}).get("FilePath", "")
+                                        normalized_path = file_path.replace("\\\\", "/").replace("\\", "/").lower()
+                                        
+                                        # Match the folder name against the keys in DOIP_TARGET_MAP (.env)
+                                        for domain_key in exploit_settings.target_map.keys():
+                                            if f"/{domain_key.lower()}/" in normalized_path:
+                                                domain_to_use = domain_key
+                                                logger.debug(f"Dynamically mapped {target_func} to domain: {domain_key}")
+                                                break
+                                                
+                                    # Fallback if no folder matches known domains
+                                    if not domain_to_use:
+                                        domain_to_use = "diag" # Safer default than 'all'
+                                    
+                                    await exploit_queue.put((report, target_func, domain_to_use))
                             else:
                                 logger.info(f"⏭️ [SKIPPED EXPLOIT] -> {target_func} is not reachable via UDS/DoIP.")
+
                         else:
                             logger.info(f"✔ [CLEAN] -> {target_func}")
                         return report
@@ -303,8 +336,13 @@ async def main():
                 scan_queue.put_nowait(t)
 
             async def scan_worker():
-                while not scan_queue.empty():
-                    target_func = await scan_queue.get()
+                while True:
+                    # --- FIX 2: Prevent asyncio deadlocks using get_nowait ---
+                    try:
+                        target_func = scan_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break  # Cleanly exit the worker when queue is empty
+                        
                     try:
                         # bounded_scan handles the semaphore and orchestrator calls
                         await bounded_scan(target_func)
@@ -319,35 +357,46 @@ async def main():
             
             try:
                 # Wait for the scan queue to empty
-                await scan_queue.join()
+                if targets_to_scan:
+                    await scan_queue.join()
                 
-                if not exploit_queue.empty():
-                    logger.info("⏳ Scans complete. Waiting for remaining exploits to finish...")
-                await exploit_queue.join() 
-                
-                # Shut down the exploit worker
-                await exploit_queue.put(None)
-                await exploit_worker_task
+                if not args.skip_exploit:
+                    if not exploit_queue.empty():
+                        logger.info("⏳ Scans complete. Waiting for remaining exploits to finish...")
+                    await exploit_queue.join() 
+                    
+                    # Kill the exploit worker safely
+                    await exploit_queue.put(None)
+                    await exploit_worker_task
+                    
             except asyncio.CancelledError:
                 logger.warning("\nExecution was cancelled. Shutting down gracefully...")
                 for w in workers:
                     w.cancel()
 
-
         # --- Final Reporting ---
         if all_reports:
-            reporter.generate_consolidated_reports(all_reports)
             print("\n" + "="*60)
-            logger.info("FINAL AUTOMOTIVE SCAN SUMMARY:")
+            logger.info("FINAL SCAN SUMMARY:")
             print("="*60)
-            vuln_count = sum(1 for r in all_reports.values() if r.get("vulnerability_found"))
+            
+            vuln_count = 0
+            for func, report in all_reports.items():
+                if report.get("vulnerability_found"):
+                    vuln_count += 1
+                    logger.warning(f"🚨 [{report.get('severity', 'HIGH').upper()}] {func}")
+                    # --- NEW: Generate the individual report ---
+                    reporter.generate_individual_report(func, report)
+            
             if vuln_count > 0:
-                for func, report in all_reports.items():
-                    if report.get("vulnerability_found"):
-                        logger.warning(f"🚨 [{report.get('severity', 'HIGH').upper()}] {func}")
+                logger.info(f"✅ Generated {vuln_count} individual Markdown reports in the 'reports/' directory.")
             else:
                 logger.info("✅ No vulnerabilities were found in the scanned targets.")
             print("="*60 + "\n")
+            
+            # Optional: Generate a single SARIF file for CI/CD integration if your reporter supports it
+            if hasattr(reporter, 'generate_consolidated_reports'):
+                reporter.generate_consolidated_reports(all_reports)
 
     except asyncio.CancelledError:
         logger.info("\nMain execution was cancelled.")

@@ -166,3 +166,63 @@ class ScanReporter:
             logger.info(f"Consolidated SARIF report saved to '{filepath}'")
         except Exception as e:
             logger.error(f"Failed to save SARIF report: {e}")
+
+    def generate_individual_report(self, func_name: str, report: dict):
+        """Generates a dedicated Markdown report tracing the full Tri-Agent chain for a single vulnerability."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(self.output_dir, f"VULN_{func_name}_{timestamp}.md")
+        
+        md = [f"# Vulnerability Report: `{func_name}`\n"]
+        md.append(f"**Severity:** {report.get('severity', 'UNKNOWN').upper()} | **Confidence:** {report.get('confidence', 'UNKNOWN').upper()}\n")
+        
+        metadata = report.get("metadata", {})
+        md.append("### 📍 Location & Context")
+        md.append(f"- **File:** `{metadata.get('FilePath', 'Unknown')}`")
+        md.append(f"- **Byte Span:** `{metadata.get('ByteSpan', 'Unknown')}`")
+        if metadata.get('DIDs'):
+            md.append(f"- **Target DIDs:** `{', '.join(metadata.get('DIDs', []))}`")
+        md.append("\n---\n")
+        
+        md.append("## 1️⃣ Triage Agent (Threat Model Generator)")
+        triage_dir = report.get("triage_directive", "No triage directive recorded.")
+        md.append(f"> {triage_dir}\n")
+        
+        md.append("## 2️⃣ Deep Scan Agent (Static Analysis Prover)")
+        md.append(report.get("details", "No details provided."))
+        md.append("\n---\n")
+        
+        exploit_val = report.get("exploit_validation")
+        md.append("## 3️⃣ Exploit Orchestrator (Dynamic Validation)")
+        if not exploit_val:
+            md.append("*No dynamic exploit validation was run for this target.*")
+        else:
+            status = exploit_val.get('status', 'Unknown').upper()
+            status_icon = "💀" if status == "SUCCESS" else "🛡️"
+            md.append(f"**Final Status:** {status_icon} **{status}**")
+            md.append(f"**Strategist Rationale:** {exploit_val.get('rationale', 'None')}\n")
+            
+            chain = exploit_val.get("exploit_chain", [])
+            if chain:
+                md.append("### Execution Chain Log")
+                for step in chain:
+                    md.append(f"#### Attempt {step.get('attempt')}")
+                    
+                    if 'tx_payload' in step:
+                        md.append(f"- **Crafted Payload:** `{step.get('tx_payload')}` (Delivery: *{step.get('delivery_method', 'sequential')}*)")
+                    
+                    if 'oracle_finding' in step:
+                        md.append(f"- **Oracle Finding:** `{step.get('oracle_finding')}`")
+                        
+                    if 'analysis' in step:
+                        md.append(f"- **Analyzer Observation:** {step['analysis'].get('observation', 'None')}")
+                        
+                    if 'error' in step:
+                        md.append(f"- **Error:** `{step.get('error')}`")
+                    md.append("")
+                    
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(md))
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to write individual report for {func_name}: {e}")

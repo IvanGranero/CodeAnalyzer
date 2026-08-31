@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 class TokenTracker:
-    def __init__(self, model_name: str, usd_input: Optional[float] = None, usd_output: Optional[float] = None):
+    def __init__(self, model_name: str, usd_per_1m_input: Optional[float] = None, usd_per_1m_output: Optional[float] = None):
         self.lock = threading.Lock()
         self.model_name = model_name
         self.total_calls = 0
@@ -14,8 +14,8 @@ class TokenTracker:
         self.reasoning_tokens = 0
 
         # Extract pricing or fallback to 0 if not provided in .env
-        self.input_rate = usd_input if usd_input is not None else 0.0
-        self.output_rate = usd_output if usd_output is not None else 0.0
+        self.input_rate = usd_per_1m_input if usd_per_1m_input is not None else 0.0
+        self.output_rate = usd_per_1m_output if usd_per_1m_output is not None else 0.0
 
     def add_usage(self, usage: Dict[str, Any]):
         """Safely aggregates token usage from the raw API response."""
@@ -32,7 +32,7 @@ class TokenTracker:
                 self.reasoning_tokens += details.get("reasoning_tokens", 0)
 
     def get_estimated_cost(self) -> float:
-        """Calculates cost based on the 1K token pricing from config."""
+        """Calculates cost based on the 1M token pricing from config."""
         input_cost = (self.prompt_tokens / 1_000_000) * self.input_rate
         output_cost = (self.completion_tokens / 1_000_000) * self.output_rate
         return input_cost + output_cost

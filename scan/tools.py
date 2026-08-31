@@ -21,15 +21,18 @@ class AnalyzerTools:
         return False
 
     def get_function_metadata(self, func_name: str) -> str:
-        """Returns the file path, byte span, and UDS entry point status of a function."""
-        if self._check_cache("get_function_metadata", func_name):
-            return f"System Note: Metadata for '{func_name}' is already in your conversation history. Do not request it again."
-
         query = """
         MATCH (f:Function {name: $func_name})
-        RETURN f.storage_uri AS FilePath, f.byte_span AS ByteSpan, 
-               f.tainted_by_uds AS TaintedByUDS, f.reachable_from_dids AS DIDs,
-               coalesce(f.is_vendor_code, false) AS IsVendorLibrary, f:Stub AS IsStubNode
+        WHERE NOT f.storage_uri ENDS WITH '.h'  // <--- NEW: Force .c file
+        RETURN {
+            FilePath: f.storage_uri,
+            ByteSpan: f.byte_span,
+            TaintedByUDS: coalesce(f.tainted_by_uds, false),
+            DIDs: coalesce(f.reachable_from_dids, []),
+            IsVendorLibrary: coalesce(f.is_vendor_code, false),
+            IsStubNode: f:Stub
+        } AS metadata
+        LIMIT 1
         """
         try:
             with self.db.driver.session() as session:
@@ -43,7 +46,6 @@ class AnalyzerTools:
         except Exception as e:
             return f"Error executing tool: {e}"
 
-    # --- NEW: Tool to get the definition of a struct, enum, or typedef ---
     def get_type_definition(self, type_name: str) -> str:
         """Returns the source code snippet for a struct, enum, or typedef definition."""
         if self._check_cache("get_type_definition", type_name):

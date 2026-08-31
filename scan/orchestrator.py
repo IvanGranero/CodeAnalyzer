@@ -20,20 +20,63 @@ class ScanOrchestrator:
         if not response_text:
             raise ValueError("Empty response from LLM")
 
+        try:
+            # 1. Fast happy path
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            pass
+
+        # 2. Strip Markdown
         cleaned = response_text.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
+        if cleaned.startswith("```json"): cleaned = cleaned[7:]
+        elif cleaned.startswith("```"): cleaned = cleaned[3:]
+        if cleaned.endswith("```"): cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
 
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. Bracket Counting (Bulletproof for trailing garbage/bad cuts)
+        logger.warning("Standard JSON parse failed. Attempting bracket-counting extraction...")
         start_idx = cleaned.find('{')
-        end_idx = cleaned.rfind('}')
-        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-            raise ValueError(f"No JSON object found in response: {response_text[:200]}")
-
-        return json.loads(cleaned[start_idx:end_idx + 1])
+        if start_idx == -1:
+            raise ValueError("No '{' found in response.")
+            
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(cleaned)):
+            char = cleaned[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+                
+            if char == '\\':
+                escape_next = True
+                continue
+                
+            if char == '"':
+                in_string = not in_string
+                continue
+                
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    
+                # We found the matching closing brace for the first opening brace!
+                if brace_count == 0:
+                    try:
+                        return json.loads(cleaned[start_idx:i+1])
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Extracted JSON block is invalid: {e}")
+                        
+        raise ValueError("Could not find balanced JSON brackets in response.")
 
     def _fetch_follow_up_artifact(self, request: Dict[str, Any]) -> str:
         kind = request.get("kind", "unknown")
@@ -52,7 +95,9 @@ class ScanOrchestrator:
         if kind == "global_initializer" and symbol:
             query = """
             MATCH (n) WHERE n.name = $symbol
-            RETURN n.name AS name, labels(n) AS labels, n.storage_uri AS file, n.byte_span AS span LIMIT 5
+            RETURN n.name AS name, labels(n) AS labels, n.storage_uri AS file, n.byte_span AS span
+            ORDER BY CASE WHEN n.storage_uri ENDS WITH '.h' THEN 1 ELSE 0 END ASC
+            LIMIT 5
             """
             try:
                 with self.tools_engine.db.driver.session() as session:
@@ -71,11 +116,12 @@ class ScanOrchestrator:
 
         return f"FOLLOW-UP ARTIFACT ({kind}):\nNo retriever implemented; request requires manual review."
     
-    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "") -> Dict[str, Any]:
+    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> Dict[str, Any]:
         """Triage acts as Hypothesis Generator."""
         try:
             response_text = await self.llm.execute_task(
                 task_name="triage_agent",
+                context_id=target_func,
                 kwargs={
                     "graph_json": graph_json,
                     "graph_summary": graph_summary,
@@ -89,11 +135,12 @@ class ScanOrchestrator:
             logger.warning(f"Triage did not return JSON. Error: {exc}")
             return {"decision": "request_more", "confidence": 0.2, "reason": "Triage output was not valid JSON.", "follow_up_requests": []}
 
-    async def _deep_scan_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "") -> Dict[str, Any]:
+    async def _deep_scan_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> Dict[str, Any]:
         """Deep scan evaluates the hypothesis with full context."""
         try:
             response_text = await self.llm.execute_task(
                 task_name="deep_scan_agent",
+                context_id=target_func,
                 kwargs={
                     "graph_json": graph_json,
                     "graph_summary": graph_summary,
@@ -115,7 +162,11 @@ class ScanOrchestrator:
             }
 
     def _get_target_source(self, func_name: str) -> str:
-        query = "MATCH (f:Function {name: $func_name}) RETURN f.storage_uri AS uri, f.byte_span AS span LIMIT 1"
+        query = """
+        MATCH (f:Function {name: $func_name}) 
+        WHERE NOT f.storage_uri ENDS WITH '.h'
+        RETURN f.storage_uri AS uri, f.byte_span AS span LIMIT 1
+        """
         try:
             with self.tools_engine.db.driver.session() as session:
                 result = session.run(query, func_name=func_name).single()
@@ -164,7 +215,7 @@ class ScanOrchestrator:
 
         while triage_budget >= 0:
             logger.info(f"Running triage for '{target_function_name}' (remaining budget: {triage_budget})")
-            triage = await self._triage_target(graph_json, graph_summary, source_code, base_directive, follow_up_context)
+            triage = await self._triage_target(graph_json, graph_summary, source_code, base_directive, follow_up_context, target_func=target_function_name)
             decision = triage.get("decision", "escalate")
             requests = triage.get("follow_up_requests") or []
 
@@ -204,7 +255,7 @@ class ScanOrchestrator:
         while deep_budget >= 0:
             logger.info(f"Running deep scan for '{target_function_name}' (remaining budget: {deep_budget})")
             # Pass the dynamically generated directive from the Triage Agent!
-            deep_response = await self._deep_scan_target(graph_json, graph_summary, source_code, deep_scan_directive, follow_up_context)
+            deep_response = await self._deep_scan_target(graph_json, graph_summary, source_code, deep_scan_directive, follow_up_context, target_func=target_function_name)
             last_report = deep_response
 
             follow_up_requests = deep_response.get("follow_up_requests") or []
@@ -238,6 +289,7 @@ class ScanOrchestrator:
 
         if isinstance(last_report, dict):
             last_report["metadata"] = metadata
+            last_report["triage_directive"] = deep_scan_directive 
             return last_report
 
         logger.error(f"Deep Scan output for {target_function_name} was not a dictionary: {last_report}")

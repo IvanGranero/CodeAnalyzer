@@ -13,8 +13,9 @@ class LLMService:
                  base_url: str, 
                  api_version: str, 
                  api_key_header: str = "",
-                 usd_input: float = None,
-                 usd_output: float = None):
+                 usd_per_1m_input: float = None,
+                 usd_per_1m_output: float = None):
+                 
         self.client = LLMClient(
             api_key=api_key, 
             model_name=model_name, 
@@ -23,10 +24,12 @@ class LLMService:
             api_key_header=api_key_header
         )
         self.prompts = self._load_prompts()
+        
+        # Pass the 1M pricing down to the tracker
         self.tracker = TokenTracker(
             model_name=model_name, 
-            usd_input=usd_input, 
-            usd_output=usd_output
+            usd_per_1m_input=usd_per_1m_input, 
+            usd_per_1m_output=usd_per_1m_output
         )    
 
     def _load_prompts(self) -> dict:
@@ -37,7 +40,7 @@ class LLMService:
             logger.error(f"Failed to load prompts.json: {e}")
             return {}
 
-    async def execute_task(self, task_name: str, kwargs: dict) -> str:
+    async def execute_task(self, task_name: str, kwargs: dict, context_id: str = None) -> str:
         if task_name not in self.prompts:
             raise ValueError(f"Task '{task_name}' not found in prompts.json")
             
@@ -52,13 +55,16 @@ class LLMService:
         start_time = time.time()
         logger.info(f"LLM Service ({self.client.model_name}): Executing async task '{task_name}'")
         
-        # --- CHANGED: Added 'await' ---
-        result = await self.client.generate_chat(system_prompt, user_prompt, settings)
-        if hasattr(result, 'usage') and result.usage:
-            # Convert the usage object to a dict to pass to the tracker
-            self.tracker.add_usage(result.usage.model_dump())
+        result_text, usage_dict = await self.client.generate_chat(system_prompt, user_prompt, settings, context_id)
+        
+        if usage_dict:
+            self.tracker.add_usage(usage_dict)
 
         elapsed = time.time() - start_time
         logger.info(f"LLM Service ({self.client.model_name}): Task '{task_name}' completed in {elapsed:.2f}s")
         
-        return result
+        # Keep logs clean: short preview on DEBUG
+        preview = result_text[:75].replace('\n', ' ') + "..." if len(result_text) > 75 else result_text
+        logger.debug(f"[LLM Response Preview] {preview}")
+        
+        return result_text

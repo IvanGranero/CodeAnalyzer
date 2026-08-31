@@ -2,9 +2,10 @@ import os
 import json
 import uuid
 import logging
+import asyncio
 from datetime import datetime
 import openai
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,10 @@ class LLMClient:
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
         
-        # --- NEW: Flag to cache the preferred endpoint ---
         self._use_legacy_endpoint = False
-        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_audit_file = os.path.join(self.audit_log_dir, f"llm_session_{timestamp}.txt")
+                
         self.clients = []
         for key in self.api_keys:
             headers = {self.api_key_header: key}
@@ -43,18 +45,19 @@ class LLMClient:
                     base_url=self.base_url,
                     api_key=key,
                     default_headers=headers,
-                    default_query=query_params if query_params else None
+                    default_query=query_params if query_params else None,
+                    timeout=60.0 # Added explicit timeout
                 )
             )
             
         self._current_index = 0
         logger.info(f"Initialized LLMClient with {len(self.clients)} keys. Auth Header: '{self.api_key_header}'")
 
-    def _audit_log(self, kwargs: dict, response_content: str, endpoint_used: str):
+    def _audit_log(self, kwargs: dict, response_content: str, endpoint_used: str, context_id: str = None):
         """Saves the exact API payload and response to disk for debugging/auditing."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_id = str(uuid.uuid4())[:8]
-        filename = os.path.join(self.audit_log_dir, f"llm_audit_{timestamp}_{run_id}.txt")
+        safe_name = "".join(c for c in (context_id or "unknown_target") if c.isalnum() or c in "_-")
+        filename = os.path.join(self.audit_log_dir, f"llm_audit_{safe_name}.txt")
         
         log_content = (
             f"==================================================\n"
@@ -65,32 +68,26 @@ class LLMClient:
             f"=== RAW INPUT (API PAYLOAD) ===\n"
             f"{json.dumps(kwargs, indent=2)}\n\n"
             f"=== RAW OUTPUT (LLM RESPONSE) ===\n"
-            f"{response_content}\n"
+            f"{response_content}\n\n\n"
         )
-        
         try:
-            with open(filename, "w", encoding="utf-8") as f:
+            with open(filename, "a", encoding="utf-8") as f:
                 f.write(log_content)
         except Exception as e:
             logger.error(f"Failed to write LLM audit log: {e}")
 
-    async def generate_chat(self, system_prompt: str, user_prompt: str, model_settings: dict = None) -> str:
+    async def generate_chat(self, system_prompt: str, user_prompt: str, model_settings: dict = None, context_id: str = None) -> tuple[str, dict]:
+
+        """Returns a tuple of (response_text, usage_dict)"""
         if model_settings is None:
             model_settings = {}
             
         client = self.clients[self._current_index]
         self._current_index = (self._current_index + 1) % len(self.clients)
         
-        reasoning_text = None
-        final_text = None
-        used_endpoint = ""
-        final_kwargs = None
-        
-        # --- NEW: Fast Path for Legacy API ---
         if self._use_legacy_endpoint:
-            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings)
+            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id)
 
-        # Standard Modern Path
         kwargs_responses = {
             "model": self.model_name,
             "input": [
@@ -101,42 +98,52 @@ class LLMClient:
         if "max_tokens" in model_settings: 
             kwargs_responses["max_tokens"] = model_settings["max_tokens"]
 
-        try:
-            # 1. Attempt the new 'Responses' API
-            response = await client.responses.create(**kwargs_responses)
-            
-            for block in response.output:
-                if block.type == "reasoning":
-                    reasoning_text = block.encrypted_content or "No reasoning summary available."
-                elif block.type == "message":
-                    final_text = block.content[0].text
-                    
-            used_endpoint = "/responses"
-            final_kwargs = kwargs_responses
-            
-        except openai.NotFoundError:
-            # 2. Graceful Fallback if Gateway throws 404
-            logger.warning(f"[LLM] Endpoint /responses returned 404. Falling back to /chat/completions globally.")
-            self._use_legacy_endpoint = True  # <--- Cache the failure so we never try /responses again
-            
-            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings)
+        max_retries = 3
+        base_delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                response = await client.responses.create(**kwargs_responses)
                 
-        except Exception as e:
-            logger.exception(f"[LLM] Primary API call failed with unknown error on model {self.model_name}")
-            raise
+                final_text = None
+                usage_dict = {}
+                
+                # Extract tokens
+                if hasattr(response, 'usage') and response.usage:
+                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage)
+                    
+                # Extract text
+                for block in response.output:
+                    if block.type == "message":
+                        final_text = block.content[0].text
+                
+                if final_text is None:
+                    raise RuntimeError("Frontier model returned no assistant message.")
 
-        if final_text is None:
-            raise RuntimeError("Frontier model returned no assistant message.")
+                self._audit_log(kwargs_responses, final_text, "/responses", context_id)
+                return final_text, usage_dict
 
-        self._audit_log(final_kwargs, final_text, used_endpoint)
-        response_preview = final_text[:75].replace('\n', ' ') + "..." if len(final_text) > 75 else final_text
-        logger.info(f"[LLM Response] {response_preview}")
-        logger.debug(f"[Full LLM Response]\n{final_text}")
+            except openai.NotFoundError:
+                logger.warning(f"[LLM] Endpoint /responses returned 404. Falling back to /chat/completions globally.")
+                self._use_legacy_endpoint = True
+                return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id)
 
-        return final_text
-        
-    async def _execute_legacy_chat(self, client, system_prompt, user_prompt, model_settings):
-        """Helper method to isolate the legacy /chat/completions logic"""
+            except APIConnectionError as e:
+                logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1: raise
+                await asyncio.sleep(base_delay * (2 ** attempt))
+                
+            except Exception as e:
+                err_str = str(e).lower()
+                if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:
+                    logger.warning(f"[LLM Network Error] Socket/Timeout (Attempt {attempt+1}/{max_retries}): {e}")
+                    if attempt == max_retries - 1: raise
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    logger.exception(f"[LLM] Primary API call failed with unknown error on model {self.model_name}")
+                    raise
+
+    async def _execute_legacy_chat(self, client, system_prompt, user_prompt, model_settings, context_id: str = None) -> tuple[str, dict]:
         kwargs_chat = {
             "model": self.model_name,
             "messages": [ 
@@ -150,20 +157,36 @@ class LLMClient:
         if model_settings.get("response_format") == "json_object": 
             kwargs_chat["response_format"] = {"type": "json_object"}
             
-        try:
-            response = await client.chat.completions.create(**kwargs_chat)
-            final_text = response.choices[0].message.content
-            used_endpoint = "/chat/completions"
-            
-            if final_text is None:
-                raise RuntimeError("Legacy model returned no assistant message.")
+        max_retries = 3
+        base_delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                response = await client.chat.completions.create(**kwargs_chat)
+                final_text = response.choices[0].message.content
+                used_endpoint = "/chat/completions"
                 
-            self._audit_log(kwargs_chat, final_text, used_endpoint)
-            response_preview = final_text[:75].replace('\n', ' ') + "..." if len(final_text) > 75 else final_text
-            logger.info(f"[LLM Response] {response_preview}")
-            logger.debug(f"[Full LLM Response]\n{final_text}")
-            return final_text
-            
-        except Exception as e:
-            logger.exception(f"[LLM] Fallback API call failed on model {self.model_name}")
-            raise
+                usage_dict = {}
+                if hasattr(response, 'usage') and response.usage:
+                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage)
+                
+                if final_text is None:
+                    raise RuntimeError("Legacy model returned no assistant message.")
+                    
+                self._audit_log(kwargs_chat, final_text, used_endpoint, context_id)
+                return final_text, usage_dict
+                
+            except APIConnectionError as e:
+                logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1: raise
+                await asyncio.sleep(base_delay * (2 ** attempt))
+                
+            except Exception as e:
+                err_str = str(e).lower()
+                if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:
+                    logger.warning(f"[LLM Network Error] Socket/Timeout (Attempt {attempt+1}/{max_retries}): {e}")
+                    if attempt == max_retries - 1: raise
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    logger.exception(f"[LLM] Fallback API call failed on model {self.model_name}")
+                    raise

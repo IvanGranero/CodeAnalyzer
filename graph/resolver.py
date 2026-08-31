@@ -24,6 +24,7 @@ class GraphResolver:
         # --- FIXED FOR NEO4J 5 GQL COMPLIANCE AND EDGE PROPERTIES ---
         query = """
         MATCH (f:Function {name: $func_name})
+        WHERE NOT f.storage_uri ENDS WITH '.h'  // <--- Force it to grab the .c implementation!
         
         // 1. Gather Concurrency Context
         OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(task:OsTask)
@@ -398,10 +399,12 @@ class GraphResolver:
             }
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
 
-    def get_prioritized_targets(self, max_targets: int, domain_filter: Optional[str] = None, file_filter: Optional[str] = None) -> List[str]:
+    def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None) -> list:
         cypher_filter = ""
+        
         if domain_filter:
             cypher_filter += f" AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\\\{domain_filter}\\\\')"
+            
         if file_filter:
             import os
             safe_file = os.path.basename(file_filter)
@@ -409,31 +412,38 @@ class GraphResolver:
             
         query = f"""
         MATCH (f:Function)
+        // 1. STRICT FILTERS: Must be app code, not dead, not a stub, not a header
         WHERE coalesce(f.is_vendor_code, false) = false 
           AND coalesce(f.is_dead_code, false) = false 
           AND NOT f:Stub
+          AND NOT f.storage_uri ENDS WITH '.h'
           {cypher_filter}
-        OPTIONAL MATCH (f)-[:CALLS*1..3]->(sink:Function {{is_dangerous_sink: true}})
-        OPTIONAL MATCH (f)-[:WRITES_VAR]->(w:GlobalVariable)
-        WITH f,
-             (CASE WHEN coalesce(f.tainted_by_uds, false) THEN 100 ELSE 0 END) +
-             (CASE WHEN coalesce(f.is_hardware_entry, false) THEN 80 ELSE 0 END) +
-             (CASE WHEN coalesce(f.has_data_race_risk, false) THEN 200 ELSE 0 END) +
-             (count(DISTINCT sink) * 50) +
-             (count(DISTINCT w) * 10) AS RiskScore
-        WHERE RiskScore > 0
-        RETURN f.name AS FunctionName, RiskScore
-        ORDER BY RiskScore DESC, f.name ASC
+        
+        // 2. RISK FILTERS: Only pick functions that actually have attack surface
+        AND (
+            coalesce(f.has_data_race_risk, false) = true OR
+            coalesce(f.tainted_by_uds, false) = true OR
+            coalesce(f.is_dangerous_sink, false) = true OR 
+            coalesce(f.is_hardware_entry, false) = true
+        )
+        
+        RETURN f.name AS FunctionName,
+               coalesce(f.has_data_race_risk, false) AS DataRace,
+               coalesce(f.tainted_by_uds, false) AS UdsTaint
+        ORDER BY DataRace DESC, UdsTaint DESC
         """
+        
+        # If max_targets is 0 (uncapped), we drop the LIMIT clause entirely
         if max_targets > 0:
-            query += f"\nLIMIT {max_targets}"
+            query += f" LIMIT {max_targets}"
             
         try:
             with self.db.driver.session() as session:
                 results = session.run(query).data()
-            return [r["FunctionName"] for r in results]
+                return [r["FunctionName"] for r in results]
         except Exception as e:
-            logger.error(f"Failed to extract prioritized targets from Neo4j: {e}")
+            import logging
+            logging.getLogger(__name__).error(f"Failed to get prioritized targets: {e}")
             return []
 
     def run_all_passes(self):
