@@ -24,8 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logging.getLogger("neo4j").setLevel(logging.WARNING)
+# Suppress noisy third-party library logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("neo4j").setLevel(logging.ERROR)          # Changed to ERROR
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR) # Added to silence DBMS warnings
 
 @dataclass
 class AppContext:
@@ -36,7 +38,6 @@ async def main():
     parser = argparse.ArgumentParser(description="AutoSAR Vulnerability Scanner Orchestrator")
     parser.add_argument("source_dir", nargs='?', default=".", help="Path to the AutoSAR source code directory")
     
-    # --- NEW: Deterministic Scope & Limit Arguments ---
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of top-risk functions to scan (default: 50).")
     parser.add_argument("--scan-all", action="store_true", help="Scan all discovered targets in scope, bypassing the limit.")
     parser.add_argument("--target-file", type=str, help="Restrict the scan to a specific file (e.g., 'bsw/Com.c').")
@@ -53,7 +54,7 @@ async def main():
         logger.error(f"The directory '{target_directory}' does not exist.")
         sys.exit(1)
 
-    scan_limit = 0 if args.scan_all else args.limit
+    scan_limit = 0 if args.scan_all or args.target_file else args.limit
     
     logger.info("Initializing Core Services...")
     try:
@@ -62,7 +63,9 @@ async def main():
             model_name=settings.strong_model_id,
             base_url=settings.strong_base_url,
             api_version=settings.strong_api_version,
-            api_key_header=settings.genai_subscription_header
+            api_key_header=settings.genai_subscription_header,
+            usd_per_1k_input=settings.strong_usd_input,
+            usd_per_1k_output=settings.strong_usd_output
         )
         graph = GraphManager(
             uri=settings.neo4j_uri, 
@@ -75,7 +78,6 @@ async def main():
         sys.exit(1)
 
     app_context = AppContext(llm=llm_service, graph=graph)
-    orchestrator = ScanOrchestrator(app_context.llm, app_context.graph)
     reporter = ScanReporter(output_dir="reports")
 
     # ==========================================
@@ -150,10 +152,15 @@ async def main():
             )            
             
             app_context.graph.resolver.run_all_passes()
-        
+
         # ==========================================
         # PHASE 2.5: INTERACTIVE DOMAIN SELECTION
         # ==========================================
+        mcu = config_json.get("mcu_guess", "Unknown MCU")
+        vendor = config_json.get("stack_vendor", "Generic AutoSAR")
+        platform_info = f"Hardware: {mcu}, Stack: {vendor}"
+        logger.info(f"Platform Context established: {platform_info}")        
+        orchestrator = ScanOrchestrator(app_context.llm, app_context.graph, platform_info=platform_info)
         app_domains = config_json.get('app_domains', [])
         selected_domain = None
 
@@ -290,17 +297,42 @@ async def main():
                         logger.error(f"Scan for {target_func} crashed: {exc}")
                         return None                            
 
-            tasks = [asyncio.create_task(bounded_scan(t)) for t in targets_to_scan]
+            # --- ENTERPRISE SCALE SCANNER QUEUE ---
+            scan_queue = asyncio.Queue()
+            for t in targets_to_scan:
+                scan_queue.put_nowait(t)
+
+            async def scan_worker():
+                while not scan_queue.empty():
+                    target_func = await scan_queue.get()
+                    try:
+                        # bounded_scan handles the semaphore and orchestrator calls
+                        await bounded_scan(target_func)
+                    except Exception as e:
+                        logger.error(f"Worker failed on {target_func}: {e}")
+                    finally:
+                        scan_queue.task_done()
+
+            # Create a fixed number of concurrent workers (e.g., 5)
+            MAX_CONCURRENT_SCANS = 5
+            workers = [asyncio.create_task(scan_worker()) for _ in range(MAX_CONCURRENT_SCANS)]
             
             try:
-                await asyncio.gather(*tasks)
+                # Wait for the scan queue to empty
+                await scan_queue.join()
+                
                 if not exploit_queue.empty():
                     logger.info("⏳ Scans complete. Waiting for remaining exploits to finish...")
                 await exploit_queue.join() 
+                
+                # Shut down the exploit worker
                 await exploit_queue.put(None)
                 await exploit_worker_task
             except asyncio.CancelledError:
-                logger.warning("\nGathering was cancelled. Shutting down gracefully...")
+                logger.warning("\nExecution was cancelled. Shutting down gracefully...")
+                for w in workers:
+                    w.cancel()
+
 
         # --- Final Reporting ---
         if all_reports:
@@ -322,6 +354,8 @@ async def main():
     except Exception as e:
         logger.exception("An unhandled error occurred during execution:")
     finally:
+        if 'app_context' in locals() and hasattr(app_context.llm, 'tracker'):
+            app_context.llm.tracker.log_summary()
         app_context.graph.close()
         logger.info("Database connection closed.")
 

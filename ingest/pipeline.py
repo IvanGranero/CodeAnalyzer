@@ -36,20 +36,18 @@ class IngestionPipeline:
             logger.info(f"Parsing {len(config_files)} OS/System configuration files...")
             
             for config_file in config_files:
-                full_path = os.path.join(self.target_dir, config_file)
+                normalized_config_path = os.path.normpath(config_file)
+                full_path = os.path.join(self.target_dir, normalized_config_path)
                 
                 if os.path.exists(full_path):
                     logger.debug(f"Parsing config: {config_file}")
-                    
-                    # --- NEW: Route to the correct parser based on file extension ---
-                    if config_file.endswith(('.arxml', '.xml')):
+                    if config_file.endswith(('.arxml', '.xml')) and hasattr(self, 'arxml_parser'):
                         self.arxml_parser.parse(full_path)
-                    elif config_file.endswith('.json'):
+                    elif config_file.endswith('.json') and hasattr(self, 'rte_json_parser'):
                         self.rte_json_parser.parse(full_path)
-                    
                     self._check_and_flush()
                 else:
-                    logger.warning(f"Config file not found on disk: {full_path} (Discovery may have hallucinated this path)")
+                    logger.warning(f"Config file not found on disk: {full_path}")
 
         # --- 2. PARSE C/C++ SOURCE CODE ---
         all_files = []

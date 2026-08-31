@@ -215,10 +215,18 @@ class ASTParser:
 
     def _extract_first_identifier(self, node, source_code: bytes):
         stack = [node]
+        # Ignore common C modifiers that Tree-sitter sometimes misclassifies
+        ignored_keywords = {'STATIC', 'CONST', 'VOLATILE', 'EXTERN', 'INLINE', 'static', 'const', 'extern'}
+        
         while stack:
             current = stack.pop()
-            if current.type in ('identifier', 'field_identifier', 'type_identifier'):
-                return source_code[current.start_byte:current.end_byte].decode('utf8', errors='ignore')
+            
+            if current.type in ('identifier', 'field_identifier'):
+                name = source_code[current.start_byte:current.end_byte].decode('utf8', errors='ignore')
+                if name and name not in ignored_keywords:
+                    return name
+                    
             for child in reversed(current.children):
                 stack.append(child)
         return None
+

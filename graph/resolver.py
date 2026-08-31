@@ -7,9 +7,9 @@ logger = logging.getLogger(__name__)
 class GraphResolver:
     """
     Executes Post-Ingestion graph completion passes.
-    Bakes semantic meaning (taint, data flow, dead code) directly into Neo4j.
+    Bakes semantic meaning (taint, data flow, dead code, concurrency) directly into Neo4j.
     """
-    
+
     def __init__(self, db: Any):
         self.db = db
 
@@ -20,60 +20,71 @@ class GraphResolver:
         retrieval_pointer: Optional[str] = None,
     ) -> Tuple[str, str]:
         """Query a function neighborhood from Neo4j and serialize it as structured graph JSON."""
+        
+        # --- FIXED FOR NEO4J 5 GQL COMPLIANCE AND EDGE PROPERTIES ---
         query = """
         MATCH (f:Function {name: $func_name})
+        
+        // 1. Gather Concurrency Context
+        OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(task:OsTask)
+        WITH f, task
+        OPTIONAL MATCH (f)-[lock_edge:OS_LOCK_ACTION]->(lock:OsResource)
+        WITH f, task, collect(DISTINCT {name: lock.name, action: lock_edge.action}) AS locks_held
+        
+        // 2. Gather Dependencies
+        OPTIONAL MATCH (f)-[:DEPENDS_ON_TYPE]->(t:TypeDefinition)
+        WITH f, task, locks_held, collect(DISTINCT t.name) AS types
+        OPTIONAL MATCH (f)-[:USES_MACRO]->(m:MacroDefinition)
+        WITH f, task, locks_held, types, collect(DISTINCT m.name) AS macros
+        
+        // 3. Gather Upstream Context
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-        OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
-        OPTIONAL MATCH (f)-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
+        WITH f, task, locks_held, types, macros, collect(DISTINCT {id: elementId(caller), type: labels(caller)[0], name: caller.name}) AS callers
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
+        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + uds.did), did: uds.did}) AS uds_triggers
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
-        OPTIONAL MATCH (san:Function)-[:CALLS]->(f)
-        WHERE san.name =~ '.*(sanitize|validate|check|clean|strip|guard).*'
+        WITH f, task, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
+        
+        // 4. Gather Downstream Context
+        OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, collect(DISTINCT {id: elementId(callee), type: labels(callee)[0], called_function: callee.name, is_dangerous_sink: coalesce(callee.is_dangerous_sink, false), is_stub_node: CASE WHEN callee:Stub THEN true ELSE false END}) AS callees
+        
+        // 5. Gather Variables & Sanitizers
+        OPTIONAL MATCH (f)-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
+        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, collect(DISTINCT {id: elementId(v), type: labels(v)[0], variable_name: v.name, access_type: type(r)}) AS var_access
+        OPTIONAL MATCH (san:Function)-[:CALLS]->(f) WHERE san.name =~ '.*(sanitize|validate|check|clean|strip|guard).*'
+        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, var_access, collect(DISTINCT {id: elementId(san), type: labels(san)[0], name: san.name}) AS sanitizers
+        
+        // Final Assembly
         RETURN {
             function: {
-                id: id(f),
+                id: elementId(f),
                 name: f.name,
                 file: f.storage_uri,
                 tainted_by_uds: coalesce(f.tainted_by_uds, false),
                 reachable_dids: coalesce(f.reachable_from_dids, []),
-                is_vendor_library: coalesce(f.is_vendor_code, false)
+                is_vendor_library: coalesce(f.is_vendor_code, false),
+                is_hardware_entry: coalesce(f.is_hardware_entry, false),
+                has_data_race_risk: coalesce(f.has_data_race_risk, false),
+                is_stub_node: f:Stub
+            },
+            concurrency: {
+                hosting_task: task.name,
+                task_priority: task.priority,
+                locks_held: locks_held
+            },
+            dependencies: {
+                types: types,
+                macros: macros
             },
             upstream: {
-                uds_triggers: collect(DISTINCT {
-                    id: id(uds),
-                    type: labels(uds)[0],
-                    name: coalesce(uds.name, 'UDS_' + uds.did),
-                    did: uds.did
-                }),
-                network_triggers: collect(DISTINCT {
-                    id: id(net),
-                    type: labels(net)[0],
-                    name: net.name
-                }),
-                standard_callers: collect(DISTINCT {
-                    id: id(caller),
-                    type: labels(caller)[0],
-                    name: caller.name
-                })
+                uds_triggers: uds_triggers,
+                network_triggers: network_triggers,
+                standard_callers: callers
             },
-            downstream: collect(DISTINCT {
-                id: id(callee),
-                type: labels(callee)[0],
-                called_function: callee.name,
-                is_dangerous_sink: coalesce(callee.is_dangerous_sink, false),
-                is_stub_node: CASE WHEN callee:Stub THEN true ELSE false END
-            }),
-            variable_access: collect(DISTINCT {
-                id: id(v),
-                type: labels(v)[0],
-                variable_name: v.name,
-                access_type: type(r)
-            }),
-            sanitizers: collect(DISTINCT {
-                id: id(san),
-                type: labels(san)[0],
-                name: san.name
-            })
+            downstream: callees,
+            variable_access: var_access,
+            sanitizers: sanitizers
         } AS payload
         LIMIT 1
         """
@@ -91,14 +102,33 @@ class GraphResolver:
             if sink_name:
                 return f"{func_name} -> {sink_name}"
             return func_name
-
+        
         try:
             with self.db.driver.session() as session:
                 records = session.run(query, func_name=func_name).data()
 
             if not records:
                 payload = {
-                    "function": {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False},
+                    "function": {
+                        "id": None,
+                        "name": func_name,
+                        "file": None,
+                        "tainted_by_uds": False,
+                        "reachable_dids": [],
+                        "is_vendor_library": False,
+                        "is_hardware_entry": False,
+                        "has_data_race_risk": False,
+                        "is_stub_node": False
+                    },
+                    "concurrency": {
+                        "hosting_task": None,
+                        "task_priority": None,
+                        "locks_held": []
+                    },
+                    "dependencies": {
+                        "types": [],
+                        "macros": []
+                    },
                     "upstream": {"uds_triggers": [], "network_triggers": [], "standard_callers": []},
                     "downstream": [],
                     "variable_access": [],
@@ -108,47 +138,119 @@ class GraphResolver:
                 payload = records[0].get("payload", {})
 
             if payload.get("function") is None:
-                payload["function"] = {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False}
+                payload["function"] = {
+                    "id": None,
+                    "name": func_name,
+                    "file": None,
+                    "tainted_by_uds": False,
+                    "reachable_dids": [],
+                    "is_vendor_library": False,
+                    "is_hardware_entry": False,
+                    "has_data_race_risk": False,
+                    "is_stub_node": False
+                }
 
             nodes = []
             edges = []
             target = payload["function"]
-            nodes.append(_node_record(target.get("name"), "Function", target.get("id"), file=target.get("file"), tainted_by_uds=target.get("tainted_by_uds", False), reachable_dids=target.get("reachable_dids", []), is_vendor_library=target.get("is_vendor_library", False)))
+            nodes.append(_node_record(
+                target.get("name"),
+                "Function",
+                target.get("id"),
+                file=target.get("file"),
+                tainted_by_uds=target.get("tainted_by_uds", False),
+                reachable_dids=target.get("reachable_dids", []),
+                is_vendor_library=target.get("is_vendor_library", False),
+                is_hardware_entry=target.get("is_hardware_entry", False),
+                has_data_race_risk=target.get("has_data_race_risk", False)
+            ))
 
             for caller in payload.get("upstream", {}).get("standard_callers", []) or []:
                 caller_name = caller.get("name")
                 if caller_name:
                     nodes.append(_node_record(caller_name, caller.get("type", "Function"), caller.get("id"), source_kind="caller"))
-                    edges.append({"id": f"edge:{caller_name}->{func_name}", "type": "CALLS", "from": caller.get("id"), "to": target.get("id"), "properties": {"direction": "inbound"}})
+                    edges.append({
+                        "id": f"edge:{caller_name}->{func_name}",
+                        "type": "CALLS",
+                        "from": caller.get("id"),
+                        "to": target.get("id"),
+                        "properties": {"direction": "inbound"}
+                    })
 
             for uds in payload.get("upstream", {}).get("uds_triggers", []) or []:
                 uds_name = uds.get("name") or f"UDS_{uds.get('did', 'unknown')}"
                 nodes.append(_node_record(uds_name, uds.get("type", "UdsService"), uds.get("id"), did=uds.get("did"), source_kind="uds"))
-                edges.append({"id": f"edge:{uds_name}->{func_name}", "type": "HANDLES_UDS", "from": uds.get("id"), "to": target.get("id"), "properties": {"did": uds.get("did")}})
+                edges.append({
+                    "id": f"edge:{uds_name}->{func_name}",
+                    "type": "HANDLES_UDS",
+                    "from": uds.get("id"),
+                    "to": target.get("id"),
+                    "properties": {"did": uds.get("did")}
+                })
 
             for net in payload.get("upstream", {}).get("network_triggers", []) or []:
                 net_name = net.get("name")
                 if net_name:
                     nodes.append(_node_record(net_name, net.get("type", "NetworkSignal"), net.get("id"), source_kind="signal"))
-                    edges.append({"id": f"edge:{net_name}->{func_name}", "type": "RECEIVES_SIGNAL", "from": net.get("id"), "to": target.get("id"), "properties": {"source": "network"}})
+                    edges.append({
+                        "id": f"edge:{net_name}->{func_name}",
+                        "type": "RECEIVES_SIGNAL",
+                        "from": net.get("id"),
+                        "to": target.get("id"),
+                        "properties": {"source": "network"}
+                    })
 
             for callee in payload.get("downstream", []) or []:
                 callee_name = callee.get("called_function")
                 if callee_name:
-                    nodes.append(_node_record(callee_name, callee.get("type", "Function"), callee.get("id"), is_dangerous_sink=callee.get("is_dangerous_sink", False), is_stub_node=callee.get("is_stub_node", False)))
-                    edges.append({"id": f"edge:{func_name}->{callee_name}", "type": "CALLS", "from": target.get("id"), "to": callee.get("id"), "properties": {"is_dangerous_sink": callee.get("is_dangerous_sink", False)}})
+                    nodes.append(_node_record(
+                        callee_name,
+                        callee.get("type", "Function"),
+                        callee.get("id"),
+                        is_dangerous_sink=callee.get("is_dangerous_sink", False),
+                        is_stub_node=callee.get("is_stub_node", False)
+                    ))
+                    edges.append({
+                        "id": f"edge:{func_name}->{callee_name}",
+                        "type": "CALLS",
+                        "from": target.get("id"),
+                        "to": callee.get("id"),
+                        "properties": {"is_dangerous_sink": callee.get("is_dangerous_sink", False)}
+                    })
 
             for var in payload.get("variable_access", []) or []:
                 var_name = var.get("variable_name")
                 if var_name:
-                    nodes.append(_node_record(var_name, var.get("type", "GlobalVariable"), var.get("id"), access_type=var.get("access_type")))
-                    edges.append({"id": f"edge:{func_name}->{var_name}", "type": var.get("access_type", "READS_VAR"), "from": target.get("id"), "to": var.get("id"), "properties": {"access_type": var.get("access_type")}})
+                    nodes.append(_node_record(
+                        var_name,
+                        var.get("type", "GlobalVariable"),
+                        var.get("id"),
+                        access_type=var.get("access_type")
+                    ))
+                    edges.append({
+                        "id": f"edge:{func_name}->{var_name}",
+                        "type": var.get("access_type", "READS_VAR"),
+                        "from": target.get("id"),
+                        "to": var.get("id"),
+                        "properties": {"access_type": var.get("access_type")}
+                    })
 
             for sanitizer in payload.get("sanitizers", []) or []:
                 sanitizer_name = sanitizer.get("name")
                 if sanitizer_name:
-                    nodes.append(_node_record(sanitizer_name, sanitizer.get("type", "Function"), sanitizer.get("id"), sanitizer_kind="sanitizer"))
-                    edges.append({"id": f"edge:{sanitizer_name}->{func_name}", "type": "CALLS", "from": sanitizer.get("id"), "to": target.get("id"), "properties": {"role": "sanitizer"}})
+                    nodes.append(_node_record(
+                        sanitizer_name,
+                        sanitizer.get("type", "Function"),
+                        sanitizer.get("id"),
+                        sanitizer_kind="sanitizer"
+                    ))
+                    edges.append({
+                        "id": f"edge:{sanitizer_name}->{func_name}",
+                        "type": "CALLS",
+                        "from": sanitizer.get("id"),
+                        "to": target.get("id"),
+                        "properties": {"role": "sanitizer"}
+                    })
 
             source_names = [
                 item.get("name") or item.get("did")
@@ -185,7 +287,13 @@ class GraphResolver:
                     })
             if not path_candidates:
                 for sink_name in sink_names[:5]:
-                    path_candidates.append({"type": "internal_sink", "path": _path_excerpt(None, sink_name), "source": None, "sink": sink_name, "confidence": "low"})
+                    path_candidates.append({
+                        "type": "internal_sink",
+                        "path": _path_excerpt(None, sink_name),
+                        "source": None,
+                        "sink": sink_name,
+                        "confidence": "low"
+                    })
 
             seen_paths = set()
             top_paths = []
@@ -210,7 +318,7 @@ class GraphResolver:
             }
 
             payload = {
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "verbosity": verbosity,
                 "function": target,
                 "graph": {
@@ -226,6 +334,8 @@ class GraphResolver:
                 "sinks": [item for item in (payload.get("downstream", []) or []) if item.get("is_dangerous_sink")],
                 "sanitizers": payload.get("sanitizers", []) or [],
                 "variable_access": payload.get("variable_access", []) or [],
+                "concurrency": payload.get("concurrency", {}),
+                "dependencies": payload.get("dependencies", {}),
                 "provenance": provenance,
                 "confidence": provenance["confidence"],
             }
@@ -242,27 +352,48 @@ class GraphResolver:
                 f"Function: {func_name}",
                 f"- tainted_by_uds: {str(target.get('tainted_by_uds', False)).lower()}",
                 f"- reachable_dids: {', '.join(str(did) for did in (target.get('reachable_dids', []) or [])) if target.get('reachable_dids') else 'none'}",
+                f"- hosting_task: {payload.get('concurrency', {}).get('hosting_task', 'none')} (priority: {payload.get('concurrency', {}).get('task_priority', 'none')})",
+                f"- has_data_race_risk: {str(target.get('has_data_race_risk', False)).lower()}",
                 f"- uds_sources: {', '.join(str(did) for did in uds_dids) if uds_dids else 'none'}",
                 f"- sources: {', '.join(source_names) if source_names else 'none'}",
                 f"- sinks: {', '.join(sink_names) if sink_names else 'none'}",
                 f"- sanitizers: {', '.join(item.get('name', '') for item in (payload.get('sanitizers', []) or []) if item.get('name')) or 'none'}",
+                f"- dependencies: {', '.join(payload.get('dependencies', {}).get('types', [])) or 'none'}",
                 f"- top_paths: {', '.join(item['path'] for item in top_paths) if top_paths else 'none'}",
                 f"- confidence: {provenance['confidence']}",
                 f"- retrieval_pointer: {provenance['retrieval_pointer']}",
             ]
+
             return json_data, "\n".join(summary_lines)
         except Exception as e:
             logger.warning(f"Failed to serialize graph neighborhood for {func_name}: {e}")
             fallback = {
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "verbosity": verbosity,
-                "function": {"id": None, "name": func_name, "file": None, "tainted_by_uds": False, "reachable_dids": [], "is_vendor_library": False},
+                "function": {
+                    "id": None,
+                    "name": func_name,
+                    "file": None,
+                    "tainted_by_uds": False,
+                    "reachable_dids": [],
+                    "is_vendor_library": False,
+                    "is_hardware_entry": False,
+                    "has_data_race_risk": False,
+                    "is_stub_node": False
+                },
                 "graph": {"nodes": [], "edges": [], "paths": []},
                 "sources": {"uds": [], "network": [], "callers": []},
                 "sinks": [],
                 "sanitizers": [],
                 "variable_access": [],
-                "provenance": {"retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}", "query": "MATCH ...", "evidence": {"node_count": 0, "edge_count": 0, "source_count": 0, "sink_count": 0, "sanitizer_count": 0}, "confidence": "low"},
+                "concurrency": {},
+                "dependencies": {},
+                "provenance": {
+                    "retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}",
+                    "query": "MATCH ...",
+                    "evidence": {"node_count": 0, "edge_count": 0, "source_count": 0, "sink_count": 0, "sanitizer_count": 0},
+                    "confidence": "low"
+                },
                 "confidence": "low",
             }
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
@@ -272,7 +403,8 @@ class GraphResolver:
         if domain_filter:
             cypher_filter += f" AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\\\{domain_filter}\\\\')"
         if file_filter:
-            safe_file = file_filter.replace('\\', '/')
+            import os
+            safe_file = os.path.basename(file_filter)
             cypher_filter += f" AND f.storage_uri CONTAINS '{safe_file}'"
             
         query = f"""
@@ -317,50 +449,6 @@ class GraphResolver:
         self._resolve_data_races()
         logger.info("=== Graph Resolution Complete ===")
 
-    def _resolve_data_races(self):
-        """
-        Flags functions that write to a global variable concurrently with another
-        function across different task/ISR contexts without an exclusive lock.
-        """
-        logger.info("Flagging functions with potential data races...")
-        query = """
-        MATCH (v:GlobalVariable)
-        WHERE size((v)<-[:WRITES_VAR]-(:Function)) > 1
-        MATCH (f:Function)-[:WRITES_VAR]->(v)
-        WHERE EXISTS {
-            MATCH (other_f:Function)-[:WRITES_VAR]->(v)
-            WHERE f <> other_f
-            OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(t1:OsTask)
-            OPTIONAL MATCH (other_f)-[:IMPLEMENTS_TASK]->(t2:OsTask)
-            WHERE (t1 IS NULL OR t2 IS NULL OR t1 <> t2)
-              AND NOT EXISTS {
-                (f)-[:OS_LOCK_ACTION]->(:OsResource)<-[:OS_LOCK_ACTION]-(other_f)
-            }
-        }
-        SET f.has_data_race_risk = true
-        """
-        try:
-            with self.db.driver.session() as session:
-                session.run(query)
-        except Exception as e:
-            logger.error(f"Failed to detect Data Races: {e}")
-
-    def _bind_runnables_to_tasks(self):
-        logger.info("Binding RTE Runnables to Functions...")
-        query = """
-        MATCH (s:Stub)-[r:IMPLEMENTS_TASK]->(t)
-        WHERE s.name STARTS WITH 'Rte_' OR s.name STARTS WITH 'Runnable_'
-        MATCH (f:Function {name: s.name})
-        MERGE (f)-[rel:IMPLEMENTS_TASK]->(t)
-        SET rel = properties(r)
-        DELETE r, s
-        """
-        try:
-            with self.db.driver.session() as session:
-                session.run(query)
-        except Exception as e:
-            logger.error(f"Failed to bind Runnables to Tasks: {e}")
-
     def _prune_local_variable_stubs(self):
         """
         Runs after ingestion. Any 'Stub' node that only has READS/WRITES edges 
@@ -370,7 +458,6 @@ class GraphResolver:
         logger.info("Pruning local variable stubs to optimize graph size...")
         query = """
         MATCH (n:Stub)
-        // If the stub is only connected via READS_VAR or WRITES_VAR edges, it's local.
         WHERE NOT ()-[:CALLS]->(n) AND NOT ()-[:DEPENDS_ON_TYPE]->(n)
         DETACH DELETE n
         RETURN count(n) as deleted_count
@@ -382,6 +469,46 @@ class GraphResolver:
                 logger.info(f"Deleted {count} useless local variable stubs.")
         except Exception as e:
             logger.error(f"Failed to prune local variables: {e}")
+
+    def _bind_runnables_to_tasks(self):
+        """
+        Binds Functions to their hosting OS Tasks.
+        Phase 1: Uses explicit RTE JSON stubs.
+        Phase 2: Uses Call Graph propagation as a fallback.
+        """
+        logger.info("Binding RTE Runnables to Functions...")
+        
+        # Phase 1: Merge the explicit JSON Stubs
+        json_bind_query = """
+        MATCH (s:Stub)-[r:IMPLEMENTS_TASK]->(t)
+        WHERE s.name STARTS WITH 'Rte_' OR s.name STARTS WITH 'Runnable_'
+        MATCH (f:Function {name: s.name})
+        MERGE (f)-[rel:IMPLEMENTS_TASK]->(t)
+        SET rel = properties(r)
+        DELETE r, s
+        RETURN count(rel) AS explicit_bindings
+        """
+        
+        # Phase 2: Propagate bindings down the call tree (The Fallback)
+        propagate_query = """
+        MATCH (entry:Function)-[:IMPLEMENTS_TASK]->(t:OsTask)
+        MATCH (entry)-[:CALLS*1..5]->(f:Function)
+        WHERE coalesce(f.is_vendor_code, false) = false
+        MERGE (f)-[:IMPLEMENTS_TASK]->(t)
+        RETURN count(DISTINCT f) AS propagated_bindings
+        """
+        
+        try:
+            with self.db.driver.session() as session:
+                res1 = session.run(json_bind_query).single()
+                explicit = res1["explicit_bindings"] if res1 else 0
+                logger.info(f"Bound {explicit} Runnables to Tasks using explicit RTE JSON data.")
+                
+                res2 = session.run(propagate_query).single()
+                propagated = res2["propagated_bindings"] if res2 else 0
+                logger.info(f"Propagated OS Task bindings to {propagated} downstream application functions.")
+        except Exception as e:
+            logger.error(f"Failed to bind Runnables to Tasks: {e}")
 
     def _resolve_os_concurrency(self):
         logger.info("Resolving AutoSAR OS Concurrency Primitives...")
@@ -516,3 +643,34 @@ class GraphResolver:
                 logger.info(f"Flagged {count} functions as dangerous memory sinks.")
         except Exception as e:
             logger.error(f"Failed to flag dangerous sinks: {e}")
+
+    def _resolve_data_races(self):
+        """
+        Flags functions that write to a global variable concurrently with another
+        function across different task/ISR contexts without an exclusive lock.
+        Uses COUNT {...} for modern Neo4j GQL compliance and sets a boolean property
+        to avoid relationship explosion.
+        """
+        logger.info("Flagging functions with potential data races...")
+        query = """
+        MATCH (v:GlobalVariable)
+        WHERE COUNT { (v)<-[:WRITES_VAR]-(:Function) } > 1
+        MATCH (f:Function)-[:WRITES_VAR]->(v)
+        WHERE EXISTS {
+            MATCH (other_f:Function)-[:WRITES_VAR]->(v)
+            WHERE f <> other_f
+            OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(t1:OsTask)
+            OPTIONAL MATCH (other_f)-[:IMPLEMENTS_TASK]->(t2:OsTask)
+            WHERE (t1 IS NULL OR t2 IS NULL OR t1 <> t2)
+              AND NOT EXISTS {
+                (f)-[:OS_LOCK_ACTION]->(:OsResource)<-[:OS_LOCK_ACTION]-(other_f)
+            }
+        }
+        SET f.has_data_race_risk = true
+        """
+        try:
+            with self.db.driver.session() as session:
+                session.run(query)
+                logger.info("Successfully completed linear data-race detection pass.")
+        except Exception as e:
+            logger.error(f"Failed to detect Data Races: {e}")

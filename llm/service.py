@@ -2,18 +2,19 @@ import json
 import logging
 import time
 from llm.client import LLMClient
+from llm.tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
 class LLMService:
-    def __init__(
-        self, 
-        api_key: str, 
-        model_name: str, 
-        base_url: str, 
-        api_version: str, 
-        api_key_header: str = ""
-    ):
+    def __init__(self, 
+                 api_key: str, 
+                 model_name: str, 
+                 base_url: str, 
+                 api_version: str, 
+                 api_key_header: str = "",
+                 usd_per_1k_input: float = None,
+                 usd_per_1k_output: float = None):
         self.client = LLMClient(
             api_key=api_key, 
             model_name=model_name, 
@@ -22,6 +23,11 @@ class LLMService:
             api_key_header=api_key_header
         )
         self.prompts = self._load_prompts()
+        self.tracker = TokenTracker(
+            model_name=model_name, 
+            usd_per_1k_input=usd_per_1k_input, 
+            usd_per_1k_output=usd_per_1k_output
+        )    
 
     def _load_prompts(self) -> dict:
         try:
@@ -48,7 +54,10 @@ class LLMService:
         
         # --- CHANGED: Added 'await' ---
         result = await self.client.generate_chat(system_prompt, user_prompt, settings)
-        
+        if hasattr(result, 'usage') and result.usage:
+            # Convert the usage object to a dict to pass to the tracker
+            self.tracker.add_usage(result.usage.model_dump())
+
         elapsed = time.time() - start_time
         logger.info(f"LLM Service ({self.client.model_name}): Task '{task_name}' completed in {elapsed:.2f}s")
         
