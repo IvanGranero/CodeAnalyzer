@@ -86,35 +86,39 @@ async def main():
     # --- PHASE 0 DIRECT EXPLOIT BYPASS ---
     # ==========================================
     if args.exploit_only:
-        # (Exploit only logic remains exactly the same...)
         logger.info("\n" + "="*60)
         logger.info(f"🚀 DIRECT EXPLOIT MODE: Loading {args.exploit_only}")
         print("="*60)
-        if not os.path.exists(args.exploit_only):
-            parser.error(f"report file not found: {args.exploit_only}")
-        with open(args.exploit_only, 'r') as f:
-            pre_existing_report = json.load(f)
-        vuln_queue = asyncio.Queue()
-        for func_name, vuln_entry in pre_existing_report.items():
-            vuln_queue.put_nowait((func_name, vuln_entry))
-        first_key = next(iter(pre_existing_report))
-        target_domain = pre_existing_report[first_key].get("domain", "all")
-        exploit_orch = ExploitOrchestrator(target_domain=target_domain, llm_service=app_context.llm)
-        results = {}
-        while not vuln_queue.empty():
-            func_name, vuln_entry = await vuln_queue.get()
-            try:
-                vuln_entry = dict(vuln_entry)
-                vuln_entry["function_name"] = func_name
-                result = await exploit_orch.execute_exploit_loop(vulnerability_report=vuln_entry, target_domain=target_domain)
-                results[func_name] = result
-                if result.get("status") == "success":
-                    logger.info(f"💀 [PWNED] {func_name} exploit validated!")
-                else:
-                    logger.info(f"🛡️ [MITIGATED] {func_name} exploit failed.")
-            except Exception as e:
-                logger.error(f"Exploit-only mode crashed on {func_name}: {e}")
-        app_context.graph.close()
+        try:
+            if not os.path.exists(args.exploit_only):
+                parser.error(f"report file not found: {args.exploit_only}")
+            with open(args.exploit_only, 'r') as f:
+                pre_existing_report = json.load(f)
+            vuln_queue = asyncio.Queue()
+            for func_name, vuln_entry in pre_existing_report.items():
+                vuln_queue.put_nowait((func_name, vuln_entry))
+            first_key = next(iter(pre_existing_report))
+            target_domain = pre_existing_report[first_key].get("domain", "all")
+            exploit_orch = ExploitOrchestrator(target_domain=target_domain, llm_service=app_context.llm)
+            results = {}
+            while not vuln_queue.empty():
+                func_name, vuln_entry = await vuln_queue.get()
+                try:
+                    vuln_entry = dict(vuln_entry)
+                    vuln_entry["function_name"] = func_name
+                    result = await exploit_orch.execute_exploit_loop(vulnerability_report=vuln_entry, target_domain=target_domain)
+                    results[func_name] = result
+                    if result.get("status") == "success":
+                        logger.info(f"💀 [PWNED] {func_name} exploit validated!")
+                    else:
+                        logger.info(f"🛡️ [MITIGATED] {func_name} exploit failed.")
+                except Exception as e:
+                    logger.error(f"Exploit-only mode crashed on {func_name}: {e}")
+        finally:
+            if hasattr(app_context.llm, 'tracker'):
+                app_context.llm.tracker.log_summary()
+            app_context.graph.close()
+            logger.info("Database connection closed.")
         return
 
     try:

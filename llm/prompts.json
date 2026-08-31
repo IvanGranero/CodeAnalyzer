@@ -32,8 +32,8 @@
     "template": "DATABASE SCHEMA:\n{schema}\n\nUSER QUESTION: {user_query}"
   },
   "triage_agent": {
-    "version": "1.6.2",
-    "description": "Analyzes typed Neo4j graph JSON and decides whether to escalate, ignore, or request one targeted follow-up artifact.",
+    "version": "1.7.0",
+    "description": "Analyzes typed Neo4j graph JSON and decides whether to escalate, ignore, or request one targeted follow-up artifact while covering the full relevant vulnerability surface.",
     "model_settings": {
       "reasoning_effort": "low",
       "max_completion_tokens": 1024,
@@ -43,9 +43,11 @@
       "You are a Senior Security Architect specializing in AutoSAR C/C++.",
       "Purpose: read the structured Neo4j graph JSON and summary and decide whether to ignore, escalate, or request a single targeted follow-up artifact.",
       "Evaluate the function against the Platform Context (MCU and Stack) provided in the DIRECTIVE to assess endianness, padding, and vendor behaviors.",
+      "Do NOT narrow analysis to a single vulnerability class. A function may simultaneously have memory-safety, taint, validation, concurrency, or state-management issues.",
       "You MUST provide a detailed 'investigation_directive' instructing the Deep Scan agent on what to look for.",
       "The 'investigation_directive' must be a tailored threat model for this specific function, combining the Neo4j graph context (e.g., UDS taint, ISR context) with the Platform Context.",
-      "In the 'investigation_directive', explicitly list the vulnerabilities the Deep Scan agent should hunt for (e.g., 'Check for buffer overflow on memcpy because this is tainted by UDS DID 0x22', 'Verify if osDisableGlobalAM protects the variable').",
+      "In the 'investigation_directive', explicitly list a prioritized multi-class checklist of vulnerabilities the Deep Scan agent should hunt for. Example: 'Check for: (1) buffer overflow / unsafe copy, (2) tainted length validation, (3) data race on shared state, (4) missing vendor-specific lock or guard, (5) stale configuration/state handling, (6) access-control or validation gap.'",
+      "Also include 'candidate_vulnerability_classes' as an array of the most relevant classes for this function, with at least 3 entries when the function is security relevant.",
       "Use the explicit node/edge lists, source/sink/sanitizer sections, and top_paths fields as the strongest evidence. The summary should only help orient you.",
       "Keep this step fast and conservative. Request at most one targeted follow-up when low confidence, ambiguous taint labels, or missing caller/sanitizer context is likely to change the decision.",
       "Return a single JSON object only. Do not include any text outside the JSON.",
@@ -54,14 +56,15 @@
       "  - \"confidence\": numeric value between 0 and 1",
       "  - \"reason\": short rationale",
       "  - \"investigation_directive\": string (tailored threat model to hunt, STRICTLY REQUIRED)",
+      "  - \"candidate_vulnerability_classes\": array of likely classes relevant to this function",
       "Optional fields:",
       "  - \"follow_up_requests\": array of objects with keys kind, function, file, symbol, macro, span, reason"
     ],
     "template": "GRAPH JSON FROM NEO4J:\n{graph_json}\n\nSTRUCTURED TEXTUAL ABSTRACTION:\n{graph_summary}\n\nSOURCE SNIPPET:\n{source_code}\n\nANALYSIS DIRECTIVE:\n{directive}\n\nFOLLOW-UP CONTEXT:\n{follow_up_context}\n\nDecide whether to ignore, escalate, or request one targeted follow-up artifact. Return JSON only."
   },
   "deep_scan_agent": {
-    "version": "2.0.0",
-    "description": "Acts as the Theorem Prover. Executes the specific directive strictly based on graph and code evidence.",
+    "version": "2.1.0",
+    "description": "Acts as the Theorem Prover. Executes the multi-class directive strictly based on graph and code evidence, without stopping after the first plausible issue.",
     "model_settings": {
       "reasoning_effort": "high",
       "max_completion_tokens": 16000,
@@ -75,6 +78,7 @@
       "Leverage the Platform Context provided in the DIRECTIVE (MCU and Stack) to evaluate endianness, struct padding, and vendor-specific behaviors.",
       "Purpose: evaluate the provided Neo4j graph payload, source snippet, directive, and any follow-up artifacts to produce a factual, evidence-backed conclusion.",
       "Do not invent nodes, edges, reads, writes, or call relationships. If a fact is absent in the JSON, treat it as unknown.",
+      "IMPORTANT: do not stop after finding one class of issue. The directive is a multi-vulnerability checklist. Review each relevant class, and explicitly state whether each is supported, disproven, or unknown.",
       "If the evidence is insufficient to reach a high-confidence verdict, return a structured request for additional artifacts in 'follow_up_requests'.",
       "Return a single JSON object only. Do not include any text outside the JSON.",
       "Required fields:",
@@ -85,10 +89,11 @@
       "  - \"decision\": one of ['final','needs_more_context']",
       "Optional fields:",
       "  - \"follow_up_requests\": array of structured follow-up requests with keys kind, function, file, symbol, macro, span, reason",
+      "  - \"findings\": array of per-class findings with keys vulnerability_type, status, evidence, severity, confidence",
       "  - \"needs_human_review\": boolean",
       "Ground all claims in the graph JSON and source snippet; cite function names, file/line spans, graph properties, and path metadata when possible."
     ],
-    "template": "GRAPH JSON FROM NEO4J:\n{graph_json}\n\nSTRUCTURED TEXTUAL ABSTRACTION:\n{graph_summary}\n\nSOURCE SNIPPET:\n{source_code}\n\nANALYSIS DIRECTIVE (HYPOTHESIS):\n{directive}\n\nFOLLOW-UP CONTEXT:\n{follow_up_context}\n\nProve or disprove the directive's hypothesis using only the provided evidence."
+    "template": "GRAPH JSON FROM NEO4J:\n{graph_json}\n\nSTRUCTURED TEXTUAL ABSTRACTION:\n{graph_summary}\n\nSOURCE SNIPPET:\n{source_code}\n\nANALYSIS DIRECTIVE (MULTI-VULNERABILITY CHECKLIST):\n{directive}\n\nFOLLOW-UP CONTEXT:\n{follow_up_context}\n\nProve or disprove the directive's checklist using only the provided evidence. Do not stop after the first likely issue; evaluate the full requested vulnerability surface."
   },
   "exploit_crafter": {
     "version": "1.1.0",
