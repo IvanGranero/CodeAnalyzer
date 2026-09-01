@@ -98,9 +98,59 @@ class GraphPayloadBuilder:
             source_id=caller_id, target_name=target_name, type=EdgeType.CALLS, properties=props
         ))
 
-    def add_var_access_edge(self, func_id: str, var_name: str, is_write: bool):
+    def add_dcm_did_table_entry(self, function_name: str, did_hex: str, func_class_hex: str = ""):
+        """
+        Records one (function, DID) pair scraped directly from a generated Dcm DID
+        dispatch table (e.g. Dcm_CfgDidMgrSignalOpClassInfo[] in Dcm_Lcfg.c/Dcm_PBcfg.c).
+        This is the module's own authoritative, generator-produced source of truth for
+        which function handles which DID -- independent of whatever naming convention
+        the callback function happens to use. graph/resolver.py's
+        _resolve_dcm_did_table_entries later resolves function_name to the real
+        Function node and creates the HANDLES_UDS edge from it.
+        """
+        entry_id = self.generate_node_id(NodeLabel.DCM_DID_TABLE_ENTRY, f"{function_name}::{did_hex}")
+        self._nodes[entry_id] = GraphNode(
+            id=entry_id,
+            labels=[NodeLabel.DCM_DID_TABLE_ENTRY],
+            properties={"function_name": function_name, "did_hex": did_hex, "func_class_hex": func_class_hex}
+        )
+
+    def add_macro_alias(self, short_name: str, long_name: str):
+        """
+        Records a function-like preprocessor macro that is a pure pass-through alias
+        for another function (the extremely common Vector MICROSAR RTE pattern
+        `#define Rte_IrvRead_SHORT(...) Rte_IrvRead_LONG(...)` used for essentially all
+        Rte_Read_/Rte_Write_/Rte_Call_/Rte_IrvRead_/Rte_IrvWrite_ port accessors).
+
+        Call sites always use the SHORT name textually, but the actual Function node
+        (from the FUNC declaration/definition) is only ever registered under the LONG
+        name -- so without this, every such call resolves to a dead-end stub instead of
+        the real function, and the real function looks like it's never called at all.
+
+        Writes directly to the deterministic id "stub::<short_name>" -- the exact same
+        id graph/manager.py's fuzzy CALLS-edge resolution falls back to for an
+        unresolved call target. This makes the mapping order-independent: it doesn't
+        matter whether the macro's defining header or a caller's .c file is parsed
+        first, because Neo4j MERGE-by-id converges onto the same node either way.
+        graph/resolver.py's _resolve_macro_call_aliases then redirects any CALLS edge
+        landing on that stub onto the real target and removes the stub.
+        """
+        alias_stub_id = f"stub::{short_name}"
+        self._nodes[alias_stub_id] = GraphNode(
+            id=alias_stub_id,
+            labels=[NodeLabel.GRAPH_NODE],
+            properties={"name": short_name, "alias_target": long_name}
+        )
+
+    def add_var_access_edge(self, func_id: str, var_name: str, is_write: bool, target_id: Optional[str] = None):
         edge_type = EdgeType.WRITES_VAR if is_write else EdgeType.READS_VAR
-        self._edges.append(GraphEdge(source_id=func_id, target_name=var_name, type=edge_type, properties={}))
+        if target_id:
+            # Exact match: this variable is a global declared in the same file as the
+            # accessing function, so we already know its real node id — no fuzzy
+            # name-based resolution needed at ingestion time.
+            self._edges.append(GraphEdge(source_id=func_id, target_id=target_id, type=edge_type, properties={}))
+        else:
+            self._edges.append(GraphEdge(source_id=func_id, target_name=var_name, type=edge_type, properties={}))
 
     def is_ready_to_flush(self) -> bool:
         return (len(self._nodes) + len(self._edges)) >= self.batch_size

@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run unit test suite
+        # These tests are all self-contained: parser/builder tests run tree-sitter
+        # directly with no Neo4j connection, and everything that talks to Neo4j/the
+        # LLM API/the exploit network stack is exercised against mocks/fakes. No
+        # external services are required in CI.
+        run: python -m pytest tests/ -v
+
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bandit
+        run: pip install bandit
+      - name: Fail on string-built Cypher passed to tx.run (Cypher-injection regression guard)
+        # Guards against reintroducing the exact bug fixed in graph/nl2cypher.py and
+        # graph/resolver.py: an f-string/.format()-built query string executed via
+        # tx.run(...)/session.run(...) with no bound parameters. This is a narrow,
+        # intentionally simple grep-based check, not a full taint analysis -- it is
+        # meant to catch the common case, not to be exhaustive.
+        run: |
+          if grep -rnE '\.run\(\s*(f"|f'"'"'|.*\.format\()' --include='*.py' graph/ ingest/ scan/ | grep -v '_test\.py'; then
+            echo "Found a Cypher query built via f-string/.format() passed to .run(...). Use bound parameters instead.";
+            exit 1;
+          fi
+      - name: Bandit security scan (informational)
+        run: bandit -r . -x ./venv,./tests -ll || true

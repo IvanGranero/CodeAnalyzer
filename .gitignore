@@ -6,3 +6,18 @@ orchestrator_state.json
 reports/
 logs/
 scan_cache/
+
+# Test suite / test tooling artifacts
+tests/
+.pytest_cache/
+.coverage
+requirements-dev.txt
+htmlcov/
+
+# Editor / tooling caches
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store

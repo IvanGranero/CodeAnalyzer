@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import List, Dict, Any
 from neo4j import GraphDatabase, exceptions
 
@@ -38,24 +39,45 @@ class GraphDB:
         
         # 2. Name index (Drastically speeds up Late-Binding edge queries!)
         tx.run("CREATE INDEX graphnode_name IF NOT EXISTS FOR (n:GraphNode) ON (n.name)")
-        
-    def ingest_batched(self, query: str, records: List[Dict[str, Any]], batch_size: int = 5000):
+
+        # 3. Label-specific name indexes. The generic GraphNode.name index above still
+        # requires Neo4j to filter by label after the index lookup; resolver.py's passes
+        # and the fuzzy-edge-resolution queries in this module both filter by a specific
+        # label (Function/GlobalVariable) + name very frequently, so a composite/scoped
+        # index avoids that extra filter step at scale.
+        tx.run("CREATE INDEX function_name IF NOT EXISTS FOR (n:Function) ON (n.name)")
+        tx.run("CREATE INDEX globalvariable_name IF NOT EXISTS FOR (n:GlobalVariable) ON (n.name)")
+
+    def ingest_batched(self, query: str, records: List[Dict[str, Any]], batch_size: int = 5000, max_retries: int = 5, base_delay: float = 2.0):
         total_records = len(records)
         # Downgrade from INFO to DEBUG
         logger.debug(f"Starting batched ingestion of {total_records} records in chunks of {batch_size}.")
 
         for i in range(0, total_records, batch_size):
             batch = records[i : i + batch_size]
-            try:
-                with self.driver.session() as session:
-                    session.execute_write(self._run_unwind_batch, query, batch)
-                # Downgrade from INFO to DEBUG
-                logger.debug(f"Successfully ingested batch {i // batch_size + 1}")
-            except exceptions.TransientError as e:
-                logger.error(f"Transient error on batch {i // batch_size + 1}: {e}")
-            except Exception as e:
-                logger.error(f"Failed to ingest batch {i // batch_size + 1}: {e}")
-                raise
+            batch_num = i // batch_size + 1
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    with self.driver.session() as session:
+                        session.execute_write(self._run_unwind_batch, query, batch)
+                    logger.debug(f"Successfully ingested batch {batch_num}")
+                    break
+                except exceptions.TransientError as e:
+                    # TransientError (e.g. DatabaseUnavailable) is exactly the class of
+                    # error that SHOULD be retried with backoff. Previously it was caught,
+                    # logged, and the batch was silently dropped -- the ingested graph
+                    # would end up missing an arbitrary slice of nodes/edges with no
+                    # indication in the final result beyond a log line.
+                    if attempt == max_retries:
+                        logger.error(f"Transient error on batch {batch_num} after {max_retries} attempts, giving up on this batch: {e}")
+                        raise
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(f"Transient error on batch {batch_num} (attempt {attempt}/{max_retries}): {e}. Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                except Exception as e:
+                    logger.error(f"Failed to ingest batch {batch_num}: {e}")
+                    raise
 
     @staticmethod
     def _run_unwind_batch(tx, query: str, batch: List[Dict[str, Any]]):

@@ -95,8 +95,19 @@ class LLMClient:
                 {"role": "user", "content": user_prompt}
             ]
         }
-        if "max_tokens" in model_settings: 
-            kwargs_responses["max_tokens"] = model_settings["max_tokens"]
+        # NOTE: the /responses API uses `max_output_tokens`, not `max_tokens`/
+        # `max_completion_tokens`. Callers (see llm/prompts.json's model_settings) set
+        # `max_completion_tokens` and `reasoning_effort`; previously only `max_tokens` was
+        # forwarded here, so both were silently dropped on every call and every deep-scan
+        # ran at whatever the provider's default reasoning effort happens to be.
+        if "max_completion_tokens" in model_settings:
+            kwargs_responses["max_output_tokens"] = model_settings["max_completion_tokens"]
+        elif "max_tokens" in model_settings:
+            kwargs_responses["max_output_tokens"] = model_settings["max_tokens"]
+        if "reasoning_effort" in model_settings:
+            kwargs_responses["reasoning"] = {"effort": model_settings["reasoning_effort"]}
+        if model_settings.get("response_format") == "json_object":
+            kwargs_responses["text"] = {"format": {"type": "json_object"}}
 
         max_retries = 3
         base_delay = 2.0
@@ -132,7 +143,20 @@ class LLMClient:
                 logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
                 if attempt == max_retries - 1: raise
                 await asyncio.sleep(base_delay * (2 ** attempt))
-                
+
+            except openai.RateLimitError as e:
+                logger.warning(f"[LLM Rate Limit] 429 (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1: raise
+                await asyncio.sleep(base_delay * (2 ** attempt))
+
+            except openai.APIStatusError as e:
+                # 5xx are transient/retryable; other 4xx (bad request, auth, etc.) are not.
+                if e.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                    logger.warning(f"[LLM Server Error] {e.status_code} (Attempt {attempt+1}/{max_retries}): {e}")
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    raise
+
             except Exception as e:
                 err_str = str(e).lower()
                 if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:
@@ -152,9 +176,13 @@ class LLMClient:
             ]
         }
         
-        if "max_tokens" in model_settings: 
+        if "max_completion_tokens" in model_settings:
+            kwargs_chat["max_completion_tokens"] = model_settings["max_completion_tokens"]
+        elif "max_tokens" in model_settings:
             kwargs_chat["max_tokens"] = model_settings["max_tokens"]
-        if model_settings.get("response_format") == "json_object": 
+        if "reasoning_effort" in model_settings:
+            kwargs_chat["reasoning_effort"] = model_settings["reasoning_effort"]
+        if model_settings.get("response_format") == "json_object":
             kwargs_chat["response_format"] = {"type": "json_object"}
             
         max_retries = 3
@@ -180,7 +208,19 @@ class LLMClient:
                 logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
                 if attempt == max_retries - 1: raise
                 await asyncio.sleep(base_delay * (2 ** attempt))
-                
+
+            except openai.RateLimitError as e:
+                logger.warning(f"[LLM Rate Limit] 429 (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1: raise
+                await asyncio.sleep(base_delay * (2 ** attempt))
+
+            except openai.APIStatusError as e:
+                if e.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                    logger.warning(f"[LLM Server Error] {e.status_code} (Attempt {attempt+1}/{max_retries}): {e}")
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    raise
+
             except Exception as e:
                 err_str = str(e).lower()
                 if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:

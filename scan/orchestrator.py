@@ -1,7 +1,7 @@
 import json
 import logging
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from llm.service import LLMService
 from scan.tools import AnalyzerTools
@@ -135,7 +135,103 @@ class ScanOrchestrator:
             logger.warning(f"Triage did not return JSON. Error: {exc}")
             return {"decision": "request_more", "confidence": 0.2, "reason": "Triage output was not valid JSON.", "follow_up_requests": []}
 
-    async def _deep_scan_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> Dict[str, Any]:
+    _SEVERITY_RANK = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+    _RACE_KEYWORDS = ("race", "concurrency")
+    _VALIDATION_KEYWORDS = ("validation", "injection")
+    _UNREACHABLE_EVIDENCE_KEYWORDS = ("unreachable", "never called", "dead code", "no caller", "internal-only", "internal only")
+
+    def _reconcile_findings(self, deep_response: Dict[str, Any], graph_json: str) -> Dict[str, Any]:
+        """
+        Makes the deep-scan output self-consistent instead of trusting the model's
+        top-level summary fields blindly:
+          1. Recomputes vulnerability_found/severity/details from the 'findings' array
+             (when present) so a report can never silently drop a supported finding just
+             because the model's own summary fields disagreed with its own findings list.
+          2. Cross-checks any 'data_race'/'concurrency' finding against the graph's own
+             has_data_race_risk flag. Previously the model could freely assert a data race
+             that the graph explicitly marks false, with no flag raised (observed in
+             production: "The graph JSON note (has_data_race_risk: false) is superseded by
+             the explicit snippet"). Any disagreement now forces needs_human_review.
+          3. Cross-checks any validation/injection finding whose evidence claims the
+             function is unreachable/internal-only against the graph's authoritative
+             UDS-entry-point signal (is_dead_code + upstream.uds_triggers[].source ==
+             'dcm_did_table'). This is the same class of false-positive investigated
+             this session (e.g. Dcm DID dispatch-table callbacks with no direct caller
+             in the source tree, which the resolver now correctly marks reachable) --
+             a model that asserts unreachability while the graph proves otherwise is a
+             contradiction, not a valid finding.
+        """
+        findings = deep_response.get("findings")
+        if not isinstance(findings, list) or not findings:
+            return deep_response
+
+        try:
+            graph_data = json.loads(graph_json)
+            graph_function = graph_data.get("function", {}) or {}
+            # NOTE: graph/resolver.py's serialize_function_neighborhood re-nests UDS
+            # trigger evidence under top-level "sources.uds" (not "upstream.uds_triggers"
+            # -- that key only exists in the raw Cypher payload before reassembly).
+            graph_uds_sources = graph_data.get("sources", {}).get("uds", []) or []
+        except (ValueError, json.JSONDecodeError, AttributeError):
+            graph_function, graph_uds_sources = {}, []
+
+        graph_has_data_race_risk = bool(graph_function.get("has_data_race_risk", False))
+        graph_is_dead_code = bool(graph_function.get("is_dead_code", False))
+        graph_has_authoritative_uds_trigger = any(
+            isinstance(t, dict) and t.get("source") == "dcm_did_table"
+            for t in graph_uds_sources
+        )
+        graph_is_reachable = (not graph_is_dead_code) or graph_has_authoritative_uds_trigger
+
+        supported = [f for f in findings if isinstance(f, dict) and f.get("status") == "supported"]
+        contradictions = []
+        for f in supported:
+            vuln_type = str(f.get("vulnerability_type", "")).lower()
+            if any(kw in vuln_type for kw in self._RACE_KEYWORDS):
+                claimed_agreement = f.get("graph_flag_agreement")
+                actual_agreement = graph_has_data_race_risk
+                if claimed_agreement is not True and claimed_agreement is not False:
+                    # Model omitted the required field entirely.
+                    f["graph_flag_agreement"] = actual_agreement
+                    contradictions.append(f"{f.get('vulnerability_type')}: graph_flag_agreement missing (graph has_data_race_risk={graph_has_data_race_risk})")
+                elif bool(claimed_agreement) != actual_agreement:
+                    contradictions.append(f"{f.get('vulnerability_type')}: model claimed graph_flag_agreement={claimed_agreement} but graph has_data_race_risk={graph_has_data_race_risk}")
+            elif any(kw in vuln_type for kw in self._VALIDATION_KEYWORDS):
+                evidence = str(f.get("evidence", "")).lower()
+                premised_on_unreachability = any(kw in evidence for kw in self._UNREACHABLE_EVIDENCE_KEYWORDS)
+                if premised_on_unreachability:
+                    claimed_agreement = f.get("graph_flag_agreement")
+                    actual_agreement = not graph_is_reachable
+                    if claimed_agreement is not True and claimed_agreement is not False:
+                        f["graph_flag_agreement"] = actual_agreement
+                        contradictions.append(
+                            f"{f.get('vulnerability_type')}: graph_flag_agreement missing (graph is_dead_code="
+                            f"{graph_is_dead_code}, authoritative_uds_trigger={graph_has_authoritative_uds_trigger})"
+                        )
+                    elif bool(claimed_agreement) != actual_agreement:
+                        contradictions.append(
+                            f"{f.get('vulnerability_type')}: model claimed unreachability (graph_flag_agreement="
+                            f"{claimed_agreement}) but graph is_dead_code={graph_is_dead_code} with "
+                            f"authoritative_uds_trigger={graph_has_authoritative_uds_trigger}"
+                        )
+
+        if contradictions:
+            deep_response["needs_human_review"] = True
+            deep_response["graph_contradictions"] = contradictions
+            logger.warning(f"Deep-scan/graph disagreement for a data-race finding: {contradictions}")
+
+        if supported:
+            top = max(supported, key=lambda f: self._SEVERITY_RANK.get(str(f.get("severity", "")).lower(), -1))
+            deep_response["vulnerability_found"] = True
+            deep_response["severity"] = top.get("severity", deep_response.get("severity", "Informational"))
+            detail_lines = [f"[{f.get('vulnerability_type', 'unknown')}] {f.get('evidence', '')}".strip() for f in supported]
+            deep_response["details"] = deep_response.get("details") or "\n".join(detail_lines)
+        else:
+            deep_response["vulnerability_found"] = False
+
+        return deep_response
+
+    async def _deep_scan_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "", checklist: Optional[list] = None) -> Dict[str, Any]:
         """Deep scan evaluates the hypothesis with full context."""
         try:
             response_text = await self.llm.execute_task(
@@ -146,10 +242,12 @@ class ScanOrchestrator:
                     "graph_summary": graph_summary,
                     "source_code": source_code,
                     "directive": directive,
+                    "checklist": json.dumps(checklist or [], ensure_ascii=False),
                     "follow_up_context": follow_up_context,
                 },
             )
-            return self._extract_json_object(response_text)
+            deep_response = self._extract_json_object(response_text)
+            return self._reconcile_findings(deep_response, graph_json)
         except (ValueError, json.JSONDecodeError) as exc:
             logger.warning(f"Deep scan did not return JSON. Error: {exc}")
             return {
@@ -212,6 +310,7 @@ class ScanOrchestrator:
         
         # This will hold the dynamic threat model generated by the Triage Agent
         deep_scan_directive = ""
+        deep_scan_checklist = []
 
         while triage_budget >= 0:
             logger.info(f"Running triage for '{target_function_name}' (remaining budget: {triage_budget})")
@@ -223,6 +322,7 @@ class ScanOrchestrator:
             # If Triage decides to escalate, it MUST provide the dynamic threat model
             if decision == "escalate":
                 deep_scan_directive = triage.get("investigation_directive", "Perform a standard check for logic flaws.")
+                deep_scan_checklist = triage.get("checklist") or []
                 preview = deep_scan_directive[:60].replace('\n', ' ') + "..." if len(deep_scan_directive) > 60 else deep_scan_directive
                 logger.info(f"Triage Escalated -> Threat Model: '{preview}'")
                 logger.debug(f"Full Threat Model Directive:\n{deep_scan_directive}")
@@ -255,7 +355,7 @@ class ScanOrchestrator:
         while deep_budget >= 0:
             logger.info(f"Running deep scan for '{target_function_name}' (remaining budget: {deep_budget})")
             # Pass the dynamically generated directive from the Triage Agent!
-            deep_response = await self._deep_scan_target(graph_json, graph_summary, source_code, deep_scan_directive, follow_up_context, target_func=target_function_name)
+            deep_response = await self._deep_scan_target(graph_json, graph_summary, source_code, deep_scan_directive, follow_up_context, target_func=target_function_name, checklist=deep_scan_checklist)
             last_report = deep_response
 
             follow_up_requests = deep_response.get("follow_up_requests") or []

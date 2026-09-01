@@ -66,7 +66,7 @@ Ensure your `.env` or `config.py` file is populated with your specific database 
 * `cheap_model_id`, `cheap_base_url`, `cheap_api_version`
 * `strong_model_id`, `strong_base_url`, `strong_api_version`
 
-The application reports missing or invalid settings before starting the scanner. If `.env` is missing, create it in the project directory. Use `python run.py --help` to view command-line usage without configuring the environment first.
+The application reports missing or invalid settings before starting the scanner. If `.env` is missing, create it in the project directory. Use `python codeanalyzer.py --help` to view command-line usage without configuring the environment first.
 
 Exploit behavior is configured separately in `exploit/.env`:
 
@@ -79,14 +79,14 @@ A failed connection is retried for the current vulnerability before the exploit 
 
 ## 💻 Usage
 
-Run the orchestrator using the main `run.py` script. Point it at the root directory of your AutoSAR source code.
+Run the orchestrator using the main `codeanalyzer.py` entrypoint. Point it at the root directory of your AutoSAR source code.
 
 ### Command-Line Options
 
 Display the built-in usage information at any time:
 
 ```bash
-python run.py --help
+python codeanalyzer.py --help
 ```
 
 Command-line parsing happens before environment configuration is loaded, so `--help` and invalid argument combinations show usage even when the `.env` file is not configured. A valid command that starts the scanner still requires the environment variables described in [Prerequisites](#prerequisites).
@@ -94,52 +94,55 @@ Command-line parsing happens before environment configuration is loaded, so `--h
 | Option | Description |
 | --- | --- |
 | `source_dir` | Optional path to the AutoSAR source directory. Defaults to the current directory (`.`). |
-| `--depth {fast,critical,full}` | Selects the scan scope. Defaults to `critical`. |
+| `--limit N` | Maximum number of top-risk functions to scan. Defaults to `50`. |
+| `--scan-all` | Scans every discovered target, bypassing `--limit` (prompts for confirmation first). |
+| `--target-file PATH` | Restricts the scan to a specific file, bypassing domain selection. |
 | `--skip-ingest` | Reuses the cached discovery configuration and existing Neo4j graph when available. |
+| `--skip-exploit` | Disables the dynamic exploit validation phase for UDS-reachable findings. |
 | `--resume` | Loads completed reports from `scan_cache/` and schedules unfinished scans and UDS exploit validations. |
 | `--exploit-only REPORT.json` | Skips discovery, ingestion, domain selection, and static scanning, then executes the exploit loop for each vulnerability in the supplied JSON report. |
 
 The normal scan flow is discovery, graph ingestion, domain selection, static scanning, and exploit validation for findings that are reachable through UDS/DoIP. The `--exploit-only` option is a separate direct-validation mode and does not require a new scan.
 
-### Standard Run (Critical Depth)
+### Standard Run (Top 50 Targets)
 Parses the codebase, builds the graph, prompts for a domain, and scans the top 50 targets:
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --depth critical
+python codeanalyzer.py ./path/to/AutoSAR_Project/
 ```
 
 ### Fast Triage (Top 10 Targets)
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --depth fast
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --limit 10
 ```
 
 ### Full Exhaustive Scan
 Scans every single active function (prompts for confirmation before starting to prevent unexpected API costs):
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --depth full
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --scan-all
 ```
 
 ### Skipping Ingestion (Instant Scans)
 If you have already parsed the project and the Neo4j database is populated, skip the heavy lifting and jump straight to domain selection:
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --depth critical --skip-ingest
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --skip-ingest
 ```
 
 ### Resuming a Cancelled Scan
 If a scan was interrupted (e.g., via `Ctrl+C`), you can resume without losing progress. The orchestrator will read the `scan_cache/` and only process unscanned targets:
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --depth critical --skip-ingest --resume
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --skip-ingest --resume
 ```
 
 ### Direct Exploit Validation
 To validate vulnerabilities from an existing JSON report without running discovery, ingestion, or static analysis:
 
 ```bash
-python run.py ./path/to/AutoSAR_Project/ --exploit-only ./path/to/vulnerabilities.json
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --exploit-only ./path/to/vulnerabilities.json
 ```
 
 The report must be a JSON object keyed by function name. Each value should contain the vulnerability fields used by the exploit agents, such as `type`, `description`, and optionally `domain`:

@@ -42,7 +42,7 @@ class GraphResolver:
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
         WITH f, task, locks_held, types, macros, collect(DISTINCT {id: elementId(caller), type: labels(caller)[0], name: caller.name}) AS callers
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
-        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + uds.did), did: uds.did}) AS uds_triggers
+        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + uds.did), did: uds.did, source: coalesce(uds.source, 'heuristic'), func_class_hex: uds.func_class_hex}) AS uds_triggers
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
         WITH f, task, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
         
@@ -52,7 +52,7 @@ class GraphResolver:
         
         // 5. Gather Variables & Sanitizers
         OPTIONAL MATCH (f)-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
-        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, collect(DISTINCT {id: elementId(v), type: labels(v)[0], variable_name: v.name, access_type: type(r)}) AS var_access
+        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, collect(DISTINCT {id: elementId(v), type: labels(v)[0], variable_name: v.name, access_type: type(r), resolution: coalesce(r.resolution, 'unknown')}) AS var_access
         OPTIONAL MATCH (san:Function)-[:CALLS]->(f) WHERE san.name =~ '.*(sanitize|validate|check|clean|strip|guard).*'
         WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, var_access, collect(DISTINCT {id: elementId(san), type: labels(san)[0], name: san.name}) AS sanitizers
         
@@ -67,6 +67,7 @@ class GraphResolver:
                 is_vendor_library: coalesce(f.is_vendor_code, false),
                 is_hardware_entry: coalesce(f.is_hardware_entry, false),
                 has_data_race_risk: coalesce(f.has_data_race_risk, false),
+                is_dead_code: coalesce(f.is_dead_code, false),
                 is_stub_node: f:Stub
             },
             concurrency: {
@@ -119,6 +120,7 @@ class GraphResolver:
                         "is_vendor_library": False,
                         "is_hardware_entry": False,
                         "has_data_race_risk": False,
+                        "is_dead_code": False,
                         "is_stub_node": False
                     },
                     "concurrency": {
@@ -148,6 +150,7 @@ class GraphResolver:
                     "is_vendor_library": False,
                     "is_hardware_entry": False,
                     "has_data_race_risk": False,
+                    "is_dead_code": False,
                     "is_stub_node": False
                 }
 
@@ -163,7 +166,8 @@ class GraphResolver:
                 reachable_dids=target.get("reachable_dids", []),
                 is_vendor_library=target.get("is_vendor_library", False),
                 is_hardware_entry=target.get("is_hardware_entry", False),
-                has_data_race_risk=target.get("has_data_race_risk", False)
+                has_data_race_risk=target.get("has_data_race_risk", False),
+                is_dead_code=target.get("is_dead_code", False)
             ))
 
             for caller in payload.get("upstream", {}).get("standard_callers", []) or []:
@@ -226,14 +230,19 @@ class GraphResolver:
                         var_name,
                         var.get("type", "GlobalVariable"),
                         var.get("id"),
-                        access_type=var.get("access_type")
+                        access_type=var.get("access_type"),
+                        resolution=var.get("resolution", "unknown")
                     ))
                     edges.append({
                         "id": f"edge:{func_name}->{var_name}",
                         "type": var.get("access_type", "READS_VAR"),
                         "from": target.get("id"),
                         "to": var.get("id"),
-                        "properties": {"access_type": var.get("access_type")}
+                        # "resolution" tells the LLM/report whether this edge was matched
+                        # exactly (declared in the same file as the accessing function) or
+                        # fuzzily (name+label matched elsewhere) -- fuzzy evidence should be
+                        # treated with lower confidence than exact evidence.
+                        "properties": {"access_type": var.get("access_type"), "resolution": var.get("resolution", "unknown")}
                     })
 
             for sanitizer in payload.get("sanitizers", []) or []:
@@ -380,6 +389,7 @@ class GraphResolver:
                     "is_vendor_library": False,
                     "is_hardware_entry": False,
                     "has_data_race_risk": False,
+                    "is_dead_code": False,
                     "is_stub_node": False
                 },
                 "graph": {"nodes": [], "edges": [], "paths": []},
@@ -400,46 +410,55 @@ class GraphResolver:
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
 
     def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None) -> list:
+        # domain_filter/file_filter previously reached Cypher via f-string interpolation
+        # (a Cypher-injection vector -- both values can originate from CLI args / the
+        # Phase-1 discovery LLM output). Bound as query parameters instead; only the
+        # LIMIT integer (validated as int by argparse/callers) is still interpolated.
         cypher_filter = ""
-        
+        params: Dict[str, Any] = {}
+
         if domain_filter:
-            cypher_filter += f" AND (f.storage_uri CONTAINS '/{domain_filter}/' OR f.storage_uri CONTAINS '\\\\{domain_filter}\\\\')"
-            
+            cypher_filter += " AND (f.storage_uri CONTAINS $domain_slash OR f.storage_uri CONTAINS $domain_backslash)"
+            params["domain_slash"] = f"/{domain_filter}/"
+            params["domain_backslash"] = f"\\{domain_filter}\\"
+
         if file_filter:
             import os
-            safe_file = os.path.basename(file_filter)
-            cypher_filter += f" AND f.storage_uri CONTAINS '{safe_file}'"
-            
+            params["file_basename"] = os.path.basename(file_filter)
+            cypher_filter += " AND f.storage_uri CONTAINS $file_basename"
+
         query = f"""
         MATCH (f:Function)
         // 1. STRICT FILTERS: Must be app code, not dead, not a stub, not a header
-        WHERE coalesce(f.is_vendor_code, false) = false 
-          AND coalesce(f.is_dead_code, false) = false 
+        WHERE coalesce(f.is_vendor_code, false) = false
+          AND coalesce(f.is_dead_code, false) = false
           AND NOT f:Stub
           AND NOT f.storage_uri ENDS WITH '.h'
           {cypher_filter}
-        
+
         // 2. RISK FILTERS: Only pick functions that actually have attack surface
         AND (
             coalesce(f.has_data_race_risk, false) = true OR
             coalesce(f.tainted_by_uds, false) = true OR
-            coalesce(f.is_dangerous_sink, false) = true OR 
+            coalesce(f.is_dangerous_sink, false) = true OR
             coalesce(f.is_hardware_entry, false) = true
         )
-        
+
         RETURN f.name AS FunctionName,
                coalesce(f.has_data_race_risk, false) AS DataRace,
                coalesce(f.tainted_by_uds, false) AS UdsTaint
         ORDER BY DataRace DESC, UdsTaint DESC
         """
-        
-        # If max_targets is 0 (uncapped), we drop the LIMIT clause entirely
+
+        # If max_targets is 0 (uncapped), we drop the LIMIT clause entirely.
+        # max_targets is an int from argparse/internal callers, never user-controlled text.
         if max_targets > 0:
-            query += f" LIMIT {max_targets}"
-            
+            query += " LIMIT $max_targets"
+            params["max_targets"] = max_targets
+
         try:
             with self.db.driver.session() as session:
-                results = session.run(query).data()
+                results = session.run(query, **params).data()
                 return [r["FunctionName"] for r in results]
         except Exception as e:
             import logging
@@ -447,17 +466,134 @@ class GraphResolver:
             return []
 
     def run_all_passes(self):
-        """Executes the full suite of resolution passes in the correct order."""
+        """
+        Executes the full suite of resolution passes in the correct order.
+
+        Later passes depend on earlier ones (e.g. _resolve_data_races reads
+        OS_LOCK_ACTION edges written by _resolve_os_concurrency). Each pass used to
+        swallow its own exceptions and continue, so a mid-run outage (a transient
+        Neo4j error, for instance) would silently leave every downstream pass
+        computing over a half-resolved graph with no visible failure. Passes still run
+        to completion (so one broken pass doesn't hide unrelated failures in others),
+        but any failure is now collected and raised at the end so the caller (run.py)
+        knows resolution did not fully succeed instead of proceeding to scan a
+        half-resolved graph.
+        """
         logger.info("=== Starting Graph Resolution & Completion Passes ===")
-        self._prune_local_variable_stubs()
-        self._bind_runnables_to_tasks()
-        self._resolve_os_concurrency()
-        self._resolve_uds_taint()
-        self._flag_dead_code()
-        self._resolve_rte_data_flow()
-        self._flag_dangerous_sinks()
-        self._resolve_data_races()
+        passes = [
+            # _resolve_dcm_did_table_entries must run BEFORE _resolve_macro_call_aliases:
+            # it needs to read the alias_target property off a "stub::<name>" node that
+            # the alias pass deletes once it has redirected that stub's CALLS edges.
+            self._resolve_dcm_did_table_entries,
+            self._resolve_macro_call_aliases,
+            self._prune_local_variable_stubs,
+            self._bind_runnables_to_tasks,
+            self._resolve_os_concurrency,
+            self._resolve_uds_taint,
+            self._flag_dead_code,
+            self._resolve_rte_data_flow,
+            self._flag_dangerous_sinks,
+            self._resolve_data_races,
+        ]
+        failures = []
+        for pass_fn in passes:
+            try:
+                pass_fn()
+            except Exception as e:
+                failures.append((pass_fn.__name__, e))
+        if failures:
+            summary = "; ".join(f"{name}: {err}" for name, err in failures)
+            logger.error(f"=== Graph Resolution FAILED for {len(failures)} pass(es): {summary} ===")
+            raise RuntimeError(f"Graph resolution failed for pass(es): {summary}")
         logger.info("=== Graph Resolution Complete ===")
+
+    def _resolve_macro_call_aliases(self):
+        """
+        Redirects CALLS edges that landed on a macro-alias stub onto the real target
+        function, then removes the stub.
+
+        Vector MICROSAR RTE-generated code universally uses
+        `#define Rte_IrvRead_SHORT(...) Rte_IrvRead_LONG(...)`-style pass-through
+        macros for Rte_Read_/Rte_Write_/Rte_Call_/Rte_IrvRead_/Rte_IrvWrite_ port
+        accessors: call sites use the SHORT name, but the actual Function node only
+        exists under the LONG name. ingest/parser.py's _process_macro_alias records
+        this mapping as an `alias_target` property on the deterministic
+        "stub::<short_name>" node (the same id manager.py's fuzzy CALLS resolution
+        already falls back to for an unresolved call target), so this works
+        regardless of whether the macro's header or the caller's .c file was parsed
+        first. Without this, real, frequently-used functions look never-called and get
+        incorrectly flagged as dead code by _flag_dead_code.
+        """
+        logger.info("Resolving RTE macro-alias call targets (Rte_Read_/Rte_IrvRead_/etc.)...")
+        query = """
+        MATCH (stub:GraphNode)
+        WHERE stub.alias_target IS NOT NULL
+        CALL (stub) {
+            MATCH (real:Function {name: stub.alias_target})
+            RETURN real
+            ORDER BY real.storage_uri
+            LIMIT 1
+        }
+        MATCH (caller)-[:CALLS]->(stub)
+        MERGE (caller)-[:CALLS]->(real)
+        WITH DISTINCT stub
+        DETACH DELETE stub
+        RETURN count(stub) AS aliases_resolved
+        """
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query).single()
+                count = result["aliases_resolved"] if result else 0
+                logger.info(f"Redirected {count} macro-aliased call targets to their real functions.")
+        except Exception as e:
+            logger.error(f"Failed to resolve macro-alias call targets: {e}")
+            raise
+
+    def _resolve_dcm_did_table_entries(self):
+        """
+        Resolves the (function_name, did_hex) facts scraped from a generated Dcm DID
+        dispatch table (ingest/parser.py's _extract_dcm_did_table_entries) into real
+        HANDLES_UDS edges.
+
+        This is a name-convention-independent, generator-authoritative alternative to
+        _resolve_uds_taint's regex heuristic below: it's the module's own dispatch
+        table, so it correctly tags callback functions whose C symbol name has no
+        "DID"/"RID" token at all (confirmed against a real codebase: 608 such functions
+        were still being false-positive-flagged as dead code after every naming-based
+        heuristic improvement). Runs before _resolve_uds_taint so taint propagation
+        and dead-code exclusion both see the complete HANDLES_UDS picture.
+        """
+        logger.info("Resolving Dcm DID dispatch table entries...")
+        # entry.function_name is very often itself an RTE macro-alias short name (e.g.
+        # "Rte_Call_DataServices_DID_0004_..." aliasing to
+        # "Rte_Call_Dcm_DataServices_DID_0004_..."), not a real Function's name -- so
+        # the alias is resolved one hop via the deterministic "stub::<name>" node
+        # BEFORE looking for the real Function (confirmed empirically: 0/1736 entries
+        # matched a real Function directly by name; every one needed this hop).
+        query = """
+        MATCH (entry:DcmDidTableEntry)
+        OPTIONAL MATCH (alias_stub:GraphNode {id: "stub::" + entry.function_name})
+        WITH entry, coalesce(alias_stub.alias_target, entry.function_name) AS resolved_name
+        CALL (resolved_name) {
+            MATCH (f:Function {name: resolved_name})
+            RETURN f
+            ORDER BY f.storage_uri
+            LIMIT 1
+        }
+        MERGE (u:UdsService {did: entry.did_hex})
+        ON CREATE SET u:GraphNode, u.name = "UDS_" + entry.did_hex
+        MERGE (f)-[:HANDLES_UDS]->(u)
+        SET u.source = "dcm_did_table", u.func_class_hex = entry.func_class_hex
+        RETURN count(f) AS linked
+        """
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query).single()
+                count = result["linked"] if result else 0
+                logger.info(f"Resolved {count} Dcm DID dispatch table entries to HANDLES_UDS edges.")
+        except Exception as e:
+            logger.error(f"Failed to resolve Dcm DID dispatch table entries: {e}")
+            raise
 
     def _prune_local_variable_stubs(self):
         """
@@ -466,9 +602,16 @@ class GraphResolver:
         We delete them to keep the graph lean.
         """
         logger.info("Pruning local variable stubs to optimize graph size...")
+        # NOTE: stubs with an incoming READS_VAR/WRITES_VAR edge are NOT pruned here.
+        # Those edges are exactly the evidence a vulnerability finding relies on ("this
+        # function writes to X") -- deleting the stub silently destroys that evidence.
+        # Only truly orphaned stubs (created but never actually referenced) are cleaned up.
         query = """
         MATCH (n:Stub)
-        WHERE NOT ()-[:CALLS]->(n) AND NOT ()-[:DEPENDS_ON_TYPE]->(n)
+        WHERE NOT ()-[:CALLS]->(n)
+          AND NOT ()-[:DEPENDS_ON_TYPE]->(n)
+          AND NOT ()-[:READS_VAR]->(n)
+          AND NOT ()-[:WRITES_VAR]->(n)
         DETACH DELETE n
         RETURN count(n) as deleted_count
         """
@@ -479,6 +622,7 @@ class GraphResolver:
                 logger.info(f"Deleted {count} useless local variable stubs.")
         except Exception as e:
             logger.error(f"Failed to prune local variables: {e}")
+            raise
 
     def _bind_runnables_to_tasks(self):
         """
@@ -519,6 +663,7 @@ class GraphResolver:
                 logger.info(f"Propagated OS Task bindings to {propagated} downstream application functions.")
         except Exception as e:
             logger.error(f"Failed to bind Runnables to Tasks: {e}")
+            raise
 
     def _resolve_os_concurrency(self):
         logger.info("Resolving AutoSAR OS Concurrency Primitives...")
@@ -540,6 +685,7 @@ class GraphResolver:
                 session.run(query)
         except Exception as e:
             logger.error(f"Failed to resolve OS concurrency: {e}")
+            raise
 
     def _resolve_uds_taint(self):
         """
@@ -547,13 +693,41 @@ class GraphResolver:
         and traces the taint down the call stack.
         """
         logger.info("Resolving UDS Attack Surface Entry Points...")
+        # Two detection tiers:
+        #  1. "_DID_"/"_RID_" (underscore-flanked) -- the DID/RID hex code is literally
+        #     embedded in the name (e.g. DataServices_DID_F129_..._ReadData). Extract
+        #     the real hex code as the UdsService key.
+        #  2. Broader: the name contains "DID"/"RID" ANYWHERE and ends with one of the
+        #     well-known Dcm/RTE-generated diagnostic-callback suffixes. This catches
+        #     the very common convention <SignalName>DID_ReadData /
+        #     <SignalName>DID_ConditionCheckRead / RID_..._Start etc., where there is no
+        #     underscore before "DID"/"RID" and often no hex code in the name at all
+        #     (the DID is symbolic, defined only in ARXML config). Confirmed against a
+        #     real ingested codebase: tier 1 alone missed 2,193 real, non-vendor DID
+        #     callback functions, which were then incorrectly flagged as dead code and
+        #     silently excluded from scanning entirely.
+        #  When no hex code is extractable, a synthetic per-signal key (everything
+        #  before "DID"/"RID" in the name) is used instead, so ReadData/WriteData/
+        #  ConditionCheckRead variants of the SAME signal still merge onto one
+        #  UdsService node instead of each getting an unrelated stand-in id.
         map_uds_query = """
         MATCH (f:Function)
         WHERE f.name CONTAINS "_DID_" OR f.name CONTAINS "_RID_"
-        WITH f, 
-             CASE 
+           OR (
+                (f.name CONTAINS "DID" OR f.name CONTAINS "RID")
+                AND (
+                     f.name ENDS WITH "_ReadData" OR f.name ENDS WITH "_WriteData" OR
+                     f.name ENDS WITH "_ReadDataLength" OR f.name ENDS WITH "_ConditionCheckRead" OR
+                     f.name ENDS WITH "_ConditionCheckWrite" OR f.name ENDS WITH "_Start" OR
+                     f.name ENDS WITH "_Stop" OR f.name ENDS WITH "_RequestResults"
+                )
+              )
+        WITH f,
+             CASE
                 WHEN f.name CONTAINS "_DID_" THEN substring(split(f.name, "_DID_")[1], 0, 4)
-                ELSE substring(split(f.name, "_RID_")[1], 0, 4)
+                WHEN f.name CONTAINS "_RID_" THEN substring(split(f.name, "_RID_")[1], 0, 4)
+                WHEN f.name CONTAINS "DID" THEN "NAMED_" + split(f.name, "DID")[0]
+                ELSE "NAMED_" + split(f.name, "RID")[0]
              END AS uds_hex
         WHERE uds_hex <> ""
         MERGE (u:UdsService {did: uds_hex})
@@ -568,6 +742,7 @@ class GraphResolver:
                 logger.info(f"Successfully mapped {count} AutoSAR UDS Entry Points.")
         except Exception as e:
             logger.error(f"Failed to map UDS entry points: {e}")
+            raise
 
         logger.info("Propagating Taint Downstream...")
         taint_query = """
@@ -585,19 +760,28 @@ class GraphResolver:
                 logger.info(f"Successfully traced UDS taint to {count} downstream functions.")
         except Exception as e:
             logger.error(f"Failed to propagate UDS Taint: {e}")
+            raise
 
     def _flag_dead_code(self):
         """Finds isolated functions (no callers, no UDS links, no Network links, no Hardware entries)."""
         logger.info("Flagging Unreachable / Dead Code...")
+        # NOTE: this SETs is_dead_code = false for non-isolated functions too, not just
+        # true for isolated ones. Previously it only ever set the flag to true and never
+        # cleared it, so re-running resolution after improving upstream detection (e.g.
+        # UDS entry-point detection in _resolve_uds_taint) would NOT retroactively
+        # un-flag functions that are now correctly known to be reachable -- the pass
+        # wasn't idempotent.
         query = """
         MATCH (f:Function)
-        WHERE NOT ()-[:CALLS]->(f)
-          AND NOT (f)-[:HANDLES_UDS]->()
-          AND NOT (f)-[:RECEIVES_SIGNAL]->()
-          AND NOT (f)-[:SENDS_SIGNAL]->()
-          AND coalesce(f.is_hardware_entry, false) = false
-        SET f.is_dead_code = true
-        RETURN count(f) AS dead_count
+        WITH f, (
+            NOT ()-[:CALLS]->(f)
+            AND NOT (f)-[:HANDLES_UDS]->()
+            AND NOT (f)-[:RECEIVES_SIGNAL]->()
+            AND NOT (f)-[:SENDS_SIGNAL]->()
+            AND coalesce(f.is_hardware_entry, false) = false
+        ) AS is_isolated
+        SET f.is_dead_code = is_isolated
+        RETURN count(CASE WHEN is_isolated THEN 1 END) AS dead_count
         """
         try:
             with self.db.driver.session() as session:
@@ -606,6 +790,7 @@ class GraphResolver:
                 logger.warning(f"Flagged {count} isolated functions as Dead Code.")
         except Exception as e:
             logger.error(f"Failed to flag Dead Code: {e}")
+            raise
 
     def _resolve_rte_data_flow(self):
         """Connects Runnables via RTE port data flow."""
@@ -629,6 +814,7 @@ class GraphResolver:
                 logger.info(f"Resolved {count} RTE data flow connections.")
         except Exception as e:
             logger.error(f"Failed to resolve RTE data flow: {e}")
+            raise
 
     def _flag_dangerous_sinks(self):
         """Flags functions that are known vulnerability sinks."""
@@ -653,6 +839,7 @@ class GraphResolver:
                 logger.info(f"Flagged {count} functions as dangerous memory sinks.")
         except Exception as e:
             logger.error(f"Failed to flag dangerous sinks: {e}")
+            raise
 
     def _resolve_data_races(self):
         """
@@ -684,3 +871,4 @@ class GraphResolver:
                 logger.info("Successfully completed linear data-race detection pass.")
         except Exception as e:
             logger.error(f"Failed to detect Data Races: {e}")
+            raise

@@ -24,11 +24,14 @@ class AnalyzerTools:
         query = """
         MATCH (f:Function {name: $func_name})
         WHERE NOT f.storage_uri ENDS WITH '.h'  // <--- NEW: Force .c file
+        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
+        WITH f, collect(DISTINCT {did: uds.did, func_class_hex: uds.func_class_hex, source: coalesce(uds.source, 'heuristic')}) AS did_details
         RETURN {
             FilePath: f.storage_uri,
             ByteSpan: f.byte_span,
             TaintedByUDS: coalesce(f.tainted_by_uds, false),
             DIDs: coalesce(f.reachable_from_dids, []),
+            DidDetails: did_details,
             IsVendorLibrary: coalesce(f.is_vendor_code, false),
             IsStubNode: f:Stub
         } AS metadata

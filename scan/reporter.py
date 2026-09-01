@@ -38,6 +38,27 @@ class ScanReporter:
             
         return os.path.normpath(file_path)
 
+    @staticmethod
+    def _supported_findings(report: dict) -> list:
+        """
+        Returns the per-class findings to render for a report. Prefers the structured
+        'findings' array (status='supported' entries); falls back to a single synthetic
+        entry built from the legacy top-level severity/details fields so reports produced
+        before the multi-finding schema was added still render correctly.
+        """
+        findings = report.get("findings")
+        if isinstance(findings, list):
+            supported = [f for f in findings if isinstance(f, dict) and f.get("status") == "supported"]
+            if supported:
+                return supported
+        return [{
+            "vulnerability_type": "unspecified",
+            "severity": report.get("severity", "Unknown"),
+            "confidence": report.get("confidence", "unknown"),
+            "evidence": report.get("details", "No details provided."),
+            "mitigation": None,
+        }]
+
     def generate_consolidated_reports(self, all_scan_results: dict):
         """
         Generates one master Markdown and SARIF report containing all
@@ -88,12 +109,18 @@ class ScanReporter:
                 start_byte = 0 # Default to 0 if ByteSpan is None or malformed
             
             line = self._byte_to_line_number(file_path, start_byte)
-            
+
             md.append("---")
             md.append(f"## 🚨 {report.get('severity', 'Unknown')}: Vulnerability in `{func}`")
             md.append(f"**File:** `{file_path}` (Line {line})")
-            md.append("\n**Details:**")
-            md.append(f"> {report.get('details', 'No details provided.')}\n")
+
+            for finding in self._supported_findings(report):
+                md.append(f"\n### [{finding.get('vulnerability_type', 'unspecified')}] {finding.get('severity', report.get('severity', 'Unknown'))} (confidence: {finding.get('confidence', 'unknown')})")
+                md.append(f"> {finding.get('evidence', 'No details provided.')}")
+                if finding.get("mitigation"):
+                    md.append(f"\n**Mitigation:** {finding['mitigation']}")
+                if finding.get("graph_flag_agreement") is False:
+                    md.append(f"\n**⚠️ Needs human review:** this finding's claim disagreed with the graph's own ground-truth flag.")
 
             exploit_data = report.get("exploit_validation")
             if exploit_data:
@@ -132,32 +159,44 @@ class ScanReporter:
             relative_path = os.path.relpath(file_path, os.getcwd()).replace("\\", "/")
             file_uri = f"file:///{relative_path}" if os.name == 'nt' else f"file://{relative_path}"
 
-            severity_level = "note"
-            sev = report.get("severity", "").lower()
-            if sev in ["critical", "high"]: 
-                severity_level = "error"
-            elif sev == "medium": 
-                severity_level = "warning"
-
-            message_text = f"Vulnerability in {func}: {report.get('details', '')}"
             exploit_data = report.get("exploit_validation")
+            exploit_suffix = ""
             if exploit_data:
                 status = exploit_data.get("status", "unknown").upper()
-                message_text += f"\n\n[Exploit Validation: {status}]\nRationale: {exploit_data.get('rationale', 'N/A')}"
+                exploit_suffix = f"\n\n[Exploit Validation: {status}]\nRationale: {exploit_data.get('rationale', 'N/A')}"
                 if status == "SUCCESS" and "final_payload" in exploit_data:
-                    message_text += f"\nVerified Payload: {exploit_data.get('final_payload')}"
+                    exploit_suffix += f"\nVerified Payload: {exploit_data.get('final_payload')}"
 
-            sarif_results.append({
-                "ruleId": "AUTOSAR-SEC-01",
-                "level": severity_level,
-                "message": {"text": f"Vulnerability in {func}: {report.get('details', '')}"},
-                "locations": [{"physicalLocation": {"artifactLocation": {"uri": file_uri}, "region": {"startLine": line}}}]
-            })
+            # One SARIF result PER FINDING, not per function -- a function with multiple
+            # independently-real vulnerability classes (e.g. buffer overflow AND a data
+            # race) previously collapsed into a single result and every class but one was
+            # invisible to any SARIF-consuming tool (GitHub Security, SonarQube, etc.).
+            for finding in self._supported_findings(report):
+                sev = str(finding.get("severity", report.get("severity", ""))).lower()
+                severity_level = "note"
+                if sev in ("critical", "high"):
+                    severity_level = "error"
+                elif sev == "medium":
+                    severity_level = "warning"
 
+                vuln_type = finding.get("vulnerability_type", "unspecified")
+                message_text = f"[{vuln_type}] Vulnerability in {func}: {finding.get('evidence', '')}"
+                if finding.get("mitigation"):
+                    message_text += f"\nMitigation: {finding['mitigation']}"
+                message_text += exploit_suffix
+
+                sarif_results.append({
+                    "ruleId": f"AUTOSAR-SEC-{vuln_type.upper()}" if vuln_type != "unspecified" else "AUTOSAR-SEC-01",
+                    "level": severity_level,
+                    "message": {"text": message_text},
+                    "locations": [{"physicalLocation": {"artifactLocation": {"uri": file_uri}, "region": {"startLine": line}}}]
+                })
+
+        rule_ids = sorted({r["ruleId"] for r in sarif_results}) or ["AUTOSAR-SEC-01"]
         sarif = {
             "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
             "version": "2.1.0",
-            "runs": [{"tool": {"driver": {"name": "AutoSAR-Multi-Agent-Scanner", "rules": [{"id": "AUTOSAR-SEC-01"}]}}, "results": sarif_results}]
+            "runs": [{"tool": {"driver": {"name": "AutoSAR-Multi-Agent-Scanner", "rules": [{"id": rid} for rid in rule_ids]}}, "results": sarif_results}]
         }
         
         try:
@@ -188,7 +227,17 @@ class ScanReporter:
         md.append(f"> {triage_dir}\n")
         
         md.append("## 2️⃣ Deep Scan Agent (Static Analysis Prover)")
-        md.append(report.get("details", "No details provided."))
+        for finding in self._supported_findings(report):
+            md.append(f"\n### [{finding.get('vulnerability_type', 'unspecified')}] {finding.get('severity', report.get('severity', 'Unknown'))} (confidence: {finding.get('confidence', 'unknown')})")
+            md.append(finding.get("evidence", "No details provided."))
+            if finding.get("mitigation"):
+                md.append(f"\n**Mitigation:** {finding['mitigation']}")
+            if finding.get("graph_flag_agreement") is False:
+                md.append("\n**⚠️ Needs human review:** this finding's claim disagreed with the graph's own ground-truth flag.")
+        if report.get("graph_contradictions"):
+            md.append("\n**Graph/LLM contradictions flagged during this scan:**")
+            for c in report["graph_contradictions"]:
+                md.append(f"- {c}")
         md.append("\n---\n")
         
         exploit_val = report.get("exploit_validation")
