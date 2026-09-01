@@ -46,7 +46,16 @@ class LLMClient:
                     api_key=key,
                     default_headers=headers,
                     default_query=query_params if query_params else None,
-                    timeout=60.0 # Added explicit timeout
+                    # 60s was too short for deep_scan_agent's reasoning_effort="high" +
+                    # max_completion_tokens=16000 calls -- confirmed against a real run:
+                    # every deep_scan call for a "gpt-5.6-luna" reasoning model timed out
+                    # at exactly 60.06s (openai SDK's own "Retrying request in Ns" log,
+                    # httpx read timeout), then kept re-timing-out through both the SDK's
+                    # internal retry and this client's own retry loop below, since the
+                    # ceiling itself -- not a transient blip -- was the bottleneck. Cheap
+                    # tasks (triage_agent: reasoning_effort="low", 4096 tokens) finish in
+                    # ~15-18s regardless, so a generous shared ceiling costs them nothing.
+                    timeout=300.0
                 )
             )
             

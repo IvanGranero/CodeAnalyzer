@@ -27,7 +27,9 @@ class DiscoveryPhase:
 
         logger.info("--- PHASE 1: Starting Architectural Discovery ---")
         dir_tree = RepoDiscoverer.generate_directory_tree(target_directory)
-        llm_response = await self.llm.execute_task(task_name="discovery", kwargs={"directory_tree": dir_tree})
+        llm_response = await self.llm.execute_task(
+            task_name="discovery", kwargs={"directory_tree": dir_tree}, context_id="discovery"
+        )
         try:
             config_json = json.loads(llm_response)
         except json.JSONDecodeError:

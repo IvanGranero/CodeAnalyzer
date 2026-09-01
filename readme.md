@@ -12,7 +12,7 @@ An enterprise-grade, asynchronous SAST (Static Application Security Testing) pla
 
 * **Domain-Specific Targeting:** Interactively filter scans by application domain (e.g., `/diag`, `/security`, `/ota`) to focus security audits on relevant modules.
 
-* **Multi-Class, Multi-Finding Analysis:** The Deep-Scan agent evaluates every vulnerability class in its checklist per function (not just the first one found) and cross-checks data-race and unreachability claims against the graph's own ground truth, flagging any disagreement for human review instead of trusting the model silently.
+* **Decomposed, Adaptive Deep-Scan:** The Triage agent breaks each function's threat model into discrete, independently-checkable vulnerability candidates (not a single batched checklist) and estimates how much reasoning each one needs. The orchestrator then runs one single-tasked Deep-Scan call per candidate, concurrently, at a reasoning-effort/token budget scaled to that candidate's own difficulty — so a quick mechanical check no longer pays for the same budget as a candidate requiring multi-hop taint or concurrency reasoning. Every candidate's verdict is cross-checked against the graph's own ground truth (`has_data_race_risk`, `is_dead_code`, UDS-trigger provenance) before the report is finalized, flagging any model/graph disagreement for human review instead of trusting it silently.
 
 * **Safety-Gated Exploit Validation:** Crafted UDS payloads for write/routine-control/flash/reset services (`0x2E`, `0x31`, `0x34-0x37`, `0x11`, `0x14`) are blocked before ever reaching a real ECU unless explicitly enabled — the exploit loop defaults to read-only, non-destructive services.
 
@@ -97,7 +97,7 @@ Command-line parsing happens before environment configuration is loaded, so `--h
 | Option | Description |
 | --- | --- |
 | `source_dir` | Optional path to the AutoSAR source directory. Defaults to the current directory (`.`). |
-| `--limit N` | Maximum number of top-risk functions to scan. Defaults to `50`. |
+| `--limit N` | Maximum number of top-risk functions to scan. If omitted: scans **all** functions in the selected domain once you choose one interactively (or when `--target-file` is used), or the top `50` if no domain is selected. |
 | `--scan-all` | Scans every discovered target, bypassing `--limit` (prompts for confirmation first). |
 | `--target-file PATH` | Restricts the scan to a specific file, bypassing domain selection. |
 | `--skip-ingest` | Reuses the cached discovery configuration and existing Neo4j graph when available. |
@@ -107,8 +107,8 @@ Command-line parsing happens before environment configuration is loaded, so `--h
 
 The normal scan flow is discovery, graph ingestion, domain selection, static scanning, and exploit validation for findings that are reachable through UDS/DoIP. The `--exploit-only` option is a separate direct-validation mode and does not require a new scan.
 
-### Standard Run (Top 50 Targets)
-Parses the codebase, builds the graph, prompts for a domain, and scans the top 50 targets:
+### Standard Run (Exhaustive Within a Domain)
+Parses the codebase, builds the graph, prompts for a domain, then scans **every** function in that domain (or the top 50 if you don't pick one):
 
 ```bash
 python codeanalyzer.py ./path/to/AutoSAR_Project/
@@ -175,8 +175,8 @@ The domain is inferred from the first report entry and passed to every exploit i
   * Prompts the user to isolate the scan to a specific module (e.g., `diag`).
 
 * **Phase 3: Multi-Agent Vulnerability Scan**
-  * **Triage Agent:** Analyzes the target's graph neighborhood to generate a prioritized, structured vulnerability checklist and a tailored investigation directive.
-  * **Deep-Scan Agent:** Iterates that checklist directly, producing one finding per vulnerability class, and cross-checks any data-race or unreachability claim against the graph's own ground truth (`has_data_race_risk`, `is_dead_code`, UDS-trigger provenance) before the report is finalized.
+  * **Triage Agent:** Analyzes the target's graph neighborhood, decomposes the threat model into discrete `vulnerability_candidates` (each tagged with a canonical class and a Low/Medium/High `effort_estimate`), and produces a shared investigation directive.
+  * **Deep-Scan Agent:** Runs single-tasked — one call per candidate, in parallel — proving or disproving exactly that candidate using the reasoning effort and token budget its `effort_estimate` calls for. Each call returns one self-contained, exploit-agent-ready verdict; any data-race or unreachability claim is cross-checked against the graph's own ground truth (`has_data_race_risk`, `is_dead_code`, UDS-trigger provenance) before the per-candidate results are reduced into the function's final report.
 
 * **Phase 4: Exploit Validation**
   * For UDS/DoIP-reachable findings, the exploit orchestrator uses a crafter, executor, analyzer, and strategist loop to generate payloads and validate ECU behavior, gated by the safety allowlist described above.
@@ -199,13 +199,14 @@ app/
     exploit_phase.py        # Phase 4 (shared by the queue-driven path and --exploit-only)
     reporting_phase.py      # Final summary + report generation
 ingest/                    # tree-sitter AST parsing, ARXML/RTE-JSON config parsing, graph payload builder
-graph/                     # Neo4j driver, ingestion/resolution passes, NL→Cypher, typed graph models
-scan/                      # Triage/deep-scan orchestration, analyzer tools, report generation
+graph/                     # Neo4j driver, NL→Cypher, typed graph models
+  resolver/                 # One module per resolution pass (dcm_did, macro_aliases, uds_taint,
+                             # rte_data_flow, dangerous_sinks, concurrency, ...), composed via mixins
+                             # into a single GraphResolver class -- same public API, one file per pass
+scan/                      # Decomposed triage/deep-scan orchestration, analyzer tools, report generation
 exploit/                   # DoIP/UDS client, crafter/analyzer/strategist exploit loop, safety config
 llm/                       # LLM client (Responses + legacy Chat APIs), prompts.json, token tracker
 ```
-
-Tests live in `tests/` and are intentionally excluded from version control (see `.gitignore`); run them locally with `pip install -r requirements-dev.txt && pytest tests/`.
 
 ## 📊 Reporting
 
@@ -214,3 +215,6 @@ Upon completion (or graceful cancellation), the `ScanReporter` aggregates all fi
 * `raw_findings_*.json`: Raw LLM output.
 * `Vulnerability_Report_*.md`: Beautifully formatted markdown containing line numbers, severity, and mitigation advice.
 * `results_*.sarif`: Static Analysis Results Interchange Format, ready to be ingested into GitHub Security or SonarQube.
+* `VULN_<function>_*.md`: One dedicated per-vulnerability report tracing the full Triage → Deep-Scan → Exploit chain for that finding.
+
+Every finding's `vulnerability_type` is constrained to a fixed canonical slug (`buffer_overflow`, `data_race`, `access_control`, `error_handling`, `state_management`, ...), which is what drives SARIF rule IDs and per-candidate audit log naming — the reporter also normalizes free-text fields defensively, so a malformed field on a single finding can't blank out that finding's report.

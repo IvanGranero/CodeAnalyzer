@@ -13,7 +13,7 @@ from app.phases.domain_selection import select_domain
 from app.phases.exploit_phase import ExploitPhase
 from app.phases.ingestion_phase import IngestionPhase
 from app.phases.reporting_phase import generate_final_report
-from app.phases.scan_phase import ScanPhase
+from app.phases.scan_phase import ScanPhase, resolve_scan_limit
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,6 @@ async def _run_exploit_only(app_context: AppContext, report_path: str) -> None:
 
 
 async def _run_full_pipeline(app_context: AppContext, reporter: ScanReporter, args, target_directory: str) -> None:
-    scan_limit = 0 if args.scan_all or args.target_file else args.limit
-
     # --- PHASE 1 & 2: DISCOVERY, INGESTION, RESOLUTION ---
     discovery = DiscoveryPhase(app_context.llm, CACHE_DIR)
     used_cache = discovery.used_cache(args.skip_ingest)
@@ -90,6 +88,13 @@ async def _run_full_pipeline(app_context: AppContext, reporter: ScanReporter, ar
     orchestrator = ScanOrchestrator(app_context.llm, app_context.graph, platform_info=platform_info)
     app_domains = config_json.get('app_domains', [])
     selected_domain = select_domain(app_domains, args.scan_all, args.target_file)
+
+    # Computed AFTER domain selection: choosing a domain interactively defaults to an
+    # exhaustive scan of that domain unless --limit was explicitly passed. See
+    # app/phases/scan_phase.resolve_scan_limit for the exact precedence.
+    scan_limit = resolve_scan_limit(args.limit, args.scan_all, args.target_file, selected_domain)
+    if scan_limit == 0 and not args.scan_all and not args.target_file:
+        logger.info(f"No --limit given; scanning all functions in domain '{selected_domain}'.")
 
     # --- PHASE 3: MULTI-AGENT VULNERABILITY SCAN ---
     logger.info("\n--- PHASE 3: Multi-Agent Vulnerability Scan ---")
@@ -115,9 +120,12 @@ async def _run_full_pipeline(app_context: AppContext, reporter: ScanReporter, ar
     if not targets_to_scan:
         logger.info("✅ All prioritized targets have already been scanned or no targets were found.")
     else:
-        if args.scan_all:
+        if scan_limit == 0 and not args.target_file:
+            scope_desc = "global scan-all" if args.scan_all else (
+                f"exhaustive scan of domain '{selected_domain}'" if selected_domain else "uncapped scan"
+            )
             print("\n" + "=" * 70)
-            logger.warning(f"ATTENTION: A global scan-all has identified {len(targets_to_scan)} targets.")
+            logger.warning(f"ATTENTION: An uncapped {scope_desc} has identified {len(targets_to_scan)} targets.")
             logger.warning("This may take a significant amount of time and incur API costs.")
             print("=" * 70)
             try:

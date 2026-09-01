@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -37,6 +38,24 @@ class ScanReporter:
             file_path = file_path[1:]
             
         return os.path.normpath(file_path)
+
+    @staticmethod
+    def _stringify(value, default: str = "No details provided.") -> str:
+        """
+        Coerces a finding's free-text field (evidence/details) to a plain string.
+        Required because deep_scan_agent sometimes returns 'evidence' as a JSON array
+        of citation strings instead of the single string the prompt asks for (observed
+        in production: ~1 in 5 findings) -- md.append()'ing that list directly used to
+        make "\\n".join(md) raise TypeError *after* the target report file had already
+        been opened in 'w' mode, silently leaving a 0-byte report with the failure only
+        visible in the log.
+        """
+        if value is None or value == "":
+            return default
+        if isinstance(value, list):
+            items = [str(v) for v in value if v not in (None, "")]
+            return "\n".join(f"- {item}" for item in items) if items else default
+        return str(value)
 
     @staticmethod
     def _supported_findings(report: dict) -> list:
@@ -116,7 +135,7 @@ class ScanReporter:
 
             for finding in self._supported_findings(report):
                 md.append(f"\n### [{finding.get('vulnerability_type', 'unspecified')}] {finding.get('severity', report.get('severity', 'Unknown'))} (confidence: {finding.get('confidence', 'unknown')})")
-                md.append(f"> {finding.get('evidence', 'No details provided.')}")
+                md.append(f"> {self._stringify(finding.get('evidence'))}")
                 if finding.get("mitigation"):
                     md.append(f"\n**Mitigation:** {finding['mitigation']}")
                 if finding.get("graph_flag_agreement") is False:
@@ -180,13 +199,18 @@ class ScanReporter:
                     severity_level = "warning"
 
                 vuln_type = finding.get("vulnerability_type", "unspecified")
-                message_text = f"[{vuln_type}] Vulnerability in {func}: {finding.get('evidence', '')}"
+                message_text = f"[{vuln_type}] Vulnerability in {func}: {self._stringify(finding.get('evidence'), default='')}"
                 if finding.get("mitigation"):
                     message_text += f"\nMitigation: {finding['mitigation']}"
                 message_text += exploit_suffix
 
+                # Defense in depth: vulnerability_type is supposed to be a short
+                # canonical slug (see llm/prompts.json), but a SARIF ruleId must stay a
+                # stable, punctuation-free identifier even if a model drifts and emits
+                # a prose phrase -- sanitize instead of embedding raw spaces/punctuation.
+                rule_slug = re.sub(r"[^A-Za-z0-9_]+", "_", str(vuln_type)).strip("_").upper()
                 sarif_results.append({
-                    "ruleId": f"AUTOSAR-SEC-{vuln_type.upper()}" if vuln_type != "unspecified" else "AUTOSAR-SEC-01",
+                    "ruleId": f"AUTOSAR-SEC-{rule_slug}" if rule_slug and vuln_type != "unspecified" else "AUTOSAR-SEC-01",
                     "level": severity_level,
                     "message": {"text": message_text},
                     "locations": [{"physicalLocation": {"artifactLocation": {"uri": file_uri}, "region": {"startLine": line}}}]
@@ -229,7 +253,7 @@ class ScanReporter:
         md.append("## 2️⃣ Deep Scan Agent (Static Analysis Prover)")
         for finding in self._supported_findings(report):
             md.append(f"\n### [{finding.get('vulnerability_type', 'unspecified')}] {finding.get('severity', report.get('severity', 'Unknown'))} (confidence: {finding.get('confidence', 'unknown')})")
-            md.append(finding.get("evidence", "No details provided."))
+            md.append(self._stringify(finding.get("evidence")))
             if finding.get("mitigation"):
                 md.append(f"\n**Mitigation:** {finding['mitigation']}")
             if finding.get("graph_flag_agreement") is False:
@@ -269,9 +293,19 @@ class ScanReporter:
                         md.append(f"- **Error:** `{step.get('error')}`")
                     md.append("")
                     
+        # Render before opening the file: open(..., "w") truncates immediately, so if
+        # rendering failed partway through and we opened first, a pre-existing report
+        # (or a fresh empty file) would be left silently blank instead of surfacing the
+        # error. _stringify above should make this join always succeed on well-formed
+        # findings, but a malformed one should still fail loud rather than truncate.
+        try:
+            content = "\n".join(md)
+        except Exception as e:
+            logger.error(f"Failed to render individual report for {func_name}: {e}")
+            return
+
         try:
             with open(filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(md))
+                f.write(content)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Failed to write individual report for {func_name}: {e}")
+            logger.error(f"Failed to write individual report for {func_name}: {e}")

@@ -14,6 +14,30 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_SCANS = 5
 
+# Applied only when no domain was selected and no --target-file was given (an
+# unscoped, whole-repository scan) and the user did not pass --limit explicitly.
+# Keeps the historical safety default for that one case; a domain-scoped scan
+# defaults to exhaustive instead (see resolve_scan_limit).
+DEFAULT_GLOBAL_SCAN_LIMIT = 50
+
+
+def resolve_scan_limit(limit: Optional[int], scan_all: bool, target_file: Optional[str], selected_domain: Optional[str]) -> int:
+    """
+    Determines the max-targets cap actually applied to a scan.
+
+    Previously this was computed as `0 if (scan_all or target_file) else args.limit`
+    BEFORE domain selection ran, with --limit defaulting to 50 -- so choosing a
+    domain interactively still silently capped the scan at 50 functions with no
+    way to tell that from an explicit `--limit 50`. Returns 0 for "uncapped".
+    """
+    if scan_all or target_file:
+        return 0
+    if limit is not None:
+        return limit
+    if selected_domain:
+        return 0
+    return DEFAULT_GLOBAL_SCAN_LIMIT
+
 
 class ScanPhase:
     """Phase 3: prioritize targets, scan them concurrently, and hand any UDS-reachable

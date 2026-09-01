@@ -40,17 +40,22 @@ class LLMService:
             logger.error(f"Failed to load prompts.json: {e}")
             return {}
 
-    async def execute_task(self, task_name: str, kwargs: dict, context_id: str = None) -> str:
+    async def execute_task(self, task_name: str, kwargs: dict, context_id: str = None, settings_override: dict = None) -> str:
         if task_name not in self.prompts:
             raise ValueError(f"Task '{task_name}' not found in prompts.json")
-            
+
         task_config = self.prompts[task_name]
-        
+
         system_prompt = "\n".join(task_config["system"]) if isinstance(task_config["system"], list) else task_config["system"]
         template = "\n".join(task_config["template"]) if isinstance(task_config["template"], list) else task_config["template"]
-        
+
         user_prompt = template.format(**kwargs)
         settings = task_config.get("model_settings", {})
+        # Lets callers pick per-call reasoning effort / token budget (e.g. the scan
+        # orchestrator scaling deep_scan_agent's cost to Triage's per-candidate
+        # effort_estimate) without needing a separate prompts.json entry per tier.
+        if settings_override:
+            settings = {**settings, **settings_override}
         
         start_time = time.time()
         logger.info(f"LLM Service ({self.client.model_name}): Executing async task '{task_name}'")

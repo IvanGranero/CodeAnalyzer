@@ -86,11 +86,6 @@ class GraphPayloadBuilder:
         edge_type = EdgeType.RECEIVES_SIGNAL if direction == "RX" else EdgeType.SENDS_SIGNAL
         self._edges.append(GraphEdge(source_id=func_id, target_id=sig_id, type=edge_type, properties={}))
 
-    def add_type_dependency_edge(self, source_id: str, target_name: str, context: str):
-        self._edges.append(GraphEdge(
-            source_id=source_id, target_name=target_name, type=EdgeType.DEPENDS_ON_TYPE, properties={"context": context}
-        ))
-
     def add_call_edge(self, caller_id: str, target_name: str, arguments: Optional[List[str]] = None, is_pointer: bool = False) -> None:
         props = {"arguments": arguments} if arguments else {}
         props["call_type"] = "pointer" if is_pointer else "direct"
@@ -140,6 +135,35 @@ class GraphPayloadBuilder:
             id=alias_stub_id,
             labels=[NodeLabel.GRAPH_NODE],
             properties={"name": short_name, "alias_target": long_name}
+        )
+
+    def mark_late_bound_accessor(self, short_name: str):
+        """
+        Records that `short_name` is a late-bound AUTOSAR RTE accessor macro (e.g.
+        Rte_Pim_*/Rte_CData_*) whose replacement body is a pointer/address-of
+        expression, not a call to another function -- confirmed against real Vector
+        MICROSAR headers:
+            #define Rte_Pim_..._17() (&((*RtePim_..._17())[0]))
+            #define Rte_CData_RomData_VIN() (&(Rte_..._RomData_VIN[0]))
+        Call sites using this name are NOT unresolved/missing calls; they are
+        placeholders that bind to real memory/config at build time (the source tree
+        is parsed as-is, never built) and must never be reported as dead ends.
+
+        Written to the same deterministic "stub::<name>" id that an unresolved CALLS
+        edge falls back to (see graph/manager.py's fuzzy-edge ingestion) via a plain
+        property SET -- so this is order-independent exactly like add_macro_alias:
+        it doesn't matter whether the accessor's defining header or a caller's .c
+        file is parsed/flushed first. If the fuzzy-CALLS ingestion's MERGE happens to
+        run first and creates the node as a :Stub, this property is still applied on
+        top of it; consumers should check `is_late_bound_accessor`, not the absence
+        of the :Stub label, to tell late-bound accessors apart from genuinely
+        unresolved targets.
+        """
+        stub_id = f"stub::{short_name}"
+        self._nodes[stub_id] = GraphNode(
+            id=stub_id,
+            labels=[NodeLabel.GRAPH_NODE],
+            properties={"name": short_name, "is_late_bound_accessor": True}
         )
 
     def add_var_access_edge(self, func_id: str, var_name: str, is_write: bool, target_id: Optional[str] = None):

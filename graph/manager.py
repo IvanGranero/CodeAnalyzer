@@ -59,7 +59,6 @@ class GraphManager:
         "CALLS": "Function",
         "READS_VAR": "GlobalVariable",
         "WRITES_VAR": "GlobalVariable",
-        "DEPENDS_ON_TYPE": "TypeDefinition",
         "USES_MACRO": "MacroDefinition",
         "RECEIVES_SIGNAL": "NetworkSignal",
         "SENDS_SIGNAL": "NetworkSignal",

@@ -21,20 +21,29 @@ class AnalyzerTools:
         return False
 
     def get_function_metadata(self, func_name: str) -> str:
+        # NOTE: fields are returned as separate top-level aliases, NOT as a single
+        # map aliased "metadata" -- `RETURN {...} AS metadata` used to make every row
+        # come back as {"metadata": {FilePath: ..., ...}}, one nesting level deeper
+        # than every consumer expects (scan_function's `metadata_list[0]`,
+        # scan/reporter.py, app/phases/scan_phase.py's TaintedByUDS exploit-routing
+        # check, exploit/orchestrator.py's DID context builder). Confirmed against a
+        # real run: 100% of cached reports had this double-nested shape, so
+        # metadata.get("TaintedByUDS") always silently returned the False default --
+        # meaning every found vulnerability was skipped for exploit regardless of
+        # actual UDS reachability -- and the DIDs-truncation/stub-warning
+        # post-processing two lines below never fired either.
         query = """
         MATCH (f:Function {name: $func_name})
         WHERE NOT f.storage_uri ENDS WITH '.h'  // <--- NEW: Force .c file
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
         WITH f, collect(DISTINCT {did: uds.did, func_class_hex: uds.func_class_hex, source: coalesce(uds.source, 'heuristic')}) AS did_details
-        RETURN {
-            FilePath: f.storage_uri,
-            ByteSpan: f.byte_span,
-            TaintedByUDS: coalesce(f.tainted_by_uds, false),
-            DIDs: coalesce(f.reachable_from_dids, []),
-            DidDetails: did_details,
-            IsVendorLibrary: coalesce(f.is_vendor_code, false),
-            IsStubNode: f:Stub
-        } AS metadata
+        RETURN f.storage_uri AS FilePath,
+               f.byte_span AS ByteSpan,
+               coalesce(f.tainted_by_uds, false) AS TaintedByUDS,
+               coalesce(f.reachable_from_dids, []) AS DIDs,
+               did_details AS DidDetails,
+               coalesce(f.is_vendor_code, false) AS IsVendorLibrary,
+               f:Stub AS IsStubNode
         LIMIT 1
         """
         try:

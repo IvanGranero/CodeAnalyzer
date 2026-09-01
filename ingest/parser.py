@@ -7,7 +7,7 @@ from ingest.builder import GraphPayloadBuilder
 logger = logging.getLogger(__name__)
 
 # --- NEW: Blacklist of common C and AUTOSAR primitive types ---
-# This prevents creating millions of useless DEPENDS_ON_TYPE edges to 'uint8', etc.
+# This prevents creating useless TypeDefinition nodes for 'uint8', etc.
 PRIMITIVE_TYPES = {
     'void', 'char', 'int', 'short', 'long', 'float', 'double',
     'uint8', 'uint16', 'uint32', 'uint64', 'sint8', 'sint16', 'sint32', 'sint64',
@@ -29,6 +29,21 @@ class ASTParser:
         # the standard RTE-generated port-accessor alias pattern. Captures the target's
         # identifier only.
         self.macro_alias_target_re = re.compile(r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
+        # Matches a function-like macro body that is a pointer/address-of expression
+        # rather than a call to another function -- the shape used by Vector MICROSAR's
+        # Rte_Pim_*/Rte_CData_* (and similar) late-bound accessor macros, confirmed
+        # against real generated headers:
+        #   #define Rte_CData_RomData_VIN() (&(Rte_..._RomData_VIN[0]))
+        #   #define Rte_Pim_DCM_VIN_F190_NvmData_17() (&((*RtePim_..._17())[0]))
+        # The second form nests an extra pointer-dereference paren -- a naive
+        # "one optional '(' " check misses it -- so this allows an arbitrary run of
+        # '(', '&', '*' (any order/depth) before the first real identifier character,
+        # rather than assuming a fixed nesting depth.
+        # These are NOT unresolved/missing calls -- they are placeholders that bind to
+        # real memory/config at build time, since the source tree is parsed as-is, not
+        # built. A call site using such a name must never be classified the same way as
+        # a genuinely broken/unresolved call target.
+        self.accessor_macro_body_re = re.compile(r'^\s*\((?:[\s&*(]*)[A-Za-z_]')
         # Matches one entry of Vector MICROSAR's generated Dcm DID dispatch table
         # (Dcm_Lcfg.c/Dcm_PBcfg.c's Dcm_CfgDidMgrSignalOpClassInfo[]/similar arrays):
         #   { ((Dcm_DidMgrOpFuncType)(Rte_Call_DataServices_DID_0004_..._ReadData)),
@@ -81,29 +96,14 @@ class ASTParser:
                 if not is_vendor_code:
                     for child in tree.root_node.children:
                         if child.type == 'declaration':
-                            type_node = child.child_by_field_name('type')
-                            type_name = None
-                            if type_node:
-                                type_name = source_code[type_node.start_byte:type_node.end_byte].decode('utf8', errors='ignore').strip()
                             for var_name in self._extract_all_declared_identifiers(child, source_code):
                                 var_id = self.builder.add_global_variable(var_name, uri, f"{child.start_byte}-{child.end_byte}")
                                 file_global_ids[var_name] = var_id
-                                if type_name and type_name not in PRIMITIVE_TYPES:
-                                    self.builder.add_type_dependency_edge(var_id, type_name, "GLOBAL_VAR_TYPE")
 
                         elif child.type in ('type_definition', 'struct_specifier', 'enum_specifier'):
                             type_name = self._extract_first_identifier(child, source_code)
                             if type_name and type_name not in PRIMITIVE_TYPES:
                                 self.builder.add_type_definition(type_name, uri, f"{child.start_byte}-{child.end_byte}")
-                                field_list = self._find_nodes_of_type(child, 'field_declaration_list')
-                                if field_list:
-                                    for field in self._find_nodes_of_type(field_list[0], 'field_declaration'):
-                                        f_type = field.child_by_field_name('type')
-                                        if f_type:
-                                            f_type_name = source_code[f_type.start_byte:f_type.end_byte].decode('utf8', errors='ignore').strip()
-                                            if f_type_name not in PRIMITIVE_TYPES:
-                                                parent_stub_id = f"stub::{type_name}"
-                                                self.builder.add_type_dependency_edge(parent_stub_id, f_type_name, "NESTED_FIELD")
 
                 # --- Macro definitions/aliases are ALWAYS parsed, even for vendor code. ---
                 # These are RTE-generated glue headers (tagged vendor/generated), which is
@@ -152,21 +152,6 @@ class ASTParser:
                         
                         # --- OPTIMIZATION: Only process internals for non-vendor code ---
                         if not is_vendor_code:
-                            type_node = func_node.child_by_field_name('type')
-                            if type_node:
-                                type_name = source_code[type_node.start_byte:type_node.end_byte].decode('utf8', errors='ignore').strip()
-                                if type_name not in PRIMITIVE_TYPES:
-                                    self.builder.add_type_dependency_edge(func_id, type_name, "RETURN_TYPE")
-                                
-                            param_lists = self._find_nodes_of_type(func_node, 'parameter_list')
-                            if param_lists:
-                                for param in self._find_nodes_of_type(param_lists[0], 'parameter_declaration'):
-                                    p_type = param.child_by_field_name('type')
-                                    if p_type:
-                                        p_type_name = source_code[p_type.start_byte:p_type.end_byte].decode('utf8', errors='ignore').strip()
-                                        if p_type_name not in PRIMITIVE_TYPES:
-                                            self.builder.add_type_dependency_edge(func_id, p_type_name, "PARAM_TYPE")
-
                             self._process_function_internals(func_node, source_code, func_id, func_name, file_global_ids)
             except Exception as e:
                 logger.error(f"AST Parsing failed on {filepath}: {e}")
@@ -321,6 +306,20 @@ class ASTParser:
 
         match = self.macro_alias_target_re.match(replacement_text)
         if not match:
+            # Not a "calls another function" shape. Check whether it's instead a
+            # late-bound RTE accessor macro (pointer/address-of expression) before
+            # giving up -- these are common enough (Rte_Pim_/Rte_CData_ alone
+            # accounted for ~14,760 permanently-unresolvable CALLS stubs in a real
+            # codebase) that they must be classified, not silently dropped.
+            #
+            # The name MUST be Rte_-prefixed: the body-shape regex alone is far too
+            # permissive (confirmed against a real run -- it swept up 8,176 unrelated
+            # macros like MATCH_CGM_ETH_DIAG_FRAME, GET_OFFSET, ReadAddrLong,
+            # Com_ReceiveShadowSignal, since plenty of ordinary cast/getter macros also
+            # start with a paren-wrapped expression). Scoping to the RTE accessor
+            # namespace is what makes this safe.
+            if short_name.startswith('Rte_') and self.accessor_macro_body_re.match(replacement_text):
+                self.builder.mark_late_bound_accessor(short_name)
             return
         long_name = match.group(1)
         if long_name and long_name != short_name:
