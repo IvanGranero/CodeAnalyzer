@@ -1,6 +1,6 @@
 # Multi-Agent Vulnerability Scanner
 
-An enterprise-grade, asynchronous SAST (Static Application Security Testing) platform designed specifically for automotive AutoSAR C/C++ codebases. By combining **Neo4j Code Property Graphs (CPG)** with **Asynchronous LLM Agents**, this tool autonomously maps attack surfaces, traces UDS taint, prioritizes critical functions, and mathematically proves vulnerabilities—all while scaling concurrently.
+An enterprise-grade, asynchronous SAST (Static Application Security Testing) platform designed specifically for automotive AutoSAR C/C++ codebases. By combining **Neo4j Code Property Graphs (CPG)** with **Asynchronous LLM Agents**, this tool autonomously maps attack surfaces, traces UDS taint, prioritizes critical functions, and proves vulnerabilities all while scaling concurrently.
 
 ## ✨ Key Features
 
