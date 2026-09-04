@@ -38,7 +38,7 @@ async def run(args) -> None:
     reporter = ScanReporter(output_dir="reports")
 
     if args.exploit_only:
-        await _run_exploit_only(app_context, args.exploit_only)
+        await _run_exploit_only(app_context, args.exploit_only, reporter)
         return
 
     try:
@@ -52,13 +52,15 @@ async def run(args) -> None:
         shutdown(app_context)
 
 
-async def _run_exploit_only(app_context: AppContext, report_path: str) -> None:
+async def _run_exploit_only(app_context: AppContext, report_path: str, reporter: ScanReporter) -> None:
     logger.info("\n" + "=" * 60)
     logger.info(f"🚀 DIRECT EXPLOIT MODE: Loading {report_path}")
     print("=" * 60)
     try:
-        exploit_phase = ExploitPhase(app_context.llm, cache_dir=".")
+        os.makedirs("reports", exist_ok=True)
+        exploit_phase = ExploitPhase(app_context.llm, cache_dir="reports")
         results = await exploit_phase.run_standalone(report_path)
+        generate_final_report(exploit_phase.standalone_reports, reporter)
         for func_name, result in results.items():
             if result.get("status") == "success":
                 logger.info(f"💀 [PWNED] {func_name} exploit validated!")
