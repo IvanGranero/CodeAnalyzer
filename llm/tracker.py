@@ -50,6 +50,11 @@ class TokenTracker:
         output_cost = (self.completion_tokens / 1_000_000) * self.output_rate
         return input_cost + output_cost
 
+    def estimate_usage_cost(self, usage: Dict[str, Any]) -> float:
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        return (input_tokens / 1_000_000) * self.input_rate + (output_tokens / 1_000_000) * self.output_rate
+
     def log_summary(self):
         """Prints a highly formatted financial/usage report."""
         cost = self.get_estimated_cost()

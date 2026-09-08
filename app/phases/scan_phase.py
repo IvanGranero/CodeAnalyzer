@@ -1,12 +1,16 @@
 import asyncio
-import json
 import logging
 import os
+import hashlib
 from typing import Dict, Optional
 
-from exploit.config import exploit_settings
-from exploit.domain_mapping import DEFAULT_DOMAIN, infer_domain
-from scan.orchestrator import ScanOrchestrator
+from app.storage.repositories import ScanCacheRepository
+from app.events import EventSink
+from app.progress import ScanProgress
+from tools.exploitation.config import exploit_settings
+from tools.exploitation.domain_mapping import DEFAULT_DOMAIN, infer_domain
+from tools.scanning.orchestrator import ScanOrchestrator
+from tools.scanning.contracts import ScanReport
 
 from app.phases.exploit_phase import ExploitPhase
 
@@ -49,12 +53,15 @@ class ScanPhase:
         exploit_phase: ExploitPhase,
         cache_dir: str,
         max_concurrent: int = MAX_CONCURRENT_SCANS,
+        event_sink: EventSink | None = None,
     ):
         self.orchestrator = orchestrator
         self.exploit_phase = exploit_phase
         self.cache_dir = cache_dir
+        self.report_store = ScanCacheRepository(cache_dir)
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.max_concurrent = max_concurrent
+        self.progress = ScanProgress(event_sink=event_sink)
 
     async def prioritize(self, max_targets: int, domain_filter: Optional[str], file_filter: Optional[str]) -> list:
         return await self.orchestrator.prioritize_targets(
@@ -64,6 +71,9 @@ class ScanPhase:
     async def run(self, targets: list, selected_domain: Optional[str], all_reports: Dict[str, dict]) -> Dict[str, dict]:
         if not targets:
             return all_reports
+
+        await self.progress.start(len(targets))
+        self.orchestrator.set_progress_callback(self.progress)
 
         queue: asyncio.Queue = asyncio.Queue()
         for t in targets:
@@ -89,11 +99,15 @@ class ScanPhase:
             logger.warning("\nExecution was cancelled. Shutting down gracefully...")
             for w in workers:
                 w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             raise
+        else:
+            await asyncio.gather(*workers)
         return all_reports
 
     async def _scan_one(self, target_func: str, selected_domain: Optional[str], all_reports: Dict[str, dict]) -> None:
         async with self.semaphore:
+            await self.progress.target_started(target_func)
             try:
                 report = await self.orchestrator.scan_function(target_func)
             except asyncio.CancelledError:
@@ -101,11 +115,17 @@ class ScanPhase:
                 raise
             except Exception as exc:
                 logger.error(f"Scan for {target_func} crashed: {exc}")
+                await self.progress.target_finished(target_func, {"scan_status": "error"})
                 return
 
             all_reports[target_func] = report
-            with open(os.path.join(self.cache_dir, f"{target_func}.json"), 'w') as f:
-                json.dump(report, f)
+            report = ScanReport.model_validate(report).as_report_dict()
+            all_reports[target_func] = report
+            safe_target = "".join(character if character.isalnum() or character in "._-" else "_" for character in target_func)
+            cache_name = f"{safe_target}-{hashlib.sha256(target_func.encode('utf-8')).hexdigest()[:12]}"
+            report["_target_function"] = target_func
+            self.report_store.save(cache_name, report)
+            await self.progress.target_finished(target_func, report)
 
             if not report.get("vulnerability_found"):
                 logger.info(f"✔ [CLEAN] -> {target_func}")

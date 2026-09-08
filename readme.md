@@ -6,13 +6,17 @@ An enterprise-grade, asynchronous SAST (Static Application Security Testing) pla
 
 * **Graph-Backed Taint Analysis:** Uses Neo4j to resolve ASTs, trace UDS (ISO 14229) diagnostic taint, map RTE data flows, and prune dead code instantly.
 
-* **Name-Convention-Independent UDS Entry-Point Detection:** Resolves RTE port-accessor macro aliases (`Rte_Read_/Rte_Write_/Rte_Call_/Rte_IrvRead_/Rte_IrvWrite_`) and scrapes the generated Dcm DID dispatch table (`Dcm_CfgDidMgrSignalOpClassInfo[]`) directly, so UDS callback functions are correctly recognized as reachable even when their C symbol name gives no hint of DID handling and they have no direct caller anywhere in the source tree.
+* **Name-Convention-Independent UDS Entry-Point Detection:** Resolves RTE port-accessor macro aliases and scrapes the generated Dcm DID dispatch table directly, so UDS callback functions are correctly recognized as reachable even when their C symbol name gives no hint of DID handling and they have no direct caller anywhere in the source tree.
 
 * **Fully Asynchronous Engine:** Built from the ground up with Python's `asyncio` for maximum I/O performance. Scans multiple targets concurrently and shuts down instantly/gracefully on `Ctrl+C`.
 
 * **Domain-Specific Targeting:** Interactively filter scans by application domain (e.g., `/diag`, `/security`, `/ota`) to focus security audits on relevant modules.
 
 * **Decomposed, Adaptive Deep-Scan:** The Triage agent breaks each function's threat model into discrete, independently-checkable vulnerability candidates (not a single batched checklist) and estimates how much reasoning each one needs. The orchestrator then runs one single-tasked Deep-Scan call per candidate, concurrently, at a reasoning-effort/token budget scaled to that candidate's own difficulty — so a quick mechanical check no longer pays for the same budget as a candidate requiring multi-hop taint or concurrency reasoning. Every candidate's verdict is cross-checked against the graph's own ground truth (`has_data_race_risk`, `is_dead_code`, UDS-trigger provenance) before the report is finalized, flagging any model/graph disagreement for human review instead of trusting it silently.
+
+* **Budgeted Tiered Reasoning:** Cheap models handle discovery, triage, and low-effort candidates; strong models handle high-effort deep scans. A shared scheduler limits concurrent calls, candidate fan-out, estimated tokens, and optional cost. Set `scan_max_*` values in `.env` to enforce repository-level limits.
+
+* **Typed Evidence Contracts:** Triage candidates, follow-up artifacts, coverage states, and findings are validated at the LLM boundary. Unsupported evidence is reported as unavailable instead of being represented by placeholder text, and inferred graph paths are labeled with their provenance.
 
 * **Safety-Gated Exploit Validation:** Crafted UDS payloads for write/routine-control/flash/reset services (`0x2E`, `0x31`, `0x34-0x37`, `0x11`, `0x14`) are blocked before ever reaching a real ECU unless explicitly enabled — the exploit loop defaults to read-only, non-destructive services.
 
@@ -67,6 +71,12 @@ Ensure your `.env` or `config.py` file is populated with your specific database 
 * `cheap_model_id`, `cheap_base_url`, `cheap_api_version`
 * `strong_model_id`, `strong_base_url`, `strong_api_version`
 
+Optional scan controls:
+
+* `scan_max_concurrent_llm_calls` defaults to `5`.
+* `scan_max_calls`, `scan_max_tokens`, and `scan_max_cost_usd` default to unlimited (`0`).
+* `scan_max_candidates_per_target` defaults to `12`.
+
 The application reports missing or invalid settings before starting the scanner. If `.env` is missing, create it in the project directory. Use `python codeanalyzer.py --help` to view command-line usage without configuring the environment first.
 
 Exploit behavior is configured separately in `exploit/.env`:
@@ -104,6 +114,7 @@ Command-line parsing happens before environment configuration is loaded, so `--h
 | `--skip-exploit` | Disables the dynamic exploit validation phase for UDS-reachable findings. |
 | `--resume` | Loads completed reports from `scan_cache/` and schedules unfinished scans and UDS exploit validations. |
 | `--exploit-only REPORT.json` | Skips discovery, ingestion, domain selection, and static scanning, then executes the exploit loop for each vulnerability in the supplied JSON report. |
+| `--tui` | Runs the Textual interface with live phase, target, finding, and cancellation status. |
 
 The normal scan flow is discovery, graph ingestion, domain selection, static scanning, and exploit validation for findings that are reachable through UDS/DoIP. The `--exploit-only` option is a separate direct-validation mode and does not require a new scan.
 
@@ -162,6 +173,16 @@ The report must be a JSON object keyed by function name. Each value should conta
 
 The domain is inferred from the first report entry and passed to every exploit in direct mode. Exploit results are printed in the final log output; this mode does not write a new consolidated scan report.
 
+### Textual Interface
+
+Use the optional Textual interface for live scan progress without terminal log output:
+
+```bash
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --tui --limit 10
+```
+
+The interface shows phase progress, target status, findings, and cancellation state. Press `c` to cancel the active scan or `q` to exit. The first TUI screen intentionally avoids stdin-based domain selection; use `--target-file`, `--scan-all`, or `--limit` to define the scan scope.
+
 ## 🏗️ Architecture Pipeline
 
 * **Phase 1: Architectural Discovery**
@@ -169,7 +190,7 @@ The domain is inferred from the first report entry and passed to every exploit i
 
 * **Phase 2: Graph Ingestion & Resolution**
   * Parses C/C++ code into a Neo4j Code Property Graph.
-  * Runs a fixed sequence of resolver passes: resolves the generated Dcm DID dispatch table and RTE macro-call aliases into real `HANDLES_UDS`/`CALLS` edges first (both are name-convention-independent, generator-authoritative sources), then propagates UDS taint, binds runnables to OS tasks, resolves concurrency/data-race risk, maps RTE data flow, flags dangerous sinks, and finally flags dead code — in that order, so dead-code detection only ever runs against the fully-resolved call graph.
+  * Runs a fixed sequence of resolver passes: resolves the generated Dcm DID dispatch table and RTE macro-call aliases into real `HANDLES_UDS`/`CALLS` edges first (both are name-convention-independent, generator-authoritative sources), then propagates UDS taint, binds runnables to OS tasks, flags dead code from resolved reachability, and applies the independent concurrency, RTE data-flow, dangerous-sink, and data-race annotations.
 
 * **Phase 2.5: Interactive Domain Selection**
   * Prompts the user to isolate the scan to a specific module (e.g., `diag`).

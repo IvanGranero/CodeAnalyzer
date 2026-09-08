@@ -11,3 +11,6 @@ tree-sitter-cpp
 
 # LLM Integration (OpenAI-compatible SDK)
 openai>=1.12.0
+
+# Optional interactive terminal UI
+textual>=0.50.0

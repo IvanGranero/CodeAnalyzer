@@ -1,9 +1,8 @@
 import json
 import logging
 import os
-import sys
 
-from ingest.discovery import RepoDiscoverer
+from tools.ingestion.discovery import RepoDiscoverer
 from llm.service import LLMService
 
 logger = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ class DiscoveryPhase:
             config_json = json.loads(llm_response)
         except json.JSONDecodeError:
             logger.error("Discovery LLM did not return valid JSON. Cannot proceed.")
-            sys.exit(1)
+            raise ValueError("Discovery LLM did not return valid JSON")
 
         with open(self.cache_file, 'w') as f:
             json.dump(config_json, f)

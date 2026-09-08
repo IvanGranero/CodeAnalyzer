@@ -1,13 +1,18 @@
 import os
 import json
-import uuid
 import logging
 import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
+from typing import Any, TypeVar
 import openai
 from openai import AsyncOpenAI, APIConnectionError
 
 logger = logging.getLogger(__name__)
+ResponseT = TypeVar("ResponseT")
+ToolDefinition = Mapping[str, Any]
+ToolHandler = Callable[[str, Mapping[str, Any]], str]
+UsageCallback = Callable[[Mapping[str, Any], float], None | Awaitable[None]]
 
 class LLMClient:
     def __init__(
@@ -20,6 +25,8 @@ class LLMClient:
         audit_log_dir: str = "logs/llm_audit"
     ):
         self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
+        if not self.api_keys:
+            raise ValueError("At least one non-empty LLM API key is required")
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.api_version = api_version
@@ -62,7 +69,13 @@ class LLMClient:
         self._current_index = 0
         logger.info(f"Initialized LLMClient with {len(self.clients)} keys. Auth Header: '{self.api_key_header}'")
 
-    def _audit_log(self, kwargs: dict, response_content: str, endpoint_used: str, context_id: str = None):
+    def _audit_log(
+        self,
+        kwargs: Mapping[str, Any],
+        response_content: str,
+        endpoint_used: str,
+        context_id: str | None = None,
+    ) -> None:
         """Saves the exact API payload and response to disk for debugging/auditing."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c for c in (context_id or "unknown_target") if c.isalnum() or c in "_-")
@@ -85,17 +98,23 @@ class LLMClient:
         except Exception as e:
             logger.error(f"Failed to write LLM audit log: {e}")
 
-    async def generate_chat(self, system_prompt: str, user_prompt: str, model_settings: dict = None, context_id: str = None) -> tuple[str, dict]:
-
-        """Returns a tuple of (response_text, usage_dict)"""
-        if model_settings is None:
-            model_settings = {}
+    async def generate_chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model_settings: Mapping[str, Any] | None = None,
+        context_id: str | None = None,
+        tools: Sequence[ToolDefinition] | None = None,
+        tool_handler: ToolHandler | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Generate a response using the configured endpoint and tool handler."""
+        model_settings = model_settings or {}
             
         client = self.clients[self._current_index]
         self._current_index = (self._current_index + 1) % len(self.clients)
         
         if self._use_legacy_endpoint:
-            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id)
+            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id, tools, tool_handler)
 
         kwargs_responses = {
             "model": self.model_name,
@@ -104,6 +123,8 @@ class LLMClient:
                 {"role": "user", "content": user_prompt}
             ]
         }
+        if tools:
+            kwargs_responses["tools"] = tools
         # NOTE: the /responses API uses `max_output_tokens`, not `max_tokens`/
         # `max_completion_tokens`. Callers (see llm/prompts.json's model_settings) set
         # `max_completion_tokens` and `reasoning_effort`; previously only `max_tokens` was
@@ -118,65 +139,127 @@ class LLMClient:
         if model_settings.get("response_format") == "json_object":
             kwargs_responses["text"] = {"format": {"type": "json_object"}}
 
-        max_retries = 3
-        base_delay = 2.0
+        try:
+            response = await self._retry_request(
+                lambda: self._request_responses(client, kwargs_responses, tool_handler),
+                endpoint="/responses",
+            )
+        except openai.NotFoundError:
+            logger.warning("[LLM] /responses returned 404; using /chat/completions.")
+            self._use_legacy_endpoint = True
+            return await self._execute_legacy_chat(
+                client, system_prompt, user_prompt, model_settings,
+                context_id, tools, tool_handler,
+            )
 
+        final_text = self._response_text(response, "Frontier")
+        usage_dict = self._usage_dict(response)
+        self._audit_log(kwargs_responses, final_text, "/responses", context_id)
+        return final_text, usage_dict
+
+    async def _retry_request(
+        self,
+        operation: Callable[[], Awaitable[ResponseT]],
+        *,
+        endpoint: str,
+        max_retries: int = 3,
+    ) -> ResponseT:
+        """Retry transient provider failures using exponential backoff."""
         for attempt in range(max_retries):
             try:
-                response = await client.responses.create(**kwargs_responses)
-                
-                final_text = None
-                usage_dict = {}
-                
-                # Extract tokens
-                if hasattr(response, 'usage') and response.usage:
-                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage)
-                    
-                # Extract text
-                for block in response.output:
-                    if block.type == "message":
-                        final_text = block.content[0].text
-                
-                if final_text is None:
-                    raise RuntimeError("Frontier model returned no assistant message.")
-
-                self._audit_log(kwargs_responses, final_text, "/responses", context_id)
-                return final_text, usage_dict
-
+                return await operation()
             except openai.NotFoundError:
-                logger.warning(f"[LLM] Endpoint /responses returned 404. Falling back to /chat/completions globally.")
-                self._use_legacy_endpoint = True
-                return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id)
-
-            except APIConnectionError as e:
-                logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1: raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
-            except openai.RateLimitError as e:
-                logger.warning(f"[LLM Rate Limit] 429 (Attempt {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1: raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
-            except openai.APIStatusError as e:
-                # 5xx are transient/retryable; other 4xx (bad request, auth, etc.) are not.
-                if e.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
-                    logger.warning(f"[LLM Server Error] {e.status_code} (Attempt {attempt+1}/{max_retries}): {e}")
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-                else:
+                raise
+            except APIConnectionError as exc:
+                retryable = True
+                message = f"connection failed: {exc}"
+            except openai.RateLimitError as exc:
+                retryable = True
+                message = f"rate limited: {exc}"
+            except openai.APIStatusError as exc:
+                retryable = exc.status_code in (500, 502, 503, 504)
+                message = f"HTTP {exc.status_code}: {exc}"
+            except Exception as exc:
+                message_text = str(exc).lower()
+                retryable = any(
+                    marker in message_text
+                    for marker in ("getaddrinfo failed", "connection", "timeout")
+                )
+                if not retryable:
+                    logger.exception("[LLM] %s failed on model %s", endpoint, self.model_name)
                     raise
+                message = f"network failure: {exc}"
 
-            except Exception as e:
-                err_str = str(e).lower()
-                if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:
-                    logger.warning(f"[LLM Network Error] Socket/Timeout (Attempt {attempt+1}/{max_retries}): {e}")
-                    if attempt == max_retries - 1: raise
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-                else:
-                    logger.exception(f"[LLM] Primary API call failed with unknown error on model {self.model_name}")
-                    raise
+            if attempt == max_retries - 1 or not retryable:
+                raise
+            delay = 2.0 * (2 ** attempt)
+            logger.warning(
+                "[LLM] %s %s (attempt %d/%d); retrying in %.1fs",
+                endpoint, message, attempt + 1, max_retries, delay,
+            )
+            await asyncio.sleep(delay)
 
-    async def _execute_legacy_chat(self, client, system_prompt, user_prompt, model_settings, context_id: str = None) -> tuple[str, dict]:
+        raise AssertionError("retry loop completed without returning or raising")
+
+    async def _request_responses(
+        self,
+        client: Any,
+        request_kwargs: dict[str, Any],
+        tool_handler: ToolHandler | None,
+    ) -> Any:
+        response_input = request_kwargs["input"]
+        for _ in range(4):
+            response = await client.responses.create(
+                **{**request_kwargs, "input": response_input}
+            )
+            function_calls = [
+                item for item in response.output
+                if getattr(item, "type", None) == "function_call"
+            ]
+            if not function_calls or not tool_handler:
+                return response
+            tool_outputs = [
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": self._call_tool(tool_handler, call.name, call.arguments),
+                }
+                for call in function_calls
+            ]
+            response_input = response_input + list(response.output) + tool_outputs
+        raise RuntimeError("Model exceeded the maximum tool-call rounds")
+
+    @staticmethod
+    def _call_tool(tool_handler: ToolHandler, name: str, arguments: str | None) -> str:
+        try:
+            return tool_handler(name, json.loads(arguments or "{}"))
+        except Exception as exc:
+            return json.dumps({"error": str(exc)})
+
+    @staticmethod
+    def _usage_dict(response: Any) -> dict[str, Any]:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return {}
+        return usage.model_dump() if hasattr(usage, "model_dump") else vars(usage)
+
+    @staticmethod
+    def _response_text(response: Any, model_name: str) -> str:
+        for block in response.output:
+            if getattr(block, "type", None) == "message":
+                return block.content[0].text
+        raise RuntimeError(f"{model_name} model returned no assistant message.")
+
+    async def _execute_legacy_chat(
+        self,
+        client: Any,
+        system_prompt: str,
+        user_prompt: str,
+        model_settings: Mapping[str, Any],
+        context_id: str | None = None,
+        tools: Sequence[ToolDefinition] | None = None,
+        tool_handler: ToolHandler | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         kwargs_chat = {
             "model": self.model_name,
             "messages": [ 
@@ -193,49 +276,50 @@ class LLMClient:
             kwargs_chat["reasoning_effort"] = model_settings["reasoning_effort"]
         if model_settings.get("response_format") == "json_object":
             kwargs_chat["response_format"] = {"type": "json_object"}
+        if tools:
+            kwargs_chat["tools"] = [
+                {"type": "function", "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {}),
+                }}
+                for tool in tools
+            ]
             
-        max_retries = 3
-        base_delay = 2.0
+        response = await self._retry_request(
+            lambda: self._request_legacy_chat(client, kwargs_chat, tool_handler),
+            endpoint="/chat/completions",
+        )
+        final_text = response.choices[0].message.content
+        if final_text is None:
+            raise RuntimeError("Legacy model returned no assistant message.")
+        self._audit_log(kwargs_chat, final_text, "/chat/completions", context_id)
+        return final_text, self._usage_dict(response)
 
-        for attempt in range(max_retries):
-            try:
-                response = await client.chat.completions.create(**kwargs_chat)
-                final_text = response.choices[0].message.content
-                used_endpoint = "/chat/completions"
-                
-                usage_dict = {}
-                if hasattr(response, 'usage') and response.usage:
-                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage)
-                
-                if final_text is None:
-                    raise RuntimeError("Legacy model returned no assistant message.")
-                    
-                self._audit_log(kwargs_chat, final_text, used_endpoint, context_id)
-                return final_text, usage_dict
-                
-            except APIConnectionError as e:
-                logger.warning(f"[LLM Network Error] Connection failed (Attempt {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1: raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
-            except openai.RateLimitError as e:
-                logger.warning(f"[LLM Rate Limit] 429 (Attempt {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1: raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
-            except openai.APIStatusError as e:
-                if e.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
-                    logger.warning(f"[LLM Server Error] {e.status_code} (Attempt {attempt+1}/{max_retries}): {e}")
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-                else:
-                    raise
-
-            except Exception as e:
-                err_str = str(e).lower()
-                if "getaddrinfo failed" in err_str or "connection" in err_str or "timeout" in err_str:
-                    logger.warning(f"[LLM Network Error] Socket/Timeout (Attempt {attempt+1}/{max_retries}): {e}")
-                    if attempt == max_retries - 1: raise
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-                else:
-                    logger.exception(f"[LLM] Fallback API call failed on model {self.model_name}")
-                    raise
+    async def _request_legacy_chat(
+        self,
+        client: Any,
+        request_kwargs: dict[str, Any],
+        tool_handler: ToolHandler | None,
+    ) -> Any:
+        messages = list(request_kwargs["messages"])
+        for _ in range(4):
+            response = await client.chat.completions.create(
+                **{**request_kwargs, "messages": messages}
+            )
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls or not tool_handler:
+                return response
+            messages.append(message)
+            for tool_call in tool_calls:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": self._call_tool(
+                        tool_handler,
+                        tool_call.function.name,
+                        tool_call.function.arguments,
+                    ),
+                })
+        raise RuntimeError("Model exceeded the maximum tool-call rounds")

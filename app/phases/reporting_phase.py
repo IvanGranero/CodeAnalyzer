@@ -1,18 +1,26 @@
 import logging
-from typing import Dict
+from collections.abc import Callable
+from typing import Any
 
-from scan.reporter import ScanReporter
+from tools.scanning.reporter import ScanReporter
 
 logger = logging.getLogger(__name__)
 
 
-def generate_final_report(all_reports: Dict[str, dict], reporter: ScanReporter) -> None:
+def generate_final_report(
+    all_reports: dict[str, dict[str, Any]],
+    reporter: ScanReporter,
+    output: Callable[[str], None] | None = print,
+) -> None:
+    """Generate reports and optionally send terminal summary text to a sink."""
     if not all_reports:
         return
 
-    print("\n" + "=" * 60)
+    if output is not None:
+        output("\n" + "=" * 60)
     logger.info("FINAL SCAN SUMMARY:")
-    print("=" * 60)
+    if output is not None:
+        output("=" * 60)
 
     vuln_count = 0
     for func, report in all_reports.items():
@@ -25,7 +33,8 @@ def generate_final_report(all_reports: Dict[str, dict], reporter: ScanReporter) 
         logger.info(f"✅ Generated {vuln_count} individual Markdown reports in the 'reports/' directory.")
     else:
         logger.info("✅ No vulnerabilities were found in the scanned targets.")
-    print("=" * 60 + "\n")
+    if output is not None:
+        output("=" * 60 + "\n")
 
     if hasattr(reporter, 'generate_consolidated_reports'):
         reporter.generate_consolidated_reports(all_reports)

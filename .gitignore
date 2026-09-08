@@ -13,6 +13,8 @@ tests/
 .coverage
 requirements-dev.txt
 htmlcov/
+.arbor/
+.vscode/
 
 # Editor / tooling caches
 .mypy_cache/

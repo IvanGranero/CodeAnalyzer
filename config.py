@@ -31,13 +31,20 @@ class AppConfig(BaseSettings):
     # --- Optional pricing ----------------------------------------------------
     # Using Optional[float] = None means if you comment these out in the .env, 
     # they just become None in Python without crashing the app.
-    cheap_usd__input: Optional[float] = None
-    cheap_usd__output: Optional[float] = None
+    cheap_usd_input: Optional[float] = None
+    cheap_usd_output: Optional[float] = None
     cheap_usd_cached_input: Optional[float] = None
     
     strong_usd_input: Optional[float] = None
     strong_usd_output: Optional[float] = None
     strong_usd_cached_input: Optional[float] = None
+
+    # --- Scan admission control ---------------------------------------------
+    scan_max_concurrent_llm_calls: int = 5
+    scan_max_calls: int = 0
+    scan_max_tokens: int = 0
+    scan_max_cost_usd: float = 0.0
+    scan_max_candidates_per_target: int = 12
 
     # --- Optional TLS override -----------------------------------------------
     # Pydantic natively understands "false", "0", "off" from the .env file

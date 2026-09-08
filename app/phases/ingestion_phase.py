@@ -1,7 +1,7 @@
 import logging
 
-from graph.manager import GraphManager
-from ingest.pipeline import IngestionPipeline
+from tools.graph.manager import GraphManager
+from tools.ingestion import IngestionService
 
 logger = logging.getLogger(__name__)
 
@@ -11,8 +11,4 @@ class IngestionPhase:
 
     def run(self, target_directory: str, graph: GraphManager, config_json: dict) -> None:
         logger.info("\n--- PHASE 2: Starting Graph Ingestion & Resolution ---")
-        IngestionPipeline(target_directory, graph).run(
-            vendor_folders=config_json.get('vendor_folders', []),
-            config_files=config_json.get('config_files', []),
-        )
-        graph.resolver.run_all_passes()
+        IngestionService().run(target_directory, graph, config_json)
