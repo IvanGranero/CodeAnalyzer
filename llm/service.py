@@ -22,8 +22,8 @@ class LLMService:
         api_key: str,
         model_name: str,
         base_url: str,
-        api_version: str,
-        api_key_header: str = "",
+        default_headers: str = "",
+        extra_query: str = "",
         usd_per_1m_input: float | None = None,
         usd_per_1m_output: float | None = None,
         usage_listener: UsageCallback | None = None,
@@ -32,8 +32,8 @@ class LLMService:
             api_key=api_key,
             model_name=model_name,
             base_url=base_url,
-            api_version=api_version,
-            api_key_header=api_key_header,
+            default_headers=default_headers,
+            extra_query=extra_query,
         )
         self.prompts = self._load_prompts()
         self.tracker = TokenTracker(

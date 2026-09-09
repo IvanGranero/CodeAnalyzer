@@ -4,6 +4,7 @@ import os
 
 from tools.ingestion.discovery import RepoDiscoverer
 from llm.service import LLMService
+from tools.scanning.response_parser import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,14 @@ class DiscoveryPhase:
             task_name="discovery", kwargs={"directory_tree": dir_tree}, context_id="discovery"
         )
         try:
-            config_json = json.loads(llm_response)
-        except json.JSONDecodeError:
-            logger.error("Discovery LLM did not return valid JSON. Cannot proceed.")
-            raise ValueError("Discovery LLM did not return valid JSON")
+            config_json = extract_json_object(llm_response)
+        except ValueError as exc:
+            logger.error(
+                "Discovery LLM did not return a JSON object (response length=%d): %s",
+                len(llm_response),
+                exc,
+            )
+            raise ValueError("Discovery LLM did not return valid JSON") from exc
 
         with open(self.cache_file, 'w') as f:
             json.dump(config_json, f)

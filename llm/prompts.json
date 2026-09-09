@@ -3,8 +3,8 @@
     "version": "1.2.0",
     "description": "Analyzes architecture, identifies key application domains, and locates critical AutoSAR/Build configuration files.",
     "model_settings": {
-      "reasoning_effort": "medium",
-      "max_completion_tokens": 2048,
+      "reasoning_effort": "low",
+      "max_completion_tokens": 4096,
       "response_format": "json_object"
     },
     "system": [
@@ -115,7 +115,7 @@
     "version": "1.1.0",
     "description": "Generates the next UDS payload based on vulnerability context, Target DIDs, and history.",
     "model_settings": {
-      "max_completion_tokens": 1024,
+      "max_completion_tokens": 4096,
       "response_format": "json_object"
     },
     "system": [
@@ -156,7 +156,7 @@
     "version": "1.0.0",
     "description": "Analyzes a single TX/RX transaction and provides a structured observation.",
     "model_settings": {
-      "max_completion_tokens": 1024,
+      "max_completion_tokens": 4096,
       "response_format": "json_object"
     },
     "system": [
@@ -182,7 +182,7 @@
     "version": "1.0.0",
     "description": "Reviews the full history and decides the next strategic move.",
     "model_settings": {
-      "max_completion_tokens": 1024,
+      "max_completion_tokens": 4096,
       "response_format": "json_object"
     },
     "system": [

@@ -20,20 +20,20 @@ class AppContext:
 def build_app_context(settings) -> AppContext:
     """Bootstraps the LLM service and graph manager from validated Settings."""
     cheap_llm = LLMService(
-        api_key=settings.genai_subscription_key,
+        api_key=settings.cheap_subscription_key,
         model_name=settings.cheap_model_id,
         base_url=settings.cheap_base_url,
-        api_version=settings.cheap_api_version,
-        api_key_header=settings.genai_subscription_header,
+        default_headers=settings.cheap_default_headers,
+        extra_query=settings.cheap_extra_query,
         usd_per_1m_input=settings.cheap_usd_input,
         usd_per_1m_output=settings.cheap_usd_output,
     )
     strong_llm = LLMService(
-        api_key=settings.genai_subscription_key,
+        api_key=settings.strong_subscription_key,
         model_name=settings.strong_model_id,
         base_url=settings.strong_base_url,
-        api_version=settings.strong_api_version,
-        api_key_header=settings.genai_subscription_header,
+        default_headers=settings.strong_default_headers,
+        extra_query=settings.strong_extra_query,
         usd_per_1m_input=settings.strong_usd_input,
         usd_per_1m_output=settings.strong_usd_output,
     )

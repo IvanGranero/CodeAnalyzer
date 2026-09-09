@@ -20,8 +20,8 @@ class LLMClient:
         api_key: str, 
         model_name: str, 
         base_url: str, 
-        api_version: str = "",
-        api_key_header: str = "",
+        default_headers: str = "",
+        extra_query: str = "",
         audit_log_dir: str = "logs/llm_audit"
     ):
         self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
@@ -29,9 +29,8 @@ class LLMClient:
             raise ValueError("At least one non-empty LLM API key is required")
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
-        self.api_version = api_version
-        
-        self.api_key_header = api_key_header.strip() if api_key_header.strip() else "api-key"
+        self.default_headers = self._parse_pairs(default_headers)
+        self.extra_query = self._parse_pairs(extra_query)
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
         
@@ -41,11 +40,8 @@ class LLMClient:
                 
         self.clients = []
         for key in self.api_keys:
-            headers = {self.api_key_header: key}
-            query_params = {}
-            
-            if self.api_version:
-                query_params["api-version"] = self.api_version
+            headers = self.default_headers.copy()
+            query_params = self.extra_query.copy()
                 
             self.clients.append(
                 AsyncOpenAI(
@@ -53,21 +49,19 @@ class LLMClient:
                     api_key=key,
                     default_headers=headers,
                     default_query=query_params if query_params else None,
-                    # 60s was too short for deep_scan_agent's reasoning_effort="high" +
-                    # max_completion_tokens=16000 calls -- confirmed against a real run:
-                    # every deep_scan call for a "gpt-5.6-luna" reasoning model timed out
-                    # at exactly 60.06s (openai SDK's own "Retrying request in Ns" log,
-                    # httpx read timeout), then kept re-timing-out through both the SDK's
-                    # internal retry and this client's own retry loop below, since the
-                    # ceiling itself -- not a transient blip -- was the bottleneck. Cheap
-                    # tasks (triage_agent: reasoning_effort="low", 4096 tokens) finish in
-                    # ~15-18s regardless, so a generous shared ceiling costs them nothing.
-                    timeout=300.0
+                    timeout=120.0
                 )
             )
             
         self._current_index = 0
-        logger.info(f"Initialized LLMClient with {len(self.clients)} keys. Auth Header: '{self.api_key_header}'")
+        logger.info(f"Initialized LLMClient with {len(self.clients)} keys.")
+
+    @staticmethod
+    def _parse_pairs(value: str) -> dict[str, str]:
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if len(parts) % 2:
+            raise ValueError("Configuration pairs must contain comma-separated key/value pairs")
+        return dict(zip(parts[::2], parts[1::2]))
 
     def _audit_log(
         self,

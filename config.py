@@ -13,31 +13,28 @@ class AppConfig(BaseSettings):
     """
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
-    # --- GenAI / Auth --------------------------------------------------------
-    # No default value means this MUST be present in the .env file
-    genai_subscription_key: str 
-    genai_subscription_header: str = ""
-
     # --- Cheap tier ("orchestrator") -----------------------------------------
+    cheap_subscription_key: str
+    cheap_default_headers: str = ""
+    cheap_extra_query: str = ""
     cheap_model_id: str
     cheap_base_url: str
-    cheap_api_version: str
 
     # --- Strong tier ("code analyzer") ---------------------------------------
+    strong_subscription_key: str
+    strong_default_headers: str = ""
+    strong_extra_query: str = ""
     strong_model_id: str
     strong_base_url: str
-    strong_api_version: str
 
     # --- Optional pricing ----------------------------------------------------
     # Using Optional[float] = None means if you comment these out in the .env, 
     # they just become None in Python without crashing the app.
     cheap_usd_input: Optional[float] = None
     cheap_usd_output: Optional[float] = None
-    cheap_usd_cached_input: Optional[float] = None
     
     strong_usd_input: Optional[float] = None
     strong_usd_output: Optional[float] = None
-    strong_usd_cached_input: Optional[float] = None
 
     # --- Scan admission control ---------------------------------------------
     scan_max_concurrent_llm_calls: int = 5
