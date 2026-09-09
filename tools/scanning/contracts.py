@@ -169,6 +169,8 @@ class ExploitFinding(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     vulnerability_type: Optional[str] = None
+    status: Optional[str] = None
+    vulnerability_found: bool = False
     severity: str = "Informational"
     confidence: str = "low"
     evidence: str = ""
@@ -177,6 +179,9 @@ class ExploitFinding(BaseModel):
     evidence_references: List[EvidenceReference] = Field(default_factory=list)
     graph_flag_agreement: Optional[bool] = None
     needs_human_review: bool = False
+    decision: Optional[str] = None
+    candidate_rationale: Optional[str] = None
+    effort_estimate: Optional[str] = None
 
 
 class ExploitContext(BaseModel):

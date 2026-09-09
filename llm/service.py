@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from llm.client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
 from llm.tracker import TokenTracker
@@ -42,6 +42,7 @@ class LLMService:
             usd_per_1m_output=usd_per_1m_output,
         )
         self.usage_listener = usage_listener
+        self.pause_waiter: Callable[[], Awaitable[None]] | None = None
 
     def _load_prompts(self) -> dict[str, dict[str, Any]]:
         """Load task templates and model defaults from ``prompts.json``."""
@@ -64,6 +65,8 @@ class LLMService:
         tool_handler: ToolHandler | None = None,
     ) -> str:
         """Render and execute one configured prompt task."""
+        if self.pause_waiter is not None:
+            await self.pause_waiter()
         if task_name not in self.prompts:
             raise ValueError(f"Task '{task_name}' not found in prompts.json")
 
@@ -115,10 +118,6 @@ class LLMService:
                 if inspect.isawaitable(listener_result):
                     await listener_result
 
-    def set_usage_listener(self, listener: UsageCallback | None) -> None:
-        """Set a process-local observer for completed LLM usage records."""
-        self.usage_listener = listener
-
         elapsed = time.time() - start_time
         logger.debug(
             "LLM Service (%s): Task '%s' completed in %.2fs",
@@ -133,3 +132,13 @@ class LLMService:
         )
         logger.debug("[LLM Response Preview] %s", preview)
         return result_text
+
+    def set_usage_listener(self, listener: UsageCallback | None) -> None:
+        """Set a process-local observer for completed LLM usage records."""
+        self.usage_listener = listener
+
+    def set_pause_waiter(
+        self, waiter: Callable[[], Awaitable[None]] | None
+    ) -> None:
+        """Pause before starting the next remote model request when configured."""
+        self.pause_waiter = waiter

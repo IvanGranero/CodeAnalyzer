@@ -45,6 +45,13 @@ class ConsoleProgressSink:
         self.writer(f"[{event.phase}] {event.target} | {event.message}")
 
 
+class _SilentProgressSink:
+    """Discard console progress when a structured event sink owns presentation."""
+
+    def emit(self, event: ProgressEvent) -> None:
+        return None
+
+
 class ScanProgress:
     def __init__(
         self,
@@ -56,7 +63,7 @@ class ScanProgress:
         self.started = 0
         self.started_at = 0.0
         self._lock = asyncio.Lock()
-        self.sink = sink or ConsoleProgressSink()
+        self.sink = sink or (ConsoleProgressSink() if event_sink is None else _SilentProgressSink())
         self.event_sink = event_sink
 
     async def start(self, total: int) -> None:

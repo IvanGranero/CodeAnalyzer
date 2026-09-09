@@ -94,6 +94,8 @@ A failed connection is retried for the current vulnerability before the exploit 
 
 Run the orchestrator using the main `codeanalyzer.py` entrypoint. Point it at the root directory of your AutoSAR source code.
 
+Running `python codeanalyzer.py` without arguments prints the command help and exits. The current directory is used only when a scan option is supplied without an explicit source directory, such as `--tui`.
+
 ### Command-Line Options
 
 Display the built-in usage information at any time:
@@ -181,7 +183,7 @@ Use the optional Textual interface for live scan progress without terminal log o
 python codeanalyzer.py ./path/to/AutoSAR_Project/ --tui --limit 10
 ```
 
-The interface shows phase progress, target status, findings, and cancellation state. Press `c` to cancel the active scan or `q` to exit. The first TUI screen intentionally avoids stdin-based domain selection; use `--target-file`, `--scan-all`, or `--limit` to define the scan scope.
+The interface provides a live scan overview with stage, completed and remaining targets, active workers, errors, token/cost usage, and pause state. Findings are listed individually with severity, confidence, classification, file location, target function, exploitability, and review status. Select a finding to inspect its source snippet, byte spans, taint and call paths, CFG blocks, concurrency relationships, unresolved references, and agent rationale when available. Press `p` to pause or resume queued target work, or `q` to exit. Active target analyses finish before a pause takes effect. The first TUI screen intentionally avoids stdin-based domain selection; use `--target-file`, `--scan-all`, or `--limit` to define the scan scope.
 
 ## 🏗️ Architecture Pipeline
 

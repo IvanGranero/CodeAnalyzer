@@ -90,6 +90,8 @@ class ScanApplication:
         self._current_reports: dict[str, dict[str, Any]] = {}
         if hasattr(self.context.llm, "set_usage_listener"):
             self.context.llm.set_usage_listener(self._on_usage)
+        if hasattr(self.context.llm, "set_pause_waiter"):
+            self.context.llm.set_pause_waiter(self.session.wait_if_paused)
 
     async def run(self, request: ScanRequest) -> ScanResult:
         """Run either the normal pipeline or direct exploit validation."""
@@ -155,6 +157,7 @@ class ScanApplication:
             self.context.llm,
             cache_dir=self.report_dir,
             event_sink=self.event_sink,
+            graph_manager=self.context.graph,
         )
         self._active_exploit_phase = exploit_phase
         results = await exploit_phase.run_standalone(str(report_path))
@@ -223,12 +226,23 @@ class ScanApplication:
             for cached_name, report in cached_reports.items():
                 func_name = report.get("_target_function", cached_name)
                 all_reports[func_name] = report
+                self._emit(
+                    AppEvent(
+                        phase="resume",
+                        target=func_name,
+                        kind=EventKind.TARGET_FINISHED,
+                        status="complete",
+                        message="Loaded cached report",
+                        payload={"report": report},
+                    )
+                )
 
         exploit_phase = ExploitPhase(
             self.context.llm,
             self.cache_dir,
             skip=request.skip_exploit,
             event_sink=self.event_sink,
+            graph_manager=self.context.graph,
         )
         self._active_exploit_phase = exploit_phase
         scan_phase = ScanPhase(
@@ -264,7 +278,12 @@ class ScanApplication:
                     all_reports, selected_domain
                 ):
                     await exploit_phase.enqueue(report, func_name, domain)
-            await scan_phase.run(targets_to_scan, selected_domain, all_reports)
+            await scan_phase.run(
+                targets_to_scan,
+                selected_domain,
+                all_reports,
+                pause_waiter=self.session.wait_if_paused,
+            )
             await exploit_phase.drain()
 
         await asyncio.to_thread(
@@ -280,3 +299,11 @@ class ScanApplication:
         self.session.cancel()
         if self._active_exploit_phase is not None:
             self._active_exploit_phase.cancel()
+
+    def pause(self) -> None:
+        """Pause target scheduling after any active target work completes."""
+        self.session.pause()
+
+    def resume(self) -> None:
+        """Resume target scheduling for queued work."""
+        self.session.resume()

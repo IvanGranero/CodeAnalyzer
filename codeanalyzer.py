@@ -34,7 +34,11 @@ warnings.filterwarnings(
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+    args = parser.parse_args()
     try:
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

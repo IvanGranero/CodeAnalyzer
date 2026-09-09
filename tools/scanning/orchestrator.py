@@ -307,6 +307,9 @@ class ScanOrchestrator:
             context.metadata,
             directive,
             triage,
+            source_code=context.source_code,
+            graph_summary=context.graph_summary,
+            candidates=candidates,
         )
         return report
 
@@ -393,20 +396,25 @@ class ScanOrchestrator:
         metadata: Dict[str, Any],
         triage_directive: str,
         triage: Dict[str, Any],
+        source_code: str = "",
+        graph_summary: str = "",
+        candidates: list[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
-        """Build the durable, bounded handoff used by later exploit-only runs."""
-        supported_findings = [
+        """Build the durable handoff used by later exploit-only runs."""
+        candidates = candidates or []
+        findings = [
             {
                 key: finding.get(key)
                 for key in (
-                    "vulnerability_type", "severity", "confidence", "evidence",
+                    "vulnerability_type", "status", "vulnerability_found",
+                    "severity", "confidence", "evidence",
                     "details", "mitigation", "evidence_references",
-                    "graph_flag_agreement", "needs_human_review",
+                    "graph_flag_agreement", "needs_human_review", "decision",
                 )
                 if finding.get(key) is not None
             }
             for finding in report.get("findings", [])
-            if isinstance(finding, dict) and finding.get("status") == "supported"
+            if isinstance(finding, dict)
         ]
         did_details = metadata.get("DidDetails") or []
         uds_triggers = [
@@ -432,7 +440,7 @@ class ScanOrchestrator:
                 "is_vendor_library": metadata.get("IsVendorLibrary"),
                 "is_stub": metadata.get("IsStubNode"),
             },
-            "findings": supported_findings,
+            "findings": findings,
             "primary_finding": {
                 key: report.get(key)
                 for key in ("vulnerability_type", "severity", "confidence", "details", "mitigation")
@@ -444,14 +452,19 @@ class ScanOrchestrator:
                 "degraded": bool(report.get("triage_degraded")),
                 "graph_contradictions": report.get("graph_contradictions", []),
                 "reason": triage.get("reason") if isinstance(triage, dict) else None,
+                "candidates": candidates,
             },
             "evidence": {
                 "tainted_by_uds": bool(metadata.get("TaintedByUDS")),
-                "all_findings_count": len(report.get("findings", [])),
-                "supported_findings_count": len(supported_findings),
+                "all_findings_count": len(findings),
+                "supported_findings_count": sum(
+                    finding.get("status") == "supported" for finding in findings
+                ),
+                "source_code": source_code,
+                "graph_summary": graph_summary,
             },
             "limitations": [
-                "Exploit context contains persisted scan evidence only; no live graph lookup is performed.",
+                "Exploit context contains persisted scan evidence; live graph lookup is available only through read-only tools.",
                 "UDS request layout, session requirements, and type layout are unknown unless explicitly stated in findings.",
             ],
         }).model_dump(mode="json")

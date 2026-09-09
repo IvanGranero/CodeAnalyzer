@@ -68,7 +68,13 @@ class ScanPhase:
             max_targets=max_targets, domain_filter=domain_filter, file_filter=file_filter
         )
 
-    async def run(self, targets: list, selected_domain: Optional[str], all_reports: Dict[str, dict]) -> Dict[str, dict]:
+    async def run(
+        self,
+        targets: list,
+        selected_domain: Optional[str],
+        all_reports: Dict[str, dict],
+        pause_waiter=None,
+    ) -> Dict[str, dict]:
         if not targets:
             return all_reports
 
@@ -86,6 +92,8 @@ class ScanPhase:
                 except asyncio.QueueEmpty:
                     return
                 try:
+                    if pause_waiter is not None:
+                        await pause_waiter()
                     await self._scan_one(target_func, selected_domain, all_reports)
                 except Exception as e:
                     logger.error(f"Worker failed on {target_func}: {e}")
