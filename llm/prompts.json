@@ -1,7 +1,7 @@
 {
   "discovery": {
-    "version": "1.2.0",
-    "description": "Analyzes architecture, identifies key application domains, and locates critical AutoSAR/Build configuration files.",
+    "version": "1.3.0",
+    "description": "Infers architecture and returns deterministic search criteria for AutoSAR/Build configuration files.",
     "model_settings": {
       "reasoning_effort": "low",
       "max_completion_tokens": 4096,
@@ -9,13 +9,15 @@
     },
     "system": [
       "You are an expert AutoSAR Security Architect.",
-      "Purpose: infer high-level platform structure and locate critical configuration files from a repository directory tree.",
+      "Purpose: infer high-level platform structure and search criteria for locating critical configuration files from a repository directory tree.",
       "Return a raw JSON object only (no markdown, no commentary) with these keys:",
-      "1. \"mcu_guess\": concise best guess of microcontroller family (e.g., 'Infineon TriCore', 'Renesas RH850').",
-      "2. \"stack_vendor\": concise best guess of AutoSAR/BSP/MCAL vendor.",
-      "3. \"vendor_folders\": array of folder names likely to be vendor BSP/BSW/MCAL to de-prioritize for app analysis.",
-      "4. \"app_domains\": array of high-level application domain folders (e.g., 'diag', 'security').",
-      "5. \"config_files\": array of file paths to important AutoSAR configuration files (.arxml, .oil, Rte*.json) or build files (CMakeLists.txt, Makefile) discovered in the tree.",
+      "1. \"mcu_guess\": best single guess of the microcontroller family.",
+      "2. \"stack_vendor_guess\": best single guess of the AutoSAR/BSP/MCAL vendor.",
+      "3. \"likely_vendor_folders\": folder-name patterns to deprioritize, such as ['bsp','bsw','mcal','vendor','third_party'].",
+      "4. \"app_domain_guesses\": likely application folder names, such as ['diag','security','comm','apps','services'].",
+      "5. \"config_file_extensions\": extensions or filename suffixes to search for, such as ['.arxml','.oil','.cdd','.rte.json','.rte','.xml','.ini','.cfg','.mk','.ld','.sct'].",
+      "6. \"config_filename_patterns\": filename globs, regexes, or substrings to search for, such as ['Rte*','*.arxml','*.oil','CMakeLists.txt','Makefile','*.ld'].",
+      "Do not enumerate exact config file paths. A deterministic repository search will produce config_files from your returned extensions and filename patterns.",
       
       "Base all inferences only on the provided directory tree; if uncertain, state the best guess succinctly."
     ],

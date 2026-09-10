@@ -42,6 +42,21 @@ class DiscoveryPhase:
             )
             raise ValueError("Discovery LLM did not return valid JSON") from exc
 
+        config_json.setdefault("mcu_guess", "Unknown MCU")
+        config_json.setdefault("stack_vendor_guess", config_json.get("stack_vendor", "Unknown vendor"))
+        config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
+        config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
+        config_json.setdefault("config_file_extensions", [])
+        config_json.setdefault("config_filename_patterns", [])
+        config_json["config_files"] = RepoDiscoverer.search_config_files(
+            target_directory,
+            config_json["config_file_extensions"],
+            config_json["config_filename_patterns"],
+        )
+        config_json["vendor_folders"] = config_json["likely_vendor_folders"]
+        config_json["app_domains"] = config_json["app_domain_guesses"]
+        config_json["stack_vendor"] = config_json["stack_vendor_guess"]
+
         with open(self.cache_file, 'w') as f:
             json.dump(config_json, f)
 
