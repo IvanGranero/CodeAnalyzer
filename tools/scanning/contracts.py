@@ -184,6 +184,21 @@ class ExploitFinding(BaseModel):
     effort_estimate: Optional[str] = None
 
 
+class EvidenceBundle(BaseModel):
+    """Stable, single-source evidence handoff for deep scan and exploitation."""
+
+    schema_version: str = "1.0"
+    retrieval_pointer: Optional[str] = None
+    scan_metadata: Dict[str, Any] = Field(default_factory=dict)
+    graph_json: str = ""
+    graph_summary: str = ""
+    source_code: str = ""
+    variable_access: List[Dict[str, Any]] = Field(default_factory=list)
+    concurrency: Dict[str, Any] = Field(default_factory=dict)
+    deep_scan_findings: List[Dict[str, Any]] = Field(default_factory=list)
+    protocol_contract: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ExploitContext(BaseModel):
     """Versioned scan-to-exploit handoff persisted for resume and exploit-only."""
 
@@ -196,6 +211,7 @@ class ExploitContext(BaseModel):
     primary_finding: Dict[str, Any] = Field(default_factory=dict)
     triage: Dict[str, Any] = Field(default_factory=dict)
     evidence: Dict[str, Any] = Field(default_factory=dict)
+    evidence_bundle: Optional[EvidenceBundle] = None
     limitations: List[str] = Field(default_factory=list)
 
 

@@ -2,14 +2,14 @@ import json
 import logging
 import ast
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Any
 
-from llm.service import LLMService
 from tools.scanning.tools import AnalyzerTools
 from tools.graph.manager import GraphManager
 from tools.scanning.contracts import Candidate, ExploitContext, Finding, VulnerabilityClass
-from tools.scanning.agents import AgentRuntime, DeepScanAgent, TriageAgent, run_triage
-from tools.scanning.scheduler import CandidateScheduler, ScanBudget
+from llm.runtime import AgentRuntime
+from tools.scanning.agents import DeepScanAgent, TriageAgent, run_triage
+from tools.scanning.scheduler import CandidateScheduler
 from tools.scanning.tool_registry import ReadOnlyToolRegistry
 from tools.scanning.response_parser import extract_json_object
 from tools.scanning.reconciliation import reconcile_finding
@@ -23,7 +23,7 @@ class ScanContext:
     """Source and graph evidence collected for one target function."""
 
     target_function_name: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
     source_code: str
     graph_json: str
     graph_summary: str
@@ -32,20 +32,21 @@ class ScanContext:
 class ScanOrchestrator:
     _MAX_TRIAGE_ATTEMPTS = 3
 
-    def __init__(self, llm_service: LLMService, graph_manager: GraphManager, platform_info: str = "Unknown Platform", scan_budget: ScanBudget = None, max_candidates_per_target: int = 12):
-        self.llm = llm_service
+    def __init__(self, runtime: AgentRuntime, graph_manager: GraphManager, platform_info: str = "Unknown Platform"):
+        self.runtime = runtime
         self.graph_resolver = graph_manager.resolver
         self.tools_engine = AnalyzerTools(graph_manager)
         self.tool_registry = ReadOnlyToolRegistry(self.tools_engine)
         self.platform_info = platform_info
-        self.scan_budget = scan_budget or ScanBudget()
-        self.max_candidates_per_target = max(1, max_candidates_per_target)
-        self.candidate_scheduler = CandidateScheduler(self.scan_budget, self.max_candidates_per_target)
-        runtime = AgentRuntime(self.llm, self.scan_budget, self.tool_registry)
-        self.triage_agent = TriageAgent(runtime, self._extract_json_object)
-        self.deep_scan_agent = DeepScanAgent(runtime, self._extract_json_object)
+        self.candidate_scheduler = CandidateScheduler()
+        self.triage_agent = TriageAgent(self.runtime, self._extract_json_object)
+        self.deep_scan_agent = DeepScanAgent(self.runtime, self._extract_json_object)
+
+    def usage_snapshot(self):
+        """Return the centralized usage ledger, including phase totals."""
+        return self.runtime.tracker.snapshot()
         
-    def _extract_json_object(self, response_text: str) -> Dict[str, Any]:
+    def _extract_json_object(self, response_text: str) -> dict[str, Any]:
         return extract_json_object(response_text)
 
     def set_progress_callback(self, progress) -> None:
@@ -66,7 +67,7 @@ class ScanOrchestrator:
                 logger.warning("Ignoring malformed triage candidate: %r", value)
         return candidates
     
-    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> Dict[str, Any]:
+    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> dict[str, Any]:
         return await run_triage(
             self.triage_agent,
             graph_json,
@@ -79,10 +80,10 @@ class ScanOrchestrator:
         )
 
     _SEVERITY_RANK = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-    def _reconcile_single_finding(self, finding: Dict[str, Any], graph_json: str) -> Dict[str, Any]:
+    def _reconcile_single_finding(self, finding: dict[str, Any], graph_json: str) -> dict[str, Any]:
         return reconcile_finding(finding, graph_json)
 
-    async def _deep_scan_candidate(self, candidate: Dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> Dict[str, Any]:
+    async def _deep_scan_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> dict[str, Any]:
         """
         Single-tasked deep scan: proves/disproves exactly ONE Triage-decomposed
         candidate per call (prompt decomposition), at a reasoning_effort/token budget
@@ -114,7 +115,7 @@ class ScanOrchestrator:
                 needs_human_review=True,
             ).model_dump(mode="json")
 
-    async def _run_candidate(self, candidate: Dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str, target_func: str) -> Dict[str, Any]:
+    async def _run_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str, target_func: str) -> dict[str, Any]:
         """Run one focused deep scan using evidence collected by triage."""
         return await self._deep_scan_candidate(
             candidate, graph_json, graph_summary, source_code, directive, follow_up_context, target_func
@@ -162,7 +163,7 @@ class ScanOrchestrator:
     async def _run_triage_phase(
         self,
         context: ScanContext,
-    ) -> tuple[Dict[str, Any], str, list[Dict[str, Any]], bool]:
+    ) -> tuple[dict[str, Any], str, list[dict[str, Any]], bool]:
         """Run triage and normalize its directive, candidates, and coverage."""
         target = context.target_function_name
         await self._progress(target, "triage: exploring graph evidence")
@@ -207,9 +208,9 @@ class ScanOrchestrator:
     async def _run_deep_scans(
         self,
         context: ScanContext,
-        candidates: list[Dict[str, Any]],
+        candidates: list[dict[str, Any]],
         directive: str,
-    ) -> list[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Run one bounded deep scan for each validated triage candidate."""
         operations = [
             self._run_candidate(
@@ -229,21 +230,18 @@ class ScanOrchestrator:
         )
         scheduler = getattr(self, "candidate_scheduler", None)
         if scheduler is None:
-            scheduler = CandidateScheduler(
-                getattr(self, "scan_budget", ScanBudget()),
-                getattr(self, "max_candidates_per_target", 12),
-            )
+            scheduler = CandidateScheduler()
         return await scheduler.gather(operations)
 
     def _build_scan_report(
         self,
         context: ScanContext,
-        triage: Dict[str, Any],
+        triage: dict[str, Any],
         directive: str,
-        candidates: list[Dict[str, Any]],
-        results: list[Dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        results: list[dict[str, Any]],
         coverage_incomplete: bool,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Select the primary finding and build the persisted scan envelope."""
         triage_degraded = not directive or not candidates
         supported = [
@@ -264,7 +262,7 @@ class ScanOrchestrator:
         if supported:
             confidence_rank = {"low": 0, "medium": 1, "high": 2}
 
-            def finding_rank(finding: Dict[str, Any]) -> tuple[int, int, int]:
+            def finding_rank(finding: dict[str, Any]) -> tuple[int, int, int]:
                 evidence_score = 0 if finding.get("needs_human_review") else 1
                 return (
                     evidence_score,
@@ -310,10 +308,11 @@ class ScanOrchestrator:
             source_code=context.source_code,
             graph_summary=context.graph_summary,
             candidates=candidates,
+            graph_json=context.graph_json,
         )
         return report
 
-    async def scan_function(self, target_function_name: str) -> Dict[str, Any]:
+    async def scan_function(self, target_function_name: str) -> dict[str, Any]:
         """Run metadata, triage, deep-scan, and report phases for one target."""
         logger.info("=== Starting Scan for '%s' ===", target_function_name)
         try:
@@ -334,7 +333,7 @@ class ScanOrchestrator:
                 "vulnerability_found": False,
                 "severity": "Informational",
                 "details": f"Triage dismissed. Reason: {triage.get('reason')}",
-                "confidence": triage.get("confidence", 0.9),
+                "confidence": str(triage.get("confidence", 0.9)),
                 "metadata": context.metadata,
             }
 
@@ -392,14 +391,15 @@ class ScanOrchestrator:
     @staticmethod
     def _build_exploit_context(
         target_function_name: str,
-        report: Dict[str, Any],
-        metadata: Dict[str, Any],
+        report: dict[str, Any],
+        metadata: dict[str, Any],
         triage_directive: str,
-        triage: Dict[str, Any],
+        triage: dict[str, Any],
         source_code: str = "",
         graph_summary: str = "",
-        candidates: list[Dict[str, Any]] | None = None,
-    ) -> Dict[str, Any]:
+        candidates: list[dict[str, Any]] | None = None,
+        graph_json: str = "",
+    ) -> dict[str, Any]:
         """Build the durable handoff used by later exploit-only runs."""
         candidates = candidates or []
         findings = [
@@ -429,6 +429,23 @@ class ScanOrchestrator:
         if not uds_triggers:
             uds_triggers = [{"did": did} for did in metadata.get("DIDs", []) if isinstance(did, str)]
 
+        try:
+            graph_payload = json.loads(graph_json) if graph_json else {}
+        except json.JSONDecodeError:
+            graph_payload = {}
+        evidence_bundle = {
+            "schema_version": "1.0",
+            "retrieval_pointer": (graph_payload.get("provenance") or {}).get("retrieval_pointer"),
+            "scan_metadata": metadata,
+            "graph_json": graph_json,
+            "graph_summary": graph_summary,
+            "source_code": source_code,
+            "variable_access": graph_payload.get("variable_access", []),
+            "concurrency": graph_payload.get("concurrency", {}),
+            "deep_scan_findings": findings,
+                    "protocol_contract": graph_payload.get("protocol_contract", {}),
+        }
+
         return ExploitContext.model_validate({
             "schema_version": "1.0",
             "target_function": target_function_name,
@@ -455,14 +472,18 @@ class ScanOrchestrator:
                 "candidates": candidates,
             },
             "evidence": {
+                                "protocol_contract": graph_payload.get("protocol_contract", {}),
                 "tainted_by_uds": bool(metadata.get("TaintedByUDS")),
                 "all_findings_count": len(findings),
                 "supported_findings_count": sum(
                     finding.get("status") == "supported" for finding in findings
                 ),
+                "scan_metadata": metadata,
+                "graph_json": graph_json,
                 "source_code": source_code,
                 "graph_summary": graph_summary,
             },
+            "evidence_bundle": evidence_bundle,
             "limitations": [
                 "Exploit context contains persisted scan evidence; live graph lookup is available only through read-only tools.",
                 "UDS request layout, session requirements, and type layout are unknown unless explicitly stated in findings.",

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, TypeVar
 import openai
 from openai import AsyncOpenAI, APIConnectionError
+from llm.runtime import CallBinder, InvocationLog, MessageRouter, RetryController, ToolInvoker
 
 logger = logging.getLogger(__name__)
 ResponseT = TypeVar("ResponseT")
@@ -49,12 +50,12 @@ class LLMClient:
                     api_key=key,
                     default_headers=headers,
                     default_query=query_params if query_params else None,
-                    timeout=120.0
+                    timeout=300.0
                 )
             )
             
         self._current_index = 0
-        logger.info(f"Initialized LLMClient with {len(self.clients)} keys.")
+        logger.info(f"Initialized {self.model_name} LLMClient with {len(self.clients)} keys.")
 
     @staticmethod
     def _parse_pairs(value: str) -> dict[str, str]:
@@ -69,6 +70,8 @@ class LLMClient:
         response_content: str,
         endpoint_used: str,
         context_id: str | None = None,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        audit_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         """Saves the exact API payload and response to disk for debugging/auditing."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -86,6 +89,16 @@ class LLMClient:
             f"=== RAW OUTPUT (LLM RESPONSE) ===\n"
             f"{response_content}\n\n\n"
         )
+        if audit_metadata:
+            log_content += (
+                "=== INVOCATION METADATA ===\n"
+                f"{json.dumps(dict(audit_metadata), indent=2, ensure_ascii=False)}\n\n\n"
+            )
+        if tool_calls:
+            log_content += (
+                "=== TOOL CALLS (RUNTIME) ===\n"
+                f"{json.dumps(list(tool_calls), indent=2, ensure_ascii=False)}\n\n\n"
+            )
         try:
             with open(filename, "a", encoding="utf-8") as f:
                 f.write(log_content)
@@ -100,6 +113,7 @@ class LLMClient:
         context_id: str | None = None,
         tools: Sequence[ToolDefinition] | None = None,
         tool_handler: ToolHandler | None = None,
+        audit_metadata: Mapping[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Generate a response using the configured endpoint and tool handler."""
         model_settings = model_settings or {}
@@ -108,7 +122,10 @@ class LLMClient:
         self._current_index = (self._current_index + 1) % len(self.clients)
         
         if self._use_legacy_endpoint:
-            return await self._execute_legacy_chat(client, system_prompt, user_prompt, model_settings, context_id, tools, tool_handler)
+            return await self._execute_legacy_chat(
+                client, system_prompt, user_prompt, model_settings,
+                context_id, tools, tool_handler, audit_metadata=audit_metadata,
+            )
 
         kwargs_responses = {
             "model": self.model_name,
@@ -134,7 +151,7 @@ class LLMClient:
             kwargs_responses["text"] = {"format": {"type": "json_object"}}
 
         try:
-            response = await self._retry_request(
+            response, tool_calls = await self._retry_request(
                 lambda: self._request_responses(client, kwargs_responses, tool_handler),
                 endpoint="/responses",
             )
@@ -143,12 +160,15 @@ class LLMClient:
             self._use_legacy_endpoint = True
             return await self._execute_legacy_chat(
                 client, system_prompt, user_prompt, model_settings,
-                context_id, tools, tool_handler,
+                context_id, tools, tool_handler, audit_metadata=audit_metadata,
             )
 
         final_text = self._response_text(response, "Frontier")
         usage_dict = self._usage_dict(response)
-        self._audit_log(kwargs_responses, final_text, "/responses", context_id)
+        self._audit_log(
+            kwargs_responses, final_text, "/responses", context_id, tool_calls,
+            audit_metadata,
+        )
         return final_text, usage_dict
 
     async def _retry_request(
@@ -159,41 +179,26 @@ class LLMClient:
         max_retries: int = 3,
     ) -> ResponseT:
         """Retry transient provider failures using exponential backoff."""
-        for attempt in range(max_retries):
-            try:
-                return await operation()
-            except openai.NotFoundError:
-                raise
-            except APIConnectionError as exc:
-                retryable = True
-                message = f"connection failed: {exc}"
-            except openai.RateLimitError as exc:
-                retryable = True
-                message = f"rate limited: {exc}"
-            except openai.APIStatusError as exc:
-                retryable = exc.status_code in (500, 502, 503, 504)
-                message = f"HTTP {exc.status_code}: {exc}"
-            except Exception as exc:
-                message_text = str(exc).lower()
-                retryable = any(
-                    marker in message_text
-                    for marker in ("getaddrinfo failed", "connection", "timeout")
-                )
-                if not retryable:
-                    logger.exception("[LLM] %s failed on model %s", endpoint, self.model_name)
-                    raise
-                message = f"network failure: {exc}"
+        controller = RetryController(self._is_retryable, max_attempts=max_retries)
 
-            if attempt == max_retries - 1 or not retryable:
-                raise
-            delay = 2.0 * (2 ** attempt)
+        def on_retry(attempt: int, exc: Exception, delay: float) -> None:
             logger.warning(
                 "[LLM] %s %s (attempt %d/%d); retrying in %.1fs",
-                endpoint, message, attempt + 1, max_retries, delay,
+                endpoint, exc, attempt, max_retries, delay,
             )
-            await asyncio.sleep(delay)
 
-        raise AssertionError("retry loop completed without returning or raising")
+        return await controller.run(operation, on_retry=on_retry)
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, openai.NotFoundError):
+            return False
+        if isinstance(exc, (APIConnectionError, openai.RateLimitError)):
+            return True
+        if isinstance(exc, openai.APIStatusError):
+            return exc.status_code in (500, 502, 503, 504)
+        message = str(exc).lower()
+        return any(marker in message for marker in ("getaddrinfo failed", "connection", "timeout"))
 
     async def _request_responses(
         self,
@@ -201,34 +206,31 @@ class LLMClient:
         request_kwargs: dict[str, Any],
         tool_handler: ToolHandler | None,
     ) -> Any:
-        response_input = request_kwargs["input"]
+        router = MessageRouter(list(request_kwargs["input"]))
+        binder = CallBinder(request_kwargs.get("tools", []))
+        invoker = ToolInvoker(tool_handler) if tool_handler else None
+        invocation_log = InvocationLog()
         for _ in range(4):
             response = await client.responses.create(
-                **{**request_kwargs, "input": response_input}
+                **{**request_kwargs, "input": router.messages}
             )
             function_calls = [
                 item for item in response.output
                 if getattr(item, "type", None) == "function_call"
             ]
-            if not function_calls or not tool_handler:
-                return response
-            tool_outputs = [
-                {
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": self._call_tool(tool_handler, call.name, call.arguments),
-                }
-                for call in function_calls
-            ]
-            response_input = response_input + list(response.output) + tool_outputs
+            if not function_calls:
+                return response, invocation_log.records
+            if invoker is None:
+                raise RuntimeError("model returned tool calls but no tool handler is configured")
+            router.append_assistant(response.output)
+            tool_outputs = []
+            for call in function_calls:
+                bound = binder.bind(call.call_id, call.name, call.arguments)
+                output = invoker.invoke(bound)
+                invocation_log.record(call_id=bound.call_id, name=bound.name, output_length=len(output))
+                tool_outputs.append(binder.result(bound, output))
+            router.append_tool_results(tool_outputs)
         raise RuntimeError("Model exceeded the maximum tool-call rounds")
-
-    @staticmethod
-    def _call_tool(tool_handler: ToolHandler, name: str, arguments: str | None) -> str:
-        try:
-            return tool_handler(name, json.loads(arguments or "{}"))
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
 
     @staticmethod
     def _usage_dict(response: Any) -> dict[str, Any]:
@@ -253,6 +255,8 @@ class LLMClient:
         context_id: str | None = None,
         tools: Sequence[ToolDefinition] | None = None,
         tool_handler: ToolHandler | None = None,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        audit_metadata: Mapping[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         kwargs_chat = {
             "model": self.model_name,
@@ -280,14 +284,17 @@ class LLMClient:
                 for tool in tools
             ]
             
-        response = await self._retry_request(
+        response, tool_calls = await self._retry_request(
             lambda: self._request_legacy_chat(client, kwargs_chat, tool_handler),
             endpoint="/chat/completions",
         )
         final_text = response.choices[0].message.content
         if final_text is None:
             raise RuntimeError("Legacy model returned no assistant message.")
-        self._audit_log(kwargs_chat, final_text, "/chat/completions", context_id)
+        self._audit_log(
+            kwargs_chat, final_text, "/chat/completions", context_id, tool_calls,
+            audit_metadata,
+        )
         return final_text, self._usage_dict(response)
 
     async def _request_legacy_chat(
@@ -296,24 +303,34 @@ class LLMClient:
         request_kwargs: dict[str, Any],
         tool_handler: ToolHandler | None,
     ) -> Any:
-        messages = list(request_kwargs["messages"])
+        router = MessageRouter(list(request_kwargs["messages"]))
+        binder = CallBinder(request_kwargs.get("tools", []))
+        invoker = ToolInvoker(tool_handler) if tool_handler else None
+        invocation_log = InvocationLog()
         for _ in range(4):
             response = await client.chat.completions.create(
-                **{**request_kwargs, "messages": messages}
+                **{**request_kwargs, "messages": router.messages}
             )
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
-            if not tool_calls or not tool_handler:
-                return response
-            messages.append(message)
+            if not tool_calls:
+                return response, invocation_log.records
+            if invoker is None:
+                raise RuntimeError("model returned tool calls but no tool handler is configured")
+            router.append_assistant([message])
+            tool_results = []
             for tool_call in tool_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": self._call_tool(
-                        tool_handler,
-                        tool_call.function.name,
-                        tool_call.function.arguments,
-                    ),
-                })
+                bound = binder.bind(
+                    tool_call.id,
+                    tool_call.function.name,
+                    tool_call.function.arguments,
+                )
+                output = invoker.invoke(bound)
+                invocation_log.record(
+                    call_id=bound.call_id,
+                    name=bound.name,
+                    output_length=len(output),
+                )
+                tool_results.append(binder.legacy_result(bound, output))
+            router.append_tool_results(tool_results)
         raise RuntimeError("Model exceeded the maximum tool-call rounds")

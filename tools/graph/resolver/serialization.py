@@ -42,8 +42,16 @@ class SerializationMixin:
         // 3. Gather Upstream Context
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
         WITH f, task, locks_held, types, macros, collect(DISTINCT {id: elementId(caller), type: labels(caller)[0], name: caller.name}) AS callers
-        OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
-        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + uds.did), did: uds.did, source: coalesce(uds.source, 'heuristic'), func_class_hex: uds.func_class_hex}) AS uds_triggers
+        OPTIONAL MATCH (f)-[uds_edge:HANDLES_UDS]->(uds:UdsService)
+        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {
+            id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + coalesce(uds.did, uds.rid)),
+            did: uds.did, rid: uds.rid, operation: coalesce(uds.operation, uds_edge.operation),
+            kind: coalesce(uds.protocol_kind, uds_edge.kind, CASE WHEN uds.rid IS NOT NULL THEN 'rid' ELSE 'did' END),
+            subfunction: uds.protocol_subfunction,
+            protocol_contract_json: uds.protocol_contract_json,
+            source: coalesce(uds.source, uds.protocol_source, 'heuristic'),
+            func_class_hex: uds.func_class_hex
+        }) AS uds_triggers
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
         WITH f, task, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
 
@@ -152,14 +160,35 @@ class SerializationMixin:
                     })
 
             for uds in payload.get("upstream", {}).get("uds_triggers", []) or []:
+                contract = uds.get("protocol_contract") or {}
+                if not contract and uds.get("protocol_contract_json"):
+                    try:
+                        contract = json.loads(uds["protocol_contract_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        contract = {}
+                uds["protocol_contract"] = contract
                 uds_name = uds.get("name") or f"UDS_{uds.get('did', 'unknown')}"
-                nodes.append(node_record(uds_name, uds.get("type", "UdsService"), uds.get("id"), did=uds.get("did"), source_kind="uds"))
+                nodes.append(node_record(
+                    uds_name,
+                    uds.get("type", "UdsService"),
+                    uds.get("id"),
+                    did=uds.get("did"),
+                    rid=uds.get("rid"),
+                    protocol_kind=uds.get("kind"),
+                    protocol_contract=uds.get("protocol_contract", {}),
+                    source_kind="uds",
+                ))
                 edges.append({
                     "id": f"edge:{uds_name}->{func_name}",
                     "type": "HANDLES_UDS",
                     "from": uds.get("id"),
                     "to": target.get("id"),
-                    "properties": {"did": uds.get("did")}
+                    "properties": {
+                        "did": uds.get("did"),
+                        "rid": uds.get("rid"),
+                        "kind": uds.get("kind"),
+                        "subfunction": uds.get("subfunction"),
+                    }
                 })
 
             for net in payload.get("upstream", {}).get("network_triggers", []) or []:
@@ -232,14 +261,15 @@ class SerializationMixin:
                     })
 
             source_names = [
-                item.get("name") or item.get("did")
+                str(item.get("name") or item.get("did"))
                 for item in (payload.get("upstream", {}).get("uds_triggers", []) or [])
+                if item.get("name") or item.get("did")
             ] + [
-                item.get("name")
+                str(item.get("name"))
                 for item in (payload.get("upstream", {}).get("network_triggers", []) or [])
                 if item.get("name")
             ] + [
-                item.get("name")
+                str(item.get("name"))
                 for item in (payload.get("upstream", {}).get("standard_callers", []) or [])
                 if item.get("name")
             ]
@@ -325,6 +355,11 @@ class SerializationMixin:
                 "confidence": provenance["confidence"],
             }
 
+            payload["protocol_contract"] = self._build_protocol_contract(
+                func_name,
+                payload.get("sources", {}).get("uds", []),
+            )
+
             if verbosity == "full":
                 payload["graph"]["all_paths"] = top_paths
                 payload["graph"]["node_types"] = sorted({node["type"] for node in nodes})
@@ -343,13 +378,15 @@ class SerializationMixin:
                 f"- sources: {', '.join(source_names) if source_names else 'none'}",
                 f"- sinks: {', '.join(sink_names) if sink_names else 'none'}",
                 f"- sanitizers: {', '.join(item.get('name', '') for item in (payload.get('sanitizers', []) or []) if item.get('name')) or 'none'}",
-                f"- dependencies: {', '.join(payload.get('dependencies', {}).get('types', [])) or 'none'}",
+                f"- dependencies: {', '.join(str(item) for item in (payload.get('dependencies', {}).get('types', []) or []) if item is not None) or 'none'}",
                 f"- top_paths: {', '.join(item['path'] for item in top_paths) if top_paths else 'none'}",
                 f"- confidence: {provenance['confidence']}",
                 f"- retrieval_pointer: {provenance['retrieval_pointer']}",
+                f"- protocol_contract: {payload['protocol_contract']['status']}",
             ]
 
             return json_data, "\n".join(summary_lines)
+
         except Exception as e:
             logger.warning(f"Failed to serialize graph neighborhood for {func_name}: {e}")
             fallback = {
@@ -383,6 +420,67 @@ class SerializationMixin:
                 "confidence": "low",
             }
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
+
+    @staticmethod
+    def _build_protocol_contract(func_name: str, uds_sources: list[dict]) -> dict:
+        """Derive safe protocol facts and make unknown wire facts explicit."""
+        contracts = []
+        for source in uds_sources:
+            persisted = source.get("protocol_contract") or {}
+            identifier = str(
+                persisted.get("identifier")
+                or source.get("did")
+                or source.get("rid")
+                or ""
+            ).upper().replace("0X", "")
+            if not identifier:
+                continue
+            is_routine = persisted.get("kind") == "rid" or source.get("kind") == "rid" or "RID" in str(source.get("name", ""))
+            operation = str(persisted.get("operation") or source.get("operation") or "").lower()
+            if is_routine:
+                subfunction = persisted.get("subfunction") or next(
+                    (value for marker, value in (("_Start", "0x01"), ("_Stop", "0x02"), ("_RequestResults", "0x03")) if marker.lower() in func_name.lower()),
+                    None,
+                )
+                missing = list(persisted.get("missing_facts") or ["control_option_record layout", "request length"])
+                if subfunction is None:
+                    if "routine subfunction" not in missing:
+                        missing.append("routine subfunction")
+                contracts.append({
+                    "kind": "routine",
+                    "service_name": persisted.get("service_name"),
+                    "identifier": f"0x{identifier[-4:]}", "subfunction": subfunction,
+                    "operation": operation or None, "minimum_length": persisted.get("minimum_length"),
+                    "request_layout": persisted.get("request_layout"), "request_length": persisted.get("request_length"),
+                    "missing_facts": sorted(set(missing)), "confidence": persisted.get("confidence", "partial"),
+                    "source": persisted.get("source") or source.get("source", "unknown"),
+                })
+            else:
+                missing = list(persisted.get("missing_facts") or [])
+                contracts.append({
+                    "kind": persisted.get("kind", "did"),
+                    "service_name": persisted.get("service_name"),
+                    "identifier": f"0x{identifier[-4:]}", "operation": operation or None,
+                    "data_length": persisted.get("data_length"), "minimum_length": persisted.get("minimum_length"),
+                    "request_layout": persisted.get("request_layout"), "request_length": persisted.get("request_length"),
+                    "missing_facts": sorted(set(missing)),
+                    "confidence": persisted.get("confidence", "partial"),
+                    "source": persisted.get("source") or source.get("source", "unknown"),
+                })
+        missing_facts = sorted({fact for item in contracts for fact in item.get("missing_facts", [])})
+        return {
+            "status": "available" if contracts and not missing_facts else "partial",
+            "target_function": func_name,
+            "contracts": contracts,
+            "missing_facts": missing_facts,
+            "session_requirements": {"status": "unknown", "values": [], "missing_fact": "required diagnostic session"},
+            "security_requirements": {"status": "unknown", "values": [], "missing_fact": "required security level"},
+            "response_oracle": {
+                "positive_response": "service byte + 0x40",
+                "negative_response": "0x7F service byte nrc",
+                "confirmation": "Use deterministic response, health, and state evidence; a positive response alone is insufficient.",
+            },
+        }
 
     def get_verified_taint_paths(self, func_name: str, max_hops: int = 8) -> list:
         return get_verified_taint_paths(self.db, func_name, max_hops)

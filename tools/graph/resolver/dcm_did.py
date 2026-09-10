@@ -38,8 +38,16 @@ class DcmDidMixin:
             LIMIT 1
         }
         MERGE (u:UdsService {did: entry.did_hex})
-        ON CREATE SET u:GraphNode, u.name = "UDS_" + entry.did_hex
-        MERGE (f)-[:HANDLES_UDS]->(u)
+        ON CREATE SET u:GraphNode, u.name = "DID_" + entry.did_hex
+        SET u.protocol_contract_json = entry.protocol_contract_json,
+            u.protocol_kind = entry.protocol_kind,
+            u.protocol_identifier = entry.protocol_identifier,
+            u.protocol_source = "dispatch_table",
+            u.protocol_confidence = entry.protocol_confidence,
+            u.protocol_missing_facts = entry.protocol_missing_facts,
+            u.source = "dispatch_table"
+        MERGE (f)-[handles:HANDLES_UDS]->(u)
+        SET handles.kind = "did", handles.source = "dispatch_table"
         SET u.source = "dcm_did_table", u.func_class_hex = entry.func_class_hex
         RETURN count(f) AS linked
         """

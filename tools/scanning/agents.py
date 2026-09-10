@@ -1,7 +1,7 @@
 """LLM-facing triage and deep-scan agents.
 
 These classes own prompt invocation and response validation. Workflow decisions,
-follow-up budgets, evidence retrieval, and finding aggregation remain in the
+follow-up decisions, evidence retrieval, and finding aggregation remain in the
 orchestrator.
 """
 
@@ -10,53 +10,10 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from llm.runtime import AgentRuntime
 from tools.scanning.contracts import Finding, TriageResponse, parse_object
-from tools.scanning.scheduler import ScanBudget
 
 logger = logging.getLogger(__name__)
-
-
-class AgentRuntime:
-    """Shared LLM execution boundary for scan agents."""
-
-    def __init__(self, llm: Any, scan_budget: ScanBudget, tool_registry: Any) -> None:
-        self.llm = llm
-        self.scan_budget = scan_budget
-        self.tool_registry = tool_registry
-
-    async def execute(
-        self,
-        task_name: str,
-        kwargs: Mapping[str, Any],
-        context_id: str,
-        settings_override: Mapping[str, Any] | None = None,
-    ) -> str:
-        estimated_tokens = (settings_override or {}).get("max_completion_tokens", 4096)
-
-        async def operation():
-            enable_tools = task_name == "triage_agent"
-            return await self.llm.execute_task(
-                task_name=task_name,
-                context_id=context_id,
-                kwargs=kwargs,
-                settings_override=settings_override,
-                usage_callback=lambda usage, cost: self.scan_budget.record_actual_usage(
-                    sum(
-                        usage.get(key, 0) or 0
-                        for key in (
-                            "input_tokens",
-                            "prompt_tokens",
-                            "output_tokens",
-                            "completion_tokens",
-                        )
-                    ),
-                    cost,
-                ),
-                tools=self.tool_registry.definitions() if enable_tools else None,
-                tool_handler=self.tool_registry.call if enable_tools else None,
-            )
-
-        return await self.scan_budget.run(operation, estimated_tokens=estimated_tokens)
 
 
 class ScanAgent:
@@ -91,6 +48,11 @@ class TriageAgent(ScanAgent):
                 "directive": directive,
                 "follow_up_context": follow_up_context,
             },
+            settings_override=(
+                {"reasoning_effort": "medium", "max_completion_tokens": 6000}
+                if follow_up_context.strip()
+                else None
+            ),
         )
         return parse_object(self._extract_json(response_text), TriageResponse).model_dump(mode="json")
 
@@ -192,6 +154,7 @@ class DeepScanAgent(ScanAgent):
                 "source_code": source_code,
                 "directive": directive,
                 "candidate": json.dumps(candidate, ensure_ascii=False),
+                "target_function": target_func,
                 "follow_up_context": follow_up_context,
             },
             settings_override=settings,

@@ -14,7 +14,7 @@ An enterprise-grade, asynchronous SAST (Static Application Security Testing) pla
 
 * **Decomposed, Adaptive Deep-Scan:** The Triage agent breaks each function's threat model into discrete, independently-checkable vulnerability candidates (not a single batched checklist) and estimates how much reasoning each one needs. The orchestrator then runs one single-tasked Deep-Scan call per candidate, concurrently, at a reasoning-effort/token budget scaled to that candidate's own difficulty — so a quick mechanical check no longer pays for the same budget as a candidate requiring multi-hop taint or concurrency reasoning. Every candidate's verdict is cross-checked against the graph's own ground truth (`has_data_race_risk`, `is_dead_code`, UDS-trigger provenance) before the report is finalized, flagging any model/graph disagreement for human review instead of trusting it silently.
 
-* **Budgeted Tiered Reasoning:** Cheap models handle discovery, triage, and low-effort candidates; strong models handle high-effort deep scans. A shared scheduler limits concurrent calls, candidate fan-out, estimated tokens, and optional cost. Set `scan_max_*` values in `.env` to enforce repository-level limits.
+* **Tiered Reasoning and Usage Reporting:** Cheap models handle discovery, triage, and low-effort candidates; strong models handle high-effort deep scans. A centralized tracker reports input, output, cached, and reasoning tokens, costs, and totals for triage, scan, and exploitation.
 
 * **Typed Evidence Contracts:** Triage candidates, follow-up artifacts, coverage states, and findings are validated at the LLM boundary. Unsupported evidence is reported as unavailable instead of being represented by placeholder text, and inferred graph paths are labeled with their provenance.
 
@@ -73,9 +73,6 @@ Ensure your `.env` or `config.py` file is populated with your specific database 
 
 Optional scan controls:
 
-* `scan_max_concurrent_llm_calls` defaults to `5`.
-* `scan_max_calls`, `scan_max_tokens`, and `scan_max_cost_usd` default to unlimited (`0`).
-* `scan_max_candidates_per_target` defaults to `12`.
 
 The application reports missing or invalid settings before starting the scanner. If `.env` is missing, create it in the project directory. Use `python codeanalyzer.py --help` to view command-line usage without configuring the environment first.
 

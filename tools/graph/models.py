@@ -1,3 +1,5 @@
+import json
+
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Dict, Any, Optional
 from enum import Enum
@@ -52,6 +54,25 @@ class IngestBatch(BaseModel):
     edges: List[GraphEdge]
 
     def to_neo4j_dicts(self) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        nodes_dict = [n.model_dump(mode='json') for n in self.nodes]
-        edges_dict = [e.model_dump(mode='json') for e in self.edges]
+        nodes_dict = [self._neo4j_record(n.model_dump(mode='json')) for n in self.nodes]
+        edges_dict = [self._neo4j_record(e.model_dump(mode='json')) for e in self.edges]
         return nodes_dict, edges_dict
+
+    @staticmethod
+    def _neo4j_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten nested Python maps at the Neo4j property boundary.
+
+        The in-memory graph remains richly modeled for late binding. Neo4j node and
+        relationship properties, however, accept only primitives or primitive arrays.
+        Nested evidence maps are therefore retained as compact JSON strings.
+        """
+        result = dict(record)
+        properties = result.get("properties")
+        if isinstance(properties, dict):
+            result["properties"] = {
+                key: json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+                if isinstance(value, dict)
+                else value
+                for key, value in properties.items()
+            }
+        return result

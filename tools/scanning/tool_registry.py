@@ -14,6 +14,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "type": "function",
+        "name": "get_uds_contract",
+        "description": "Get the deterministic UDS/DID/RID protocol contract and explicit missing facts for a function.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]},
+    },
+    {
+        "type": "function",
         "name": "get_callers_and_entry_points",
         "description": "Get callers, UDS triggers, network triggers, and hardware-entry status.",
         "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]},
@@ -76,11 +82,14 @@ TOOL_DEFINITIONS = [
 
 
 class ReadOnlyToolRegistry:
-    def __init__(self, analyzer_tools):
+    def __init__(self, analyzer_tools, allowed_tools=None, audit_callback=None):
         self.tools = analyzer_tools
         self.activity_callback = None
+        self.audit_callback = audit_callback
+        self.allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
         self.handlers = {
             "get_function_metadata": lambda function_name: self.tools.get_function_metadata(function_name),
+            "get_uds_contract": lambda function_name: self.tools.get_uds_contract(function_name),
             "get_callers_and_entry_points": lambda function_name: self.tools.get_callers_and_entry_points(function_name),
             "get_callees": lambda function_name: self.tools.get_callees(function_name),
             "get_variable_access": lambda function_name: self.tools.get_variable_access(function_name),
@@ -94,12 +103,25 @@ class ReadOnlyToolRegistry:
         }
 
     def definitions(self):
-        return TOOL_DEFINITIONS
+        if self.allowed_tools is None:
+            return TOOL_DEFINITIONS
+        return [definition for definition in TOOL_DEFINITIONS if definition["name"] in self.allowed_tools]
+
+    def scoped(self, allowed_tools, audit_callback=None):
+        scoped_registry = ReadOnlyToolRegistry(
+            self.tools,
+            allowed_tools=allowed_tools,
+            audit_callback=audit_callback,
+        )
+        scoped_registry.activity_callback = self.activity_callback
+        return scoped_registry
 
     def set_activity_callback(self, callback) -> None:
         self.activity_callback = callback
 
     def call(self, name: str, arguments: dict) -> str:
+        if self.allowed_tools is not None and name not in self.allowed_tools:
+            return json.dumps({"error": f"Tool '{name}' is not allowed for this agent."})
         if self.activity_callback is not None:
             callback = getattr(self.activity_callback, "tool", None)
             if callback is not None:
@@ -114,9 +136,16 @@ class ReadOnlyToolRegistry:
             result = handler(**arguments)
             if isinstance(result, str):
                 try:
-                    return json.dumps(ast.literal_eval(result), ensure_ascii=False)
+                    output = json.dumps(ast.literal_eval(result), ensure_ascii=False)
                 except (ValueError, SyntaxError):
-                    return result
-            return json.dumps(result, ensure_ascii=False)
+                    output = result
+            else:
+                output = json.dumps(result, ensure_ascii=False)
+            if self.audit_callback is not None:
+                self.audit_callback(name, arguments, output)
+            return output
         except Exception as exc:
-            return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
+            output = json.dumps({"error": f"Tool '{name}' failed: {exc}"})
+            if self.audit_callback is not None:
+                self.audit_callback(name, arguments, output)
+            return output

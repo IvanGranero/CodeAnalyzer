@@ -3,30 +3,32 @@ from dataclasses import dataclass
 
 from llm.service import LLMService
 from llm.router import TieredLLMService
+from llm.runtime import AgentRuntime
 from tools.graph.manager import GraphManager
 from tools.graph.resolver import GraphResolver
-from tools.scanning.scheduler import ScanBudget
+from config import settings
+from llm.tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class AppContext:
     llm: TieredLLMService
+    runtime: AgentRuntime
     graph: GraphManager
-    scan_budget: ScanBudget
 
 
-def build_app_context(settings) -> AppContext:
+def build_app_context() -> AppContext:
     """Bootstraps the LLM service and graph manager from validated Settings."""
+    tracker = TokenTracker()
     cheap_llm = LLMService(
         api_key=settings.cheap_subscription_key,
         model_name=settings.cheap_model_id,
         base_url=settings.cheap_base_url,
         default_headers=settings.cheap_default_headers,
         extra_query=settings.cheap_extra_query,
-        usd_per_1m_input=settings.cheap_usd_input,
-        usd_per_1m_output=settings.cheap_usd_output,
+        pricing=settings.cheap_token_pricing,
+        tracker=tracker,
     )
     strong_llm = LLMService(
         api_key=settings.strong_subscription_key,
@@ -34,8 +36,8 @@ def build_app_context(settings) -> AppContext:
         base_url=settings.strong_base_url,
         default_headers=settings.strong_default_headers,
         extra_query=settings.strong_extra_query,
-        usd_per_1m_input=settings.strong_usd_input,
-        usd_per_1m_output=settings.strong_usd_output,
+        pricing=settings.strong_token_pricing,
+        tracker=tracker,
     )
     graph = GraphManager(
         uri=settings.neo4j_uri,
@@ -43,13 +45,8 @@ def build_app_context(settings) -> AppContext:
         password=settings.neo4j_password,
     )
     graph.resolver = GraphResolver(graph.db)
-    budget = ScanBudget(
-        max_concurrent=settings.scan_max_concurrent_llm_calls,
-        max_calls=settings.scan_max_calls,
-        max_tokens=settings.scan_max_tokens,
-        max_cost_usd=settings.scan_max_cost_usd,
-    )
-    return AppContext(llm=TieredLLMService(cheap_llm, strong_llm), graph=graph, scan_budget=budget)
+    llm = TieredLLMService(cheap_llm, strong_llm)
+    return AppContext(llm=llm, runtime=AgentRuntime(llm), graph=graph)
 
 
 def shutdown(app_context: AppContext) -> None:

@@ -700,13 +700,12 @@ class ScanTUI(App[None]):
 
 def run_tui(args) -> None:
     """Build core services, run Textual, and release shared resources."""
-    from config import settings
 
     source_directory = Path(args.source_dir).resolve()
     if not source_directory.is_dir():
         raise NotADirectoryError(str(source_directory))
 
-    context = build_app_context(settings)
+    context = build_app_context()
     request = ScanRequest(
         source_directory=source_directory,
         limit=args.limit,

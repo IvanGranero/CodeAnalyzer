@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -74,7 +75,6 @@ class ScanApplication:
         output: Callable[[str], None] | None = print,
         domain_selector: DomainSelector = select_domain,
         confirm: Confirmation | None = None,
-        max_candidates_per_target: int = 12,
     ) -> None:
         self.context = context
         self.reporter = reporter or ScanReporter(output_dir=report_dir)
@@ -84,7 +84,6 @@ class ScanApplication:
         self.output = output
         self.domain_selector = domain_selector
         self.confirm = confirm or (lambda _message: True)
-        self.max_candidates_per_target = max_candidates_per_target
         self.session = ScanSession()
         self._active_exploit_phase: ExploitPhase | None = None
         self._current_reports: dict[str, dict[str, Any]] = {}
@@ -96,6 +95,9 @@ class ScanApplication:
     async def run(self, request: ScanRequest) -> ScanResult:
         """Run either the normal pipeline or direct exploit validation."""
         self.session.task = asyncio.current_task()
+        audit_context = f"run_{uuid.uuid4().hex}"
+        if hasattr(self.context.llm, "set_audit_context"):
+            self.context.llm.set_audit_context(audit_context)
         try:
             source_directory = request.source_directory.resolve()
             if not source_directory.is_dir():
@@ -124,6 +126,9 @@ class ScanApplication:
                 AppEvent(phase="application", kind=EventKind.CANCELLED)
             )
             return ScanResult(reports=self._current_reports, cancelled=True)
+        finally:
+            if hasattr(self.context.llm, "set_audit_context"):
+                self.context.llm.set_audit_context(None)
 
     def _emit(self, event: AppEvent) -> None:
         if self.event_sink is not None:
@@ -154,7 +159,7 @@ class ScanApplication:
 
     async def _run_exploit_only(self, report_path: Path) -> ScanResult:
         exploit_phase = ExploitPhase(
-            self.context.llm,
+            self.context.runtime,
             cache_dir=self.report_dir,
             event_sink=self.event_sink,
             graph_manager=self.context.graph,
@@ -196,11 +201,9 @@ class ScanApplication:
         vendor = config_json.get("stack_vendor", "Generic AutoSAR")
         platform_info = f"Hardware: {mcu}, Stack: {vendor}"
         orchestrator = ScanOrchestrator(
-            self.context.llm,
+            self.context.runtime,
             self.context.graph,
             platform_info=platform_info,
-            scan_budget=self.context.scan_budget,
-            max_candidates_per_target=self.max_candidates_per_target,
         )
         scan_service = ScanService(orchestrator)
         selected_domain = await self._resolve_interaction(
@@ -238,7 +241,7 @@ class ScanApplication:
                 )
 
         exploit_phase = ExploitPhase(
-            self.context.llm,
+            self.context.runtime,
             self.cache_dir,
             skip=request.skip_exploit,
             event_sink=self.event_sink,

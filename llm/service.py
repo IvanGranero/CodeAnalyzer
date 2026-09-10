@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from llm.client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
 from llm.tracker import TokenTracker
+from config import TokenPricing
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +23,11 @@ class LLMService:
         api_key: str,
         model_name: str,
         base_url: str,
+        pricing: TokenPricing,
         default_headers: str = "",
         extra_query: str = "",
-        usd_per_1m_input: float | None = None,
-        usd_per_1m_output: float | None = None,
         usage_listener: UsageCallback | None = None,
+        tracker: TokenTracker | None = None,
     ) -> None:
         self.client = LLMClient(
             api_key=api_key,
@@ -36,13 +37,12 @@ class LLMService:
             extra_query=extra_query,
         )
         self.prompts = self._load_prompts()
-        self.tracker = TokenTracker(
-            model_name=model_name,
-            usd_per_1m_input=usd_per_1m_input,
-            usd_per_1m_output=usd_per_1m_output,
-        )
+        self.tracker = tracker or TokenTracker()
+        self.tracker.register_model(model_name, pricing)
+        self.model_name = model_name
         self.usage_listener = usage_listener
         self.pause_waiter: Callable[[], Awaitable[None]] | None = None
+        self.audit_context_id: str | None = None
 
     def _load_prompts(self) -> dict[str, dict[str, Any]]:
         """Load task templates and model defaults from ``prompts.json``."""
@@ -96,24 +96,25 @@ class LLMService:
             system_prompt,
             user_prompt,
             settings,
-            context_id,
+            self.audit_context_id or context_id,
             tools=tools,
             tool_handler=tool_handler,
+            audit_metadata={"task_name": task_name, "task_context_id": context_id},
         )
 
         if usage_dict:
-            self.tracker.add_usage(usage_dict)
+            self.tracker.add_usage(usage_dict, task_name=task_name, model_name=self.model_name)
             if usage_callback:
                 callback_result = usage_callback(
                     usage_dict,
-                    self.tracker.estimate_usage_cost(usage_dict),
+                    self.tracker.estimate_usage_cost(usage_dict, model_name=self.model_name),
                 )
                 if inspect.isawaitable(callback_result):
                     await callback_result
             if self.usage_listener:
                 listener_result = self.usage_listener(
                     usage_dict,
-                    self.tracker.estimate_usage_cost(usage_dict),
+                    self.tracker.estimate_usage_cost(usage_dict, model_name=self.model_name),
                 )
                 if inspect.isawaitable(listener_result):
                     await listener_result
@@ -132,6 +133,10 @@ class LLMService:
         )
         logger.debug("[LLM Response Preview] %s", preview)
         return result_text
+
+    def set_audit_context(self, context_id: str | None) -> None:
+        """Override per-task audit filenames for one application run."""
+        self.audit_context_id = context_id
 
     def set_usage_listener(self, listener: UsageCallback | None) -> None:
         """Set a process-local observer for completed LLM usage records."""

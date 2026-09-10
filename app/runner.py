@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 async def run(args) -> None:
     """Translate parsed CLI arguments into an application request."""
-    from config import settings
 
     source_directory = Path(args.source_dir).resolve()
     if not source_directory.is_dir():
@@ -21,7 +20,7 @@ async def run(args) -> None:
         sys.exit(1)
 
     try:
-        app_context = build_app_context(settings)
+        app_context = build_app_context()
     except Exception as exc:
         logger.error("Failed to initialize core services: %s", exc)
         sys.exit(1)
@@ -34,7 +33,6 @@ async def run(args) -> None:
 
     application = ScanApplication(
         app_context,
-        max_candidates_per_target=settings.scan_max_candidates_per_target,
         confirm=confirm,
     )
     request = ScanRequest(

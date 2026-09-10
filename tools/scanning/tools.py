@@ -59,6 +59,22 @@ class AnalyzerTools:
         except Exception as e:
             return f"Error executing tool: {e}"
 
+    def get_uds_contract(self, func_name: str) -> str:
+        """Return one deterministic protocol handoff for an analyzed function."""
+        try:
+            graph_json, _ = self.graph_resolver.serialize_function_neighborhood(
+                func_name, verbosity="compact"
+            )
+            payload = json.loads(graph_json)
+            return json.dumps({
+                "function": func_name,
+                "protocol_contract": payload.get("protocol_contract", {}),
+                "entry_points": payload.get("sources", {}).get("uds", []),
+                "source": payload.get("function", {}).get("file"),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"function": func_name, "error": str(exc)})
+
     def get_type_definition(self, type_name: str) -> str:
         """Returns the source code snippet for a struct, enum, or typedef definition."""
         if self._check_cache("get_type_definition", type_name):

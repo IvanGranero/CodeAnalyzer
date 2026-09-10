@@ -41,16 +41,35 @@ class UdsTaintMixin:
                      f.name ENDS WITH "_Stop" OR f.name ENDS WITH "_RequestResults"
                 )
               )
-        WITH f,
-             CASE
+          WITH f,
+                 CASE
                 WHEN f.name CONTAINS "_DID_" THEN substring(split(f.name, "_DID_")[1], 0, 4)
                 WHEN f.name CONTAINS "_RID_" THEN substring(split(f.name, "_RID_")[1], 0, 4)
                 WHEN f.name CONTAINS "DID" THEN "NAMED_" + split(f.name, "DID")[0]
                 ELSE "NAMED_" + split(f.name, "RID")[0]
-             END AS uds_hex
+                 END AS uds_hex,
+                 CASE WHEN f.name CONTAINS "RID" THEN "rid" ELSE "did" END AS protocol_kind,
+                 CASE
+                     WHEN f.name ENDS WITH "_ReadData" OR f.name ENDS WITH "_ReadDataLength" OR f.name ENDS WITH "_ConditionCheckRead" THEN "Read"
+                     WHEN f.name ENDS WITH "_WriteData" OR f.name ENDS WITH "_ConditionCheckWrite" THEN "Write"
+                     ELSE NULL
+                 END AS protocol_operation
         WHERE uds_hex <> ""
         MERGE (u:UdsService {did: uds_hex})
         ON CREATE SET u:GraphNode, u.name = "UDS_" + uds_hex
+        SET u.protocol_kind = coalesce(u.protocol_kind, protocol_kind),
+            u.protocol_identifier = coalesce(u.protocol_identifier, "0x" + uds_hex),
+            u.operation = coalesce(u.operation, protocol_operation),
+            u.protocol_source = coalesce(u.protocol_source, "name_heuristic"),
+            u.protocol_confidence = coalesce(u.protocol_confidence, "partial"),
+            u.protocol_missing_facts = coalesce(
+                u.protocol_missing_facts,
+                CASE
+                    WHEN protocol_kind = "rid" THEN ["routine subfunction", "request layout", "request length"]
+                    WHEN protocol_operation = "Read" THEN ["response data length"]
+                    ELSE ["service direction", "request layout", "request length"]
+                END
+            )
         MERGE (f)-[:HANDLES_UDS]->(u)
         RETURN count(f) AS linked_uds
         """

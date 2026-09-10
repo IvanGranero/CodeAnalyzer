@@ -1,17 +1,31 @@
 import logging
 import os
-from typing import Optional
-from pydantic import ValidationError
+from typing import Any
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+
+class TokenPricing(BaseModel):
+    """Per-million-token pricing used by the LLM usage tracker."""
+    model_config = ConfigDict(frozen=True)
+    input: float = 0.0
+    output: float = 0.0
+    cached: float = 0.0
+
 
 class AppConfig(BaseSettings):
     """
     Centralized configuration. 
     Pydantic automatically matches these lowercase variables to the UPPERCASE keys in the .env file.
     """
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+    model_config = SettingsConfigDict(
+        env_file='.env',
+        env_file_encoding='utf-8',
+        env_nested_delimiter='__',
+        extra='ignore',
+    )
 
     # --- Cheap tier ("orchestrator") -----------------------------------------
     cheap_subscription_key: str
@@ -28,20 +42,9 @@ class AppConfig(BaseSettings):
     strong_base_url: str
 
     # --- Optional pricing ----------------------------------------------------
-    # Using Optional[float] = None means if you comment these out in the .env, 
-    # they just become None in Python without crashing the app.
-    cheap_usd_input: Optional[float] = None
-    cheap_usd_output: Optional[float] = None
-    
-    strong_usd_input: Optional[float] = None
-    strong_usd_output: Optional[float] = None
+    cheap_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
+    strong_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
 
-    # --- Scan admission control ---------------------------------------------
-    scan_max_concurrent_llm_calls: int = 5
-    scan_max_calls: int = 0
-    scan_max_tokens: int = 0
-    scan_max_cost_usd: float = 0.0
-    scan_max_candidates_per_target: int = 12
 
     # --- Optional TLS override -----------------------------------------------
     # Pydantic natively understands "false", "0", "off" from the .env file

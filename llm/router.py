@@ -1,6 +1,5 @@
 """Task-aware routing between cheap and strong LLM services."""
 
-import json
 from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any
@@ -16,7 +15,12 @@ class ModelTier(str, Enum):
 class TieredLLMService:
     """Route prompt tasks to cheap or strong services by investigation cost."""
 
-    _CHEAP_TASKS = frozenset({"discovery", "nl2cypher", "triage_agent"})
+    _CHEAP_TASKS = frozenset({
+        "discovery",
+        "nl2cypher",
+        "triage_agent",
+        "exploit_analyzer",
+    })
 
     def __init__(self, cheap_service: Any, strong_service: Any):
         self.services = {
@@ -30,20 +34,21 @@ class TieredLLMService:
         kwargs: Mapping[str, Any],
         settings_override: Mapping[str, Any] | None = None,
     ) -> ModelTier:
-        """Choose a model tier; high-effort deep scans use the strong model."""
+        """Choose a model tier according to the task's reasoning requirements."""
         if task_name in self._CHEAP_TASKS:
             return ModelTier.CHEAP
         if task_name == "deep_scan_agent":
-            candidate = kwargs.get("candidate", "")
-            if isinstance(candidate, str):
-                try:
-                    candidate = json.loads(candidate)
-                except json.JSONDecodeError:
-                    candidate = {}
-            if isinstance(candidate, Mapping) and candidate.get("effort_estimate") == "high":
-                return ModelTier.STRONG
-            return ModelTier.CHEAP
+            return ModelTier.STRONG
         return ModelTier.STRONG
+
+    def tier_for(
+        self,
+        task_name: str,
+        kwargs: Mapping[str, Any],
+        settings_override: Mapping[str, Any] | None = None,
+    ) -> ModelTier:
+        """Expose deterministic routing for model selection."""
+        return self._tier_for(task_name, kwargs, settings_override)
 
     async def execute_task(
         self,
@@ -65,12 +70,17 @@ class TieredLLMService:
         return self.services[ModelTier.STRONG].tracker
 
     def log_summary(self) -> None:
-        for service in self.services.values():
-            if hasattr(service, "tracker"):
-                service.tracker.log_summary()
+        if hasattr(self.tracker, "log_summary"):
+            self.tracker.log_summary()
 
     def set_usage_listener(self, listener: UsageCallback | None) -> None:
         """Forward usage events from both model tiers to one observer."""
         for service in self.services.values():
             if hasattr(service, "set_usage_listener"):
                 service.set_usage_listener(listener)
+
+    def set_audit_context(self, context_id: str | None) -> None:
+        """Route one application-run audit context to both model services."""
+        for service in self.services.values():
+            if hasattr(service, "set_audit_context"):
+                service.set_audit_context(context_id)
