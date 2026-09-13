@@ -160,3 +160,34 @@ class DeepScanAgent(ScanAgent):
             settings_override=settings,
         )
         return parse_object(self._extract_json(response_text), Finding).model_dump(mode="json")
+
+    async def run_with_retries(
+        self,
+        candidate: Mapping[str, Any],
+        graph_json: str,
+        graph_summary: str,
+        source_code: str,
+        directive: str,
+        follow_up_context: str = "",
+        target_func: str = "",
+        max_attempts: int = 2,
+    ) -> dict[str, Any]:
+        """Retry only contract failures, preserving the same evidence scope."""
+        last_error = "unknown deep-scan failure"
+        for attempt in range(1, max(1, max_attempts) + 1):
+            try:
+                return await self.run(
+                    candidate, graph_json, graph_summary, source_code,
+                    directive, follow_up_context, target_func,
+                )
+            except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "Deep-scan attempt %d/%d failed for '%s': %s",
+                    attempt, max_attempts, target_func, exc,
+                )
+                follow_up_context = (
+                    f"{follow_up_context}\nRETRY {attempt}: Return one JSON object matching the Finding contract. "
+                    "Use status='unknown' and needs_human_review=true when graph evidence is insufficient."
+                )
+        raise ValueError(f"Deep scan failed after bounded retries: {last_error}")

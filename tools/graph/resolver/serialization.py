@@ -22,48 +22,67 @@ class SerializationMixin:
         # --- FIXED FOR NEO4J 5 GQL COMPLIANCE AND EDGE PROPERTIES ---
         query = """
         MATCH (f:Function {name: $func_name})
-        WHERE NOT f.storage_uri ENDS WITH '.h'  // <--- Force it to grab the .c implementation!
 
         // 1. Gather Concurrency Context
         OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(task:OsTask)
         WITH f, task
+        OPTIONAL MATCH (f)-[:IMPLEMENTS_TASK]->(isr:OsIsr)
+        WITH f, task, collect(DISTINCT {
+            name: isr.name,
+            category: isr.isr_category,
+            file: isr.storage_uri,
+            byte_span: isr.byte_span
+        }) AS isrs
         OPTIONAL MATCH (f)-[lock_edge:OS_LOCK_ACTION]->(lock:OsResource)
-        WITH f, task, collect(DISTINCT {name: lock.name, action: lock_edge.action}) AS locks_held
+        WITH f, task, isrs, collect(DISTINCT {name: lock.name, action: lock_edge.action}) AS locks_held
 
         // 2. Gather Dependencies
         // NOTE: DEPENDS_ON_TYPE is retired (99.99% of its edges were unresolved
         // stubs, invisible to this query anyway since it's scoped to :TypeDefinition
         // -- pure ingestion cost with no observed consumer). `types` stays in the
         // output shape as an always-empty list for downstream schema stability.
-        WITH f, task, locks_held, [] AS types
+        WITH f, task, isrs, locks_held, [] AS types
         OPTIONAL MATCH (f)-[:USES_MACRO]->(m:MacroDefinition)
-        WITH f, task, locks_held, types, collect(DISTINCT m.name) AS macros
+        WITH f, task, isrs, locks_held, types, collect(DISTINCT m.name) AS macros
 
         // 3. Gather Upstream Context
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-        WITH f, task, locks_held, types, macros, collect(DISTINCT {id: elementId(caller), type: labels(caller)[0], name: caller.name}) AS callers
+        WITH f, task, isrs, locks_held, types, macros, collect(DISTINCT {id: elementId(caller), type: labels(caller)[0], name: caller.name}) AS callers
         OPTIONAL MATCH (f)-[uds_edge:HANDLES_UDS]->(uds:UdsService)
-        WITH f, task, locks_held, types, macros, callers, collect(DISTINCT {
+        WITH f, task, isrs, locks_held, types, macros, callers, collect(DISTINCT {
             id: elementId(uds), type: labels(uds)[0], name: coalesce(uds.name, 'UDS_' + coalesce(uds.did, uds.rid)),
             did: uds.did, rid: uds.rid, operation: coalesce(uds.operation, uds_edge.operation),
             kind: coalesce(uds.protocol_kind, uds_edge.kind, CASE WHEN uds.rid IS NOT NULL THEN 'rid' ELSE 'did' END),
             subfunction: uds.protocol_subfunction,
-            protocol_contract_json: uds.protocol_contract_json,
+            protocol_contract_json: coalesce(uds.protocol_contract_json, uds.protocol_contract),
             source: coalesce(uds.source, uds.protocol_source, 'heuristic'),
             func_class_hex: uds.func_class_hex
         }) AS uds_triggers
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
-        WITH f, task, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
+        WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
 
         // 4. Gather Downstream Context
         OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
-        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, collect(DISTINCT {id: elementId(callee), type: labels(callee)[0], called_function: callee.name, is_dangerous_sink: coalesce(callee.is_dangerous_sink, false), is_stub_node: CASE WHEN callee:Stub THEN true ELSE false END}) AS callees
+        WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, network_triggers, collect(DISTINCT {id: elementId(callee), type: labels(callee)[0], called_function: callee.name, file: callee.storage_uri, byte_span: callee.byte_span, is_dangerous_sink: coalesce(callee.is_dangerous_sink, false), is_stub_node: CASE WHEN callee:Stub THEN true ELSE false END}) AS callees
 
         // 5. Gather Variables & Sanitizers
         OPTIONAL MATCH (f)-[r:READS_VAR|WRITES_VAR]->(v:GlobalVariable)
-        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, collect(DISTINCT {id: elementId(v), type: labels(v)[0], variable_name: v.name, access_type: type(r), resolution: coalesce(r.resolution, 'unknown')}) AS var_access
+        WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, collect(DISTINCT {id: elementId(v), type: labels(v)[0], variable_name: v.name, access_type: type(r), resolution: coalesce(r.resolution, 'unknown')}) AS var_access
         OPTIONAL MATCH (san:Function)-[:CALLS]->(f) WHERE san.name =~ '.*(sanitize|validate|check|clean|strip|guard).*'
-        WITH f, task, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, var_access, collect(DISTINCT {id: elementId(san), type: labels(san)[0], name: san.name}) AS sanitizers
+        WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, var_access, collect(DISTINCT {id: elementId(san), type: labels(san)[0], name: san.name}) AS sanitizers
+        OPTIONAL MATCH (f)-[rte]-(rte_peer:Function)
+        WHERE type(rte) = 'RTE_DATA_FLOW'
+        WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, network_triggers, callees, var_access, sanitizers,
+             collect(DISTINCT CASE WHEN rte_peer IS NULL THEN NULL ELSE {
+                 direction: CASE WHEN startNode(rte) = f THEN 'outgoing' ELSE 'incoming' END,
+                 peer_function: rte_peer.name,
+                 peer_file: rte_peer.storage_uri,
+                 peer_byte_span: rte_peer.byte_span,
+                 port: properties(rte)['port'],
+                 data_type: properties(rte)['data_type'],
+                 source: coalesce(properties(rte)['source'], 'unknown'),
+                 resolution: coalesce(properties(rte)['resolution'], 'exact')
+             } END) AS rte_flows
 
         // Final Assembly
         RETURN {
@@ -82,6 +101,7 @@ class SerializationMixin:
             concurrency: {
                 hosting_task: task.name,
                 task_priority: task.priority,
+                hosting_isrs: isrs,
                 locks_held: locks_held
             },
             dependencies: {
@@ -94,6 +114,7 @@ class SerializationMixin:
                 standard_callers: callers
             },
             downstream: callees,
+            rte_data_flows: rte_flows,
             variable_access: var_access,
             sanitizers: sanitizers
         } AS payload
@@ -112,6 +133,7 @@ class SerializationMixin:
                     "concurrency": {
                         "hosting_task": None,
                         "task_priority": None,
+                        "hosting_isrs": [],
                         "locks_held": []
                     },
                     "dependencies": {
@@ -211,7 +233,9 @@ class SerializationMixin:
                         callee.get("type", "Function"),
                         callee.get("id"),
                         is_dangerous_sink=callee.get("is_dangerous_sink", False),
-                        is_stub_node=callee.get("is_stub_node", False)
+                        is_stub_node=callee.get("is_stub_node", False),
+                        file=callee.get("file"),
+                        byte_span=callee.get("byte_span")
                     ))
                     edges.append({
                         "id": f"edge:{func_name}->{callee_name}",
@@ -351,6 +375,9 @@ class SerializationMixin:
                 "variable_access": payload.get("variable_access", []) or [],
                 "concurrency": payload.get("concurrency", {}),
                 "dependencies": payload.get("dependencies", {}),
+                "rte_data_flows": [
+                    item for item in (payload.get("rte_data_flows", []) or []) if item
+                ],
                 "provenance": provenance,
                 "confidence": provenance["confidence"],
             }
@@ -456,7 +483,11 @@ class SerializationMixin:
                     "source": persisted.get("source") or source.get("source", "unknown"),
                 })
             else:
-                missing = list(persisted.get("missing_facts") or [])
+                missing = list(
+                    persisted.get("missing_facts")
+                    or source.get("protocol_missing_facts")
+                    or []
+                )
                 contracts.append({
                     "kind": persisted.get("kind", "did"),
                     "service_name": persisted.get("service_name"),
@@ -464,7 +495,7 @@ class SerializationMixin:
                     "data_length": persisted.get("data_length"), "minimum_length": persisted.get("minimum_length"),
                     "request_layout": persisted.get("request_layout"), "request_length": persisted.get("request_length"),
                     "missing_facts": sorted(set(missing)),
-                    "confidence": persisted.get("confidence", "partial"),
+                    "confidence": persisted.get("confidence") or source.get("protocol_confidence", "partial"),
                     "source": persisted.get("source") or source.get("source", "unknown"),
                 })
         missing_facts = sorted({fact for item in contracts for fact in item.get("missing_facts", [])})

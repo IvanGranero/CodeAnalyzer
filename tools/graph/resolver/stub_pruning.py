@@ -22,6 +22,7 @@ class StubPruningMixin:
         WHERE NOT ()-[:CALLS]->(n)
           AND NOT ()-[:READS_VAR]->(n)
           AND NOT ()-[:WRITES_VAR]->(n)
+                    AND NOT (n)-[:IMPLEMENTS_TASK]->(:OsTask)
         DETACH DELETE n
         RETURN count(n) as deleted_count
         """

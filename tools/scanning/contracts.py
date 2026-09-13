@@ -75,20 +75,20 @@ class Candidate(BaseModel):
 class Coverage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    memory_safety: str = "unknown"
-    integer_arithmetic: str = "unknown"
-    taint_validation: str = "unknown"
-    concurrency: str = "unknown"
-    state_management: str = "unknown"
+    memory_safety: str = "insufficient_evidence"
+    integer_arithmetic: str = "insufficient_evidence"
+    taint_validation: str = "insufficient_evidence"
+    concurrency: str = "insufficient_evidence"
+    state_management: str = "insufficient_evidence"
 
     @field_validator("memory_safety", "integer_arithmetic", "taint_validation", "concurrency", "state_management")
     @classmethod
     def validate_coverage_state(cls, value: str) -> str:
-        allowed = {"checked", "not_applicable", "insufficient_evidence", "unknown"}
-        return value if value in allowed else "unknown"
+        allowed = {"checked", "not_applicable", "insufficient_evidence"}
+        return value if value in allowed else "insufficient_evidence"
 
     def incomplete(self) -> bool:
-        return any(value in {"unknown", "insufficient_evidence"} for value in self.model_dump().values())
+        return any(value == "insufficient_evidence" for value in self.model_dump().values())
 
 
 class TriageResponse(BaseModel):
@@ -161,6 +161,9 @@ class ScanMetadata(BaseModel):
     byte_span: Optional[str] = Field(default=None, alias="ByteSpan")
     tainted_by_uds: bool = Field(default=False, alias="TaintedByUDS")
     dids: List[str] = Field(default_factory=list, alias="DIDs")
+    taint_depth: Optional[int] = Field(default=None, alias="TaintDepth")
+    memory_region: Optional[str] = Field(default=None, alias="MemoryRegion")
+    location: Dict[str, Any] = Field(default_factory=dict, alias="Location")
 
 
 class ExploitFinding(BaseModel):
@@ -197,6 +200,9 @@ class EvidenceBundle(BaseModel):
     concurrency: Dict[str, Any] = Field(default_factory=dict)
     deep_scan_findings: List[Dict[str, Any]] = Field(default_factory=list)
     protocol_contract: Dict[str, Any] = Field(default_factory=dict)
+    graph_flags: Dict[str, Any] = Field(default_factory=dict)
+    rte_data_flows: List[Dict[str, Any]] = Field(default_factory=list)
+    memory_sink_paths: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ExploitContext(BaseModel):

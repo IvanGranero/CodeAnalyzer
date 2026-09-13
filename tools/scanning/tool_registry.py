@@ -2,7 +2,9 @@
 
 import json
 import ast
+from copy import deepcopy
 from typing import Callable
+from llm.runtime import CallBinder
 
 
 TOOL_DEFINITIONS = [
@@ -62,6 +64,30 @@ TOOL_DEFINITIONS = [
     },
     {
         "type": "function",
+        "name": "get_resolution_metadata",
+        "description": "Get resolver annotations: dead-code, UDS-taint, data-race, dangerous-sink, task/ISR, macro, and edge-resolution evidence.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]},
+    },
+    {
+        "type": "function",
+        "name": "get_rte_data_flows",
+        "description": "Get authoritative RTE sender/receiver flow relationships, data types, provenance, and peer source locations.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]},
+    },
+    {
+        "type": "function",
+        "name": "get_memory_sinks",
+        "description": "Get resolved CALLS paths from a function to flagged memory/NVM sinks with sink source locations.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}, "max_hops": {"type": "integer", "minimum": 0, "maximum": 8}}, "required": ["function_name"]},
+    },
+    {
+        "type": "function",
+        "name": "get_graph_evidence",
+        "description": "Get the complete structured graph evidence payload for a function, including sources, sinks, taint, concurrency, RTE flows, resolver flags, paths, provenance, and confidence.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}, "verbosity": {"type": "string", "enum": ["compact", "medium", "full"]}}, "required": ["function_name"]},
+    },
+    {
+        "type": "function",
         "name": "get_type_layout",
         "description": "Get an indexed type definition and layout-related properties; report when compiler layout data is unavailable.",
         "parameters": {"type": "object", "properties": {"type_name": {"type": "string"}}, "required": ["type_name"]},
@@ -97,15 +123,29 @@ class ReadOnlyToolRegistry:
             "get_concurrency_metadata": lambda function_name: self.tools.get_concurrency_metadata(function_name),
             "get_preprocessed_source": lambda function_name, build_variant="default": self.tools.get_preprocessed_source(function_name, build_variant),
             "get_related_taint_paths": lambda function_name, max_hops=8: self.tools.get_related_taint_paths(function_name, max_hops),
+            "get_resolution_metadata": lambda function_name: self.tools.get_resolution_metadata(function_name),
+            "get_rte_data_flows": lambda function_name: self.tools.get_rte_data_flows(function_name),
+            "get_memory_sinks": lambda function_name, max_hops=4: self.tools.get_memory_sinks(function_name, max_hops),
+            "get_graph_evidence": lambda function_name, verbosity="medium": self.tools.get_graph_evidence(function_name, verbosity),
             "get_type_definition": self.tools.get_type_definition,
             "get_type_layout": self.tools.get_type_layout,
             "get_macro_definition": self.tools.get_macro_definition,
         }
 
     def definitions(self):
-        if self.allowed_tools is None:
-            return TOOL_DEFINITIONS
-        return [definition for definition in TOOL_DEFINITIONS if definition["name"] in self.allowed_tools]
+        definitions = TOOL_DEFINITIONS if self.allowed_tools is None else [
+            definition for definition in TOOL_DEFINITIONS
+            if definition["name"] in self.allowed_tools
+        ]
+        strict = []
+        for definition in definitions:
+            item = deepcopy(definition)
+            item["parameters"] = {
+                **item.get("parameters", {}),
+                "additionalProperties": False,
+            }
+            strict.append(item)
+        return strict
 
     def scoped(self, allowed_tools, audit_callback=None):
         scoped_registry = ReadOnlyToolRegistry(
@@ -133,7 +173,10 @@ class ReadOnlyToolRegistry:
         if handler is None:
             return json.dumps({"error": f"Tool '{name}' is not allow-listed."})
         try:
-            result = handler(**arguments)
+            # Apply the same schema boundary to direct calls that provider-backed
+            # calls receive through AgentRuntime/CallBinder.
+            bound = CallBinder(self.definitions()).bind("direct-call", name, arguments)
+            result = handler(**bound.arguments)
             if isinstance(result, str):
                 try:
                     output = json.dumps(ast.literal_eval(result), ensure_ascii=False)
@@ -149,3 +192,4 @@ class ReadOnlyToolRegistry:
             if self.audit_callback is not None:
                 self.audit_callback(name, arguments, output)
             return output
+

@@ -47,37 +47,41 @@ class GraphDB:
         # index avoids that extra filter step at scale.
         tx.run("CREATE INDEX function_name IF NOT EXISTS FOR (n:Function) ON (n.name)")
         tx.run("CREATE INDEX globalvariable_name IF NOT EXISTS FOR (n:GlobalVariable) ON (n.name)")
+        tx.run("CREATE INDEX udsservice_did IF NOT EXISTS FOR (n:UdsService) ON (n.did)")
+        tx.run("CREATE INDEX typedefinition_name IF NOT EXISTS FOR (n:TypeDefinition) ON (n.name)")
+        tx.run("CREATE INDEX macrodefinition_name IF NOT EXISTS FOR (n:MacroDefinition) ON (n.name)")
+        tx.run("CREATE INDEX osresource_name IF NOT EXISTS FOR (n:OsResource) ON (n.name)")
+        tx.run("CREATE INDEX joern_source IF NOT EXISTS FOR (n) ON (n.source)")
+        tx.run("CREATE INDEX joern_file_line IF NOT EXISTS FOR (n:ASTNode) ON (n.file, n.line)")
 
     def ingest_batched(self, query: str, records: List[Dict[str, Any]], batch_size: int = 5000, max_retries: int = 5, base_delay: float = 2.0):
         total_records = len(records)
         # Downgrade from INFO to DEBUG
         logger.debug(f"Starting batched ingestion of {total_records} records in chunks of {batch_size}.")
 
-        for i in range(0, total_records, batch_size):
-            batch = records[i : i + batch_size]
-            batch_num = i // batch_size + 1
+        # Keep one session for the complete ingestion call. Creating a session for
+        # every chunk adds measurable pool/context overhead on large source trees.
+        with self.driver.session() as session:
+            for i in range(0, total_records, batch_size):
+                batch = records[i : i + batch_size]
+                batch_num = i // batch_size + 1
 
-            for attempt in range(1, max_retries + 1):
-                try:
-                    with self.driver.session() as session:
+                for attempt in range(1, max_retries + 1):
+                    try:
                         session.execute_write(self._run_unwind_batch, query, batch)
-                    logger.debug(f"Successfully ingested batch {batch_num}")
-                    break
-                except exceptions.TransientError as e:
-                    # TransientError (e.g. DatabaseUnavailable) is exactly the class of
-                    # error that SHOULD be retried with backoff. Previously it was caught,
-                    # logged, and the batch was silently dropped -- the ingested graph
-                    # would end up missing an arbitrary slice of nodes/edges with no
-                    # indication in the final result beyond a log line.
-                    if attempt == max_retries:
-                        logger.error(f"Transient error on batch {batch_num} after {max_retries} attempts, giving up on this batch: {e}")
+                        logger.debug(f"Successfully ingested batch {batch_num}")
+                        break
+                    except exceptions.TransientError as e:
+                        # Retry transient failures without reopening the session.
+                        if attempt == max_retries:
+                            logger.error(f"Transient error on batch {batch_num} after {max_retries} attempts, giving up on this batch: {e}")
+                            raise
+                        delay = base_delay * (2 ** (attempt - 1))
+                        logger.warning(f"Transient error on batch {batch_num} (attempt {attempt}/{max_retries}): {e}. Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                    except Exception as e:
+                        logger.error(f"Failed to ingest batch {batch_num}: {e}")
                         raise
-                    delay = base_delay * (2 ** (attempt - 1))
-                    logger.warning(f"Transient error on batch {batch_num} (attempt {attempt}/{max_retries}): {e}. Retrying in {delay:.1f}s...")
-                    time.sleep(delay)
-                except Exception as e:
-                    logger.error(f"Failed to ingest batch {batch_num}: {e}")
-                    raise
 
     @staticmethod
     def _run_unwind_batch(tx, query: str, batch: List[Dict[str, Any]]):

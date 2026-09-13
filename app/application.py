@@ -190,12 +190,28 @@ class ScanApplication:
             logger.info("--- PHASE 2: Skipped (using cached graph) ---")
         else:
             self._emit(AppEvent(phase="ingestion", kind=EventKind.PHASE_STARTED))
-            await asyncio.to_thread(
+            ingestion_report = await asyncio.to_thread(
                 IngestionPhase().run,
                 str(request.source_directory),
                 self.context.graph,
                 config_json,
             )
+            self._emit(
+                AppEvent(
+                    phase="ingestion",
+                    kind=EventKind.PHASE_UPDATED,
+                    message="Ingestion coverage recorded",
+                    payload={"coverage": ingestion_report},
+                )
+            )
+            partial_coverage = (
+                ingestion_report.get("config_files_missing")
+                or ingestion_report.get("config_files_outside_target")
+                or ingestion_report.get("config_files_unsupported")
+                or ingestion_report.get("source_files_failed")
+            )
+            if partial_coverage:
+                logger.warning("Graph ingestion completed with partial coverage: %s", ingestion_report)
 
         mcu = config_json.get("mcu_guess", "Unknown MCU")
         vendor = config_json.get("stack_vendor", "Generic AutoSAR")

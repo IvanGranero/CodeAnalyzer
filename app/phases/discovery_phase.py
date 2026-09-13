@@ -46,13 +46,24 @@ class DiscoveryPhase:
         config_json.setdefault("stack_vendor_guess", config_json.get("stack_vendor", "Unknown vendor"))
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
         config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
-        config_json.setdefault("config_file_extensions", [])
-        config_json.setdefault("config_filename_patterns", [])
-        config_json["config_files"] = RepoDiscoverer.search_config_files(
+        config_json["config_file_extensions"] = self._merge_discovery_rules(
+            config_json.get("config_file_extensions"),
+            RepoDiscoverer.DEFAULT_CONFIG_EXTENSIONS,
+        )
+        config_json["config_filename_patterns"] = self._merge_discovery_rules(
+            config_json.get("config_filename_patterns"),
+            RepoDiscoverer.DEFAULT_CONFIG_PATTERNS,
+        )
+        discovered_config_files = RepoDiscoverer.search_config_files(
             target_directory,
             config_json["config_file_extensions"],
             config_json["config_filename_patterns"],
         )
+        config_json["config_files"] = [
+            path for path in discovered_config_files
+            if os.path.splitext(path)[1].lower() in RepoDiscoverer.SUPPORTED_CONFIG_EXTENSIONS
+        ]
+        config_json["ignored_config_candidates"] = len(discovered_config_files) - len(config_json["config_files"])
         config_json["vendor_folders"] = config_json["likely_vendor_folders"]
         config_json["app_domains"] = config_json["app_domain_guesses"]
         config_json["stack_vendor"] = config_json["stack_vendor_guess"]
@@ -64,3 +75,17 @@ class DiscoveryPhase:
         if found_configs:
             logger.info(f"Discovery found {len(found_configs)} system configuration files.")
         return config_json
+
+    @staticmethod
+    def _merge_discovery_rules(value, defaults) -> list[str]:
+        """Keep deterministic repository coverage when the model under-infers rules."""
+        candidates = value if isinstance(value, list) else []
+        merged = []
+        seen = set()
+        for item in [*candidates, *defaults]:
+            rule = str(item).strip()
+            key = rule.lower()
+            if rule and key not in seen:
+                merged.append(rule)
+                seen.add(key)
+        return merged

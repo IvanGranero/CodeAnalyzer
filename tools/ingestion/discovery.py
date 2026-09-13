@@ -7,12 +7,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class RepoDiscoverer:
+    SUPPORTED_CONFIG_EXTENSIONS = frozenset({".arxml", ".xml", ".json"})
     DEFAULT_CONFIG_EXTENSIONS = (
-        ".arxml", ".oil", ".cdd", ".rte.json", ".rte", ".xml",
+        ".arxml", ".oil", ".cdd", ".rte.json", ".rte", ".xml", ".json",
         ".ini", ".cfg", ".mk", ".ld", ".sct",
     )
     DEFAULT_CONFIG_PATTERNS = (
-        "Rte*", "*.arxml", "*.oil", "CMakeLists.txt", "Makefile", "*.ld",
+        "*.arxml", "*.oil", "CMakeLists.txt", "Makefile", "*.ld",
     )
 
     @staticmethod

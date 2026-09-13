@@ -7,8 +7,6 @@ from typing import Dict, Optional
 from app.storage.repositories import ScanCacheRepository
 from app.events import EventSink
 from app.progress import ScanProgress
-from tools.exploitation.config import exploit_settings
-from tools.exploitation.domain_mapping import DEFAULT_DOMAIN, infer_domain
 from tools.scanning.orchestrator import ScanOrchestrator
 from tools.scanning.contracts import ScanReport
 
@@ -147,12 +145,7 @@ class ScanPhase:
                 logger.info(f"⏭️ [SKIPPED EXPLOIT] -> {target_func} is not reachable via UDS/DoIP.")
                 return
 
-            domain_to_use = selected_domain
-            if not domain_to_use:
-                file_path = report.get("metadata", {}).get("FilePath", "")
-                domain_to_use = infer_domain(file_path, exploit_settings.target_map)
-
-            await self.exploit_phase.enqueue(report, target_func, domain_to_use)
+            await self.exploit_phase.enqueue(report, target_func, selected_domain)
             # Keep one target's triage, deep scans, and exploit validation together.
             await self.exploit_phase.wait_until_idle()
 
@@ -164,6 +157,5 @@ class ScanPhase:
         for func_name, report in all_reports.items():
             is_uds = report.get("metadata", {}).get("TaintedByUDS") is True
             if report.get("vulnerability_found") and "exploit_validation" not in report and is_uds:
-                domain_to_use = selected_domain if selected_domain else report.get("domain", DEFAULT_DOMAIN)
-                pending.append((func_name, report, domain_to_use))
+                pending.append((func_name, report, selected_domain))
         return pending

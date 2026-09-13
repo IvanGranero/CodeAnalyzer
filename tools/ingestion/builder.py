@@ -71,12 +71,43 @@ class GraphPayloadBuilder:
         )
         return node_id
 
-    def add_uds_handler(self, func_id: str, did_hex: str, operation: str):
+    def add_uds_handler(self, func_id: str, did_hex: str, operation: str, kind: str = "did"):
         uds_id = self.generate_node_id(NodeLabel.UDS_SERVICE, did_hex)
+        normalized_id = str(did_hex).upper().removeprefix("0X")
+        is_routine = kind == "rid"
+        contract = {
+            "kind": kind,
+            "identifier": f"0x{normalized_id}",
+            "operation": operation,
+            "request_layout": None,
+            "source": "name_heuristic",
+            "confidence": "partial",
+            "missing_facts": ["request layout", "request length"],
+        }
+        if is_routine:
+            subfunction = {
+                "Start": "0x01",
+                "Stop": "0x02",
+                "RequestResults": "0x03",
+            }.get(operation)
+            if subfunction is not None:
+                contract["subfunction"] = subfunction
+            contract["missing_facts"].append("control option record layout")
         self._nodes[uds_id] = GraphNode(
-            id=uds_id, labels=[NodeLabel.UDS_SERVICE], properties={"did": did_hex, "name": f"DID_{did_hex}"}
+            id=uds_id,
+            labels=[NodeLabel.UDS_SERVICE],
+            properties={
+                "did": did_hex,
+                "name": f"DID_{did_hex}",
+                "protocol_contract": contract,
+            },
         )
-        self._edges.append(GraphEdge(source_id=func_id, target_id=uds_id, type=EdgeType.HANDLES_UDS, properties={"operation": operation}))
+        self._edges.append(GraphEdge(
+            source_id=func_id,
+            target_id=uds_id,
+            type=EdgeType.HANDLES_UDS,
+            properties={"operation": operation, "kind": kind, "source": "name_heuristic"},
+        ))
 
     def add_network_signal(self, func_id: str, signal_name: str, direction: str):
         sig_id = self.generate_node_id(NodeLabel.NETWORK_SIGNAL, signal_name)
@@ -172,9 +203,19 @@ class GraphPayloadBuilder:
             # Exact match: this variable is a global declared in the same file as the
             # accessing function, so we already know its real node id — no fuzzy
             # name-based resolution needed at ingestion time.
-            self._edges.append(GraphEdge(source_id=func_id, target_id=target_id, type=edge_type, properties={}))
+            self._edges.append(GraphEdge(
+                source_id=func_id,
+                target_id=target_id,
+                type=edge_type,
+                properties={"resolution": "exact"},
+            ))
         else:
-            self._edges.append(GraphEdge(source_id=func_id, target_name=var_name, type=edge_type, properties={}))
+            self._edges.append(GraphEdge(
+                source_id=func_id,
+                target_name=var_name,
+                type=edge_type,
+                properties={"resolution": "fuzzy"},
+            ))
 
     def is_ready_to_flush(self) -> bool:
         return (len(self._nodes) + len(self._edges)) >= self.batch_size

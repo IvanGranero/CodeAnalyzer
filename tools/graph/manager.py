@@ -2,9 +2,10 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from tools.graph.db import GraphDB
-# from tools.graph.resolver import GraphResolver # Removed to fix circular import
+from tools.graph.resolver import GraphResolver
 from tools.graph.nl2cypher import NL2CypherEngine
 from tools.graph.models import GraphNode, GraphEdge, IngestBatch
+from tools.ingestion.joern import JoernExportAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,9 @@ class GraphManager:
         # (USES, Variable, RunnableEntity, RtePort) that didn't match what's actually
         # ingested (READS_VAR/WRITES_VAR, GlobalVariable, HANDLES_UDS), was unreachable
         # from the real scan path, and has been removed rather than left as dead code.
-        # Resolver initialization is done outside or lazily to avoid circular imports.
         self.nl_engine = NL2CypherEngine(self.db, llm_client) if llm_client else None
         self.db.initialize_schema()
+        self.resolver = GraphResolver(self.db)
 
     def close(self):
         self.db.close()
@@ -31,6 +32,12 @@ class GraphManager:
             self._ingest_nodes(node_dicts)
         if edge_dicts:
             self._ingest_edges(edge_dicts)
+
+    def ingest_joern_export(self, path: str, timestamp: str | None = None) -> dict[str, int]:
+        """Ingest security evidence exported from Joern without importing its CPG."""
+        batch = JoernExportAdapter.from_file(path, timestamp=timestamp)
+        self.ingest_batch(batch)
+        return {"nodes": len(batch.nodes), "edges": len(batch.edges)}
 
     def _ingest_nodes(self, node_dicts: List[Dict[str, Any]]):
         grouped_nodes = {}
@@ -62,6 +69,12 @@ class GraphManager:
         "USES_MACRO": "MacroDefinition",
         "RECEIVES_SIGNAL": "NetworkSignal",
         "SENDS_SIGNAL": "NetworkSignal",
+        "IMPLEMENTS_TASK": "OsTask",
+        "HANDLES_UDS": "UdsService",
+        "OS_LOCK_ACTION": "OsResource",
+        "LOCATED_IN": "Function",
+        "TAINTS": "ASTNode",
+        "RELATED_TO": "GraphNode",
     }
 
     def _ingest_edges(self, edge_dicts: List[Dict[str, Any]]):
@@ -100,7 +113,13 @@ class GraphManager:
                 target_label = self._FUZZY_TARGET_LABEL.get(rel_type, "GraphNode")
                 query_fuzzy = f"""
                 UNWIND $batch AS record
-                MATCH (source:GraphNode {{id: record.source_id}})
+                MERGE (source:GraphNode {{id: record.source_id}})
+                ON CREATE SET source:Stub,
+                              source.name = CASE
+                                  WHEN record.source_id STARTS WITH 'stub::'
+                                  THEN substring(record.source_id, 6)
+                                  ELSE record.source_id
+                              END
                 CALL (record) {{
                     OPTIONAL MATCH (target:{target_label} {{name: record.target_name}})
                     RETURN target

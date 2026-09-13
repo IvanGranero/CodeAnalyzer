@@ -39,12 +39,11 @@ class DcmDidMixin:
         }
         MERGE (u:UdsService {did: entry.did_hex})
         ON CREATE SET u:GraphNode, u.name = "DID_" + entry.did_hex
-        SET u.protocol_contract_json = entry.protocol_contract_json,
-            u.protocol_kind = entry.protocol_kind,
-            u.protocol_identifier = entry.protocol_identifier,
+        SET u.protocol_kind = "did",
+            u.protocol_identifier = "0x" + entry.did_hex,
             u.protocol_source = "dispatch_table",
-            u.protocol_confidence = entry.protocol_confidence,
-            u.protocol_missing_facts = entry.protocol_missing_facts,
+            u.protocol_confidence = "exact",
+            u.protocol_missing_facts = ["request layout", "request length"],
             u.source = "dispatch_table"
         MERGE (f)-[handles:HANDLES_UDS]->(u)
         SET handles.kind = "did", handles.source = "dispatch_table"

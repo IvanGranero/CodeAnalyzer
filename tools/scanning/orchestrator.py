@@ -93,7 +93,7 @@ class ScanOrchestrator:
         """
         vuln_class = candidate.get("vulnerability_class", "unknown")
         try:
-            finding = await self.deep_scan_agent.run(
+            finding = await self.deep_scan_agent.run_with_retries(
                 candidate,
                 graph_json,
                 graph_summary,
@@ -101,6 +101,7 @@ class ScanOrchestrator:
                 directive,
                 follow_up_context,
                 target_func,
+                max_attempts=2,
             )
             return self._reconcile_single_finding(finding, graph_json)
         except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
@@ -124,7 +125,6 @@ class ScanOrchestrator:
     def _get_target_source(self, func_name: str) -> str:
         query = """
         MATCH (f:Function {name: $func_name}) 
-        WHERE NOT f.storage_uri ENDS WITH '.h'
         RETURN f.storage_uri AS uri, f.byte_span AS span LIMIT 1
         """
         try:
@@ -142,12 +142,17 @@ class ScanOrchestrator:
         metadata_value = self.tools_engine.get_function_metadata(target_function_name)
         if isinstance(metadata_value, str):
             try:
-                metadata_list = json.loads(metadata_value)
+                metadata_value = json.loads(metadata_value)
             except json.JSONDecodeError:
-                metadata_list = ast.literal_eval(metadata_value)
+                metadata_value = ast.literal_eval(metadata_value)
         else:
-            metadata_list = metadata_value
-        metadata = metadata_list[0] if isinstance(metadata_list, list) and metadata_list else {}
+            metadata_value = metadata_value
+        if isinstance(metadata_value, dict):
+            metadata = metadata_value.get("metadata", metadata_value)
+        elif isinstance(metadata_value, list):
+            metadata = metadata_value[0] if metadata_value else {}
+        else:
+            metadata = {}
         source_code = self._get_target_source(target_function_name)
         graph_json, graph_summary = self.graph_resolver.serialize_function_neighborhood(
             target_function_name
@@ -443,7 +448,17 @@ class ScanOrchestrator:
             "variable_access": graph_payload.get("variable_access", []),
             "concurrency": graph_payload.get("concurrency", {}),
             "deep_scan_findings": findings,
-                    "protocol_contract": graph_payload.get("protocol_contract", {}),
+            "protocol_contract": graph_payload.get("protocol_contract", {}),
+            "graph_flags": {
+                key: (graph_payload.get("function") or {}).get(key)
+                for key in (
+                    "tainted_by_uds", "reachable_dids", "is_dead_code",
+                    "has_data_race_risk", "is_hardware_entry", "is_vendor_library",
+                )
+                if key in (graph_payload.get("function") or {})
+            },
+            "rte_data_flows": graph_payload.get("rte_data_flows", []),
+            "memory_sink_paths": graph_payload.get("sinks", []),
         }
 
         return ExploitContext.model_validate({
@@ -472,7 +487,10 @@ class ScanOrchestrator:
                 "candidates": candidates,
             },
             "evidence": {
-                                "protocol_contract": graph_payload.get("protocol_contract", {}),
+                "protocol_contract": graph_payload.get("protocol_contract", {}),
+                "graph_flags": evidence_bundle["graph_flags"],
+                "rte_data_flows": evidence_bundle["rte_data_flows"],
+                "memory_sink_paths": evidence_bundle["memory_sink_paths"],
                 "tainted_by_uds": bool(metadata.get("TaintedByUDS")),
                 "all_findings_count": len(findings),
                 "supported_findings_count": sum(

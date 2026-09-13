@@ -16,12 +16,14 @@ class RunnableBindingMixin:
 
         # Phase 1: Merge the explicit JSON Stubs
         json_bind_query = """
-        MATCH (s:Stub)-[r:IMPLEMENTS_TASK]->(t)
-        WHERE s.name STARTS WITH 'Rte_' OR s.name STARTS WITH 'Runnable_'
+        MATCH (s:GraphNode)-[r:IMPLEMENTS_TASK]->(t:OsTask)
+        WHERE s.name IS NOT NULL
         MATCH (f:Function {name: s.name})
         MERGE (f)-[rel:IMPLEMENTS_TASK]->(t)
         SET rel = properties(r)
-        DELETE r, s
+        // Keep the late-binding source stub. It may carry other configuration
+        // evidence or relationships, so deleting it can fail or destroy provenance.
+        DELETE r
         RETURN count(rel) AS explicit_bindings
         """
 

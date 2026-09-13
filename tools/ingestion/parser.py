@@ -59,6 +59,7 @@ class ASTParser:
         )
 
     def parse_file(self, filepath: str, is_vendor_code: bool = False):
+        self._node_cache = {}
         try:
             with open(filepath, 'rb') as f:
                 raw_code = f.read()
@@ -189,9 +190,18 @@ class ASTParser:
             if "_DID_" in func_name or "_RID_" in func_name:
                 parts = func_name.split("_DID_") if "_DID_" in func_name else func_name.split("_RID_")
                 if len(parts) > 1:
-                    did_hex = parts[1][:4] 
-                    operation = "Read" if "Read" in func_name else ("Write" if "Write" in func_name else "Unknown")
-                    self.builder.add_uds_handler(func_id, did_hex, operation)
+                    raw_identifier = parts[1].split("_", 1)[0]
+                    # AUTOSAR DIDs and RIDs are two-byte identifiers. Some
+                    # generated symbols include a wider padded/vendor prefix;
+                    # retain the protocol identifier's final four hex digits.
+                    did_hex = raw_identifier[-4:]
+                    operation = (
+                        "Read" if "Read" in func_name else
+                        "Write" if "Write" in func_name else
+                        next((name for name in ("Start", "Stop", "RequestResults") if name in func_name), "Unknown")
+                    )
+                    kind = "rid" if "_RID_" in func_name else "did"
+                    self.builder.add_uds_handler(func_id, did_hex, operation, kind)
                 
             if "RxIndication" in func_name or "TxConfirmation" in func_name:
                 direction = "RX" if "RxIndication" in func_name else "TX"
@@ -268,6 +278,10 @@ class ASTParser:
                 self.builder.add_var_access_edge(caller_id, var_name, is_write, target_id=target_id)
 
     def _find_nodes_of_type(self, node, target_type):
+        cache_key = (id(node), target_type)
+        cached = self._node_cache.get(cache_key)
+        if cached is not None:
+            return cached
         results = []
         stack = [node]
         while stack:
@@ -276,6 +290,7 @@ class ASTParser:
                 results.append(current)
             for child in current.children:
                 stack.append(child)
+        self._node_cache[cache_key] = results
         return results
 
     def _extract_function_name(self, func_node, source_code: bytes):

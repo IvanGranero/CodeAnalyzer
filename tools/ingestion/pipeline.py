@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 from pathlib import Path
+from typing import Any
 from tools.graph.manager import GraphManager
 from tools.ingestion.builder import GraphPayloadBuilder
 from tools.ingestion.parser import ASTParser
@@ -28,7 +29,7 @@ class IngestionPipeline:
             ".json": self.rte_json_parser,
         })
 
-    def run(self, vendor_folders: list = None, config_files: list = None):
+    def run(self, vendor_folders: list = None, config_files: list = None) -> dict[str, Any]:
         if vendor_folders is None:
             vendor_folders = []
         if config_files is None:
@@ -37,31 +38,56 @@ class IngestionPipeline:
         vendor_folders_normalized = [vf.strip().strip('/\\').lower() for vf in vendor_folders]
         
         logger.info(f"Starting pipeline. Tagging Vendor/Generated folders: {vendor_folders_normalized}")
+        report: dict[str, Any] = {
+            "config_files_seen": 0,
+            "config_files_parsed": 0,
+            "config_files_missing": [],
+            "config_files_outside_target": [],
+            "config_files_unsupported": [],
+            "source_files_seen": 0,
+            "source_files_parsed": 0,
+            "source_files_failed": [],
+        }
         
         # --- 1. PARSE CONFIG FILES (ARXML, JSON, etc.) FIRST ---
         if config_files:
             logger.info(f"Parsing {len(config_files)} OS/System configuration files...")
+            report["config_files_seen"] = len(config_files)
             
             for config_file in config_files:
                 normalized_config_path = os.path.normpath(config_file)
-                full_path = os.path.join(self.target_dir, normalized_config_path)
+                target_root = Path(self.target_dir).resolve()
+                full_path = (target_root / normalized_config_path).resolve()
+                try:
+                    full_path.relative_to(target_root)
+                except ValueError:
+                    logger.warning("Config file is outside target directory: %s", config_file)
+                    report["config_files_outside_target"].append(config_file)
+                    continue
                 
-                if os.path.exists(full_path):
+                if full_path.exists():
                     logger.debug(f"Parsing config: {config_file}")
-                    self.config_dispatcher.parse(Path(full_path))
-                    self._check_and_flush()
+                    config_path = Path(full_path)
+                    if self.config_dispatcher.parse(config_path):
+                        report["config_files_parsed"] += 1
+                        self._check_and_flush()
+                    else:
+                        report["config_files_unsupported"].append(config_file)
+                        logger.warning("No parser registered for config file: %s", config_file)
                 else:
                     logger.warning(f"Config file not found on disk: {full_path}")
+                    report["config_files_missing"].append(config_file)
 
         # --- 2. PARSE C/C++ SOURCE CODE ---
         all_files = discover_source_files(self.target_dir)
                     
         total_files = len(all_files)
+        report["source_files_seen"] = total_files
         logger.info(f"Discovered {total_files} C/C++ files to parse.")
 
         print("")
         for idx, filepath in enumerate(all_files, 1):
-            percent = (idx / total_files) * 100
+            percent = (idx / total_files) * 100 if total_files else 100
             
             is_vendor_code = is_vendor_file(filepath, set(vendor_folders_normalized))
             
@@ -73,8 +99,10 @@ class IngestionPipeline:
                 
             try:
                 self.parser.parse_file(str(filepath), is_vendor_code)
+                report["source_files_parsed"] += 1
             except Exception as e:
                 print(f"\n❌ Crash while parsing {short_path}: {e}")
+                report["source_files_failed"].append({"file": str(filepath), "error": str(e)})
             
             self._check_and_flush()
 
@@ -85,6 +113,26 @@ class IngestionPipeline:
             self.graph_manager.ingest_batch(final_batch)
             
         logger.info("Ingestion pipeline finished.")
+        if (
+            report["config_files_missing"]
+            or report["config_files_outside_target"]
+            or report["config_files_unsupported"]
+            or report["source_files_failed"]
+        ):
+            logger.warning(
+                "Ingestion completed with partial coverage: %d missing configs, %d outside-target configs, %d unsupported configs, %d source parse failures",
+                len(report["config_files_missing"]),
+                len(report["config_files_outside_target"]),
+                len(report["config_files_unsupported"]),
+                len(report["source_files_failed"]),
+            )
+        else:
+            logger.info(
+                "Ingestion coverage complete: %d config files and %d source files processed",
+                report["config_files_parsed"],
+                report["source_files_parsed"],
+            )
+        return report
 
     def _check_and_flush(self):
         if self.builder.is_ready_to_flush():

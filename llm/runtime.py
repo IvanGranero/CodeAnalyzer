@@ -93,11 +93,22 @@ class CallBinder:
         if unknown and schema.get("additionalProperties", False) is False:
             raise ValueError(f"tool '{name}' received unknown arguments: {unknown}")
         for key, value in arguments.items():
-            expected = properties.get(key, {}).get("type")
+            property_schema = properties.get(key, {})
+            expected = property_schema.get("type")
             if expected == "string" and not isinstance(value, str):
                 raise ValueError(f"tool '{name}' argument '{key}' must be a string")
             if expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
                 raise ValueError(f"tool '{name}' argument '{key}' must be an integer")
+            allowed = property_schema.get("enum")
+            if allowed is not None and value not in allowed:
+                raise ValueError(f"tool '{name}' argument '{key}' must be one of {allowed}")
+            if expected == "integer":
+                minimum = property_schema.get("minimum")
+                maximum = property_schema.get("maximum")
+                if minimum is not None and value < minimum:
+                    raise ValueError(f"tool '{name}' argument '{key}' must be >= {minimum}")
+                if maximum is not None and value > maximum:
+                    raise ValueError(f"tool '{name}' argument '{key}' must be <= {maximum}")
 
 
 class ToolInvoker:

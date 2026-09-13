@@ -5,7 +5,6 @@ from llm.service import LLMService
 from llm.router import TieredLLMService
 from llm.runtime import AgentRuntime
 from tools.graph.manager import GraphManager
-from tools.graph.resolver import GraphResolver
 from config import settings
 from llm.tracker import TokenTracker
 
@@ -44,7 +43,6 @@ def build_app_context() -> AppContext:
         user=settings.neo4j_user,
         password=settings.neo4j_password,
     )
-    graph.resolver = GraphResolver(graph.db)
     llm = TieredLLMService(cheap_llm, strong_llm)
     return AppContext(llm=llm, runtime=AgentRuntime(llm), graph=graph)
 

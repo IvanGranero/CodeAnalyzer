@@ -14,6 +14,11 @@ class EdgeType(str, Enum):
     IMPLEMENTS_TASK = "IMPLEMENTS_TASK" 
     DEPENDS_ON_TYPE = "DEPENDS_ON_TYPE"  
     USES_MACRO = "USES_MACRO"          
+    OS_LOCK_ACTION = "OS_LOCK_ACTION"
+    RTE_DATA_FLOW = "RTE_DATA_FLOW"
+    RELATED_TO = "RELATED_TO"
+    TAINTS = "TAINTS"
+    LOCATED_IN = "LOCATED_IN"
 
 class NodeLabel(str, Enum):
     GRAPH_NODE = "GraphNode" 
@@ -27,6 +32,7 @@ class NodeLabel(str, Enum):
     OS_TASK = "OsTask"
     OS_ISR = "OsIsr"
     OS_RESOURCE = "OsResource"
+    STUB = "Stub"
     # A single (function_name, did_hex) pair scraped from a generated Dcm DID
     # dispatch table (e.g. Dcm_Lcfg.c's Dcm_CfgDidMgrSignalOpClassInfo[]). This is raw,
     # unresolved evidence -- graph/resolver.py's _resolve_dcm_did_table_entries later
@@ -35,6 +41,9 @@ class NodeLabel(str, Enum):
     # value) so this authoritative, name-convention-independent signal survives
     # ingestion batching/flushing the same way every other extracted fact does.
     DCM_DID_TABLE_ENTRY = "DcmDidTableEntry"
+    VULNERABILITY_CANDIDATE = "VulnerabilityCandidate"
+    TAINT_PATH = "TaintPath"
+    AST_NODE = "ASTNode"
 
 class GraphNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
