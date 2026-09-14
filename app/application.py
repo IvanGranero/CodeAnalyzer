@@ -2,9 +2,9 @@
 
 import asyncio
 import inspect
+import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -69,17 +69,17 @@ class ScanApplication:
         context: AppContext,
         *,
         reporter: ScanReporter | None = None,
-        cache_dir: str = "scan_cache",
-        report_dir: str = "reports",
+        cache_dir: str | os.PathLike[str] = "scan_cache",
+        report_dir: str | os.PathLike[str] = "reports",
         event_sink: EventSink | None = None,
         output: Callable[[str], None] | None = print,
         domain_selector: DomainSelector = select_domain,
         confirm: Confirmation | None = None,
     ) -> None:
         self.context = context
-        self.reporter = reporter or ScanReporter(output_dir=report_dir)
-        self.cache_dir = cache_dir
-        self.report_dir = report_dir
+        self.cache_dir = Path(cache_dir)
+        self.report_dir = Path(report_dir)
+        self.reporter = reporter or ScanReporter(output_dir=str(self.report_dir))
         self.event_sink = event_sink
         self.output = output
         self.domain_selector = domain_selector
@@ -95,9 +95,6 @@ class ScanApplication:
     async def run(self, request: ScanRequest) -> ScanResult:
         """Run either the normal pipeline or direct exploit validation."""
         self.session.task = asyncio.current_task()
-        audit_context = f"run_{uuid.uuid4().hex}"
-        if hasattr(self.context.llm, "set_audit_context"):
-            self.context.llm.set_audit_context(audit_context)
         try:
             source_directory = request.source_directory.resolve()
             if not source_directory.is_dir():
@@ -126,9 +123,6 @@ class ScanApplication:
                 AppEvent(phase="application", kind=EventKind.CANCELLED)
             )
             return ScanResult(reports=self._current_reports, cancelled=True)
-        finally:
-            if hasattr(self.context.llm, "set_audit_context"):
-                self.context.llm.set_audit_context(None)
 
     def _emit(self, event: AppEvent) -> None:
         if self.event_sink is not None:
@@ -158,11 +152,18 @@ class ScanApplication:
         return value
 
     async def _run_exploit_only(self, report_path: Path) -> ScanResult:
+        discovery_path = self.cache_dir / "discovery_config.json"
+        discovery_config = {}
+        if discovery_path.exists():
+            with discovery_path.open("r", encoding="utf-8") as stream:
+                discovery_config = json.load(stream)
         exploit_phase = ExploitPhase(
             self.context.runtime,
             cache_dir=self.report_dir,
             event_sink=self.event_sink,
             graph_manager=self.context.graph,
+            vendor_folders=discovery_config.get("vendor_folders", []),
+            application_roots=discovery_config.get("application_roots", []),
         )
         self._active_exploit_phase = exploit_phase
         results = await exploit_phase.run_standalone(str(report_path))
@@ -220,6 +221,8 @@ class ScanApplication:
             self.context.runtime,
             self.context.graph,
             platform_info=platform_info,
+            vendor_folders=config_json.get("vendor_folders", []),
+            application_roots=config_json.get("application_roots", []),
         )
         scan_service = ScanService(orchestrator)
         selected_domain = await self._resolve_interaction(
@@ -262,6 +265,8 @@ class ScanApplication:
             skip=request.skip_exploit,
             event_sink=self.event_sink,
             graph_manager=self.context.graph,
+            vendor_folders=config_json.get("vendor_folders", []),
+            application_roots=config_json.get("application_roots", []),
         )
         self._active_exploit_phase = exploit_phase
         scan_phase = ScanPhase(

@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, TypeVar
@@ -17,10 +18,10 @@ UsageCallback = Callable[[Mapping[str, Any], float], None | Awaitable[None]]
 
 class LLMClient:
     def __init__(
-        self, 
-        api_key: str, 
-        model_name: str, 
-        base_url: str, 
+        self,
+        api_key: str,
+        model_name: str,
+        base_url: str,
         default_headers: str = "",
         extra_query: str = "",
         audit_log_dir: str = "logs/llm_audit"
@@ -34,16 +35,16 @@ class LLMClient:
         self.extra_query = self._parse_pairs(extra_query)
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
-        
+
         self._use_legacy_endpoint = False
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_audit_file = os.path.join(self.audit_log_dir, f"llm_session_{timestamp}.txt")
-                
+
         self.clients = []
         for key in self.api_keys:
             headers = self.default_headers.copy()
             query_params = self.extra_query.copy()
-                
+
             self.clients.append(
                 AsyncOpenAI(
                     base_url=self.base_url,
@@ -53,7 +54,7 @@ class LLMClient:
                     timeout=300.0
                 )
             )
-            
+
         self._current_index = 0
         logger.info(f"Initialized {self.model_name} LLMClient with {len(self.clients)} keys.")
 
@@ -75,9 +76,11 @@ class LLMClient:
     ) -> None:
         """Saves the exact API payload and response to disk for debugging/auditing."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(c for c in (context_id or "unknown_target") if c.isalnum() or c in "_-")
-        filename = os.path.join(self.audit_log_dir, f"llm_audit_{safe_name}.txt")
-        
+        context = context_id or "unknown_target"
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in context)
+        digest = hashlib.sha256(context.encode("utf-8")).hexdigest()[:12]
+        filename = os.path.join(self.audit_log_dir, f"{safe_name}-{digest}.txt")
+
         log_content = (
             f"==================================================\n"
             f"TIMESTAMP: {timestamp}\n"
@@ -117,10 +120,10 @@ class LLMClient:
     ) -> tuple[str, dict[str, Any]]:
         """Generate a response using the configured endpoint and tool handler."""
         model_settings = model_settings or {}
-            
+
         client = self.clients[self._current_index]
         self._current_index = (self._current_index + 1) % len(self.clients)
-        
+
         if self._use_legacy_endpoint:
             return await self._execute_legacy_chat(
                 client, system_prompt, user_prompt, model_settings,
@@ -260,12 +263,12 @@ class LLMClient:
     ) -> tuple[str, dict[str, Any]]:
         kwargs_chat = {
             "model": self.model_name,
-            "messages": [ 
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ]
         }
-        
+
         if "max_completion_tokens" in model_settings:
             kwargs_chat["max_completion_tokens"] = model_settings["max_completion_tokens"]
         elif "max_tokens" in model_settings:
@@ -283,7 +286,7 @@ class LLMClient:
                 }}
                 for tool in tools
             ]
-            
+
         response, tool_calls = await self._retry_request(
             lambda: self._request_legacy_chat(client, kwargs_chat, tool_handler),
             endpoint="/chat/completions",

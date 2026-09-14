@@ -23,7 +23,8 @@ class DiscoveryPhase:
         if self.used_cache(skip_ingest):
             logger.info("--- PHASE 1: Skipped (using cached discovery config) ---")
             with open(self.cache_file, 'r') as f:
-                return json.load(f)
+                config_json = json.load(f)
+            return self._normalize_scope(config_json, target_directory)
 
         logger.info("--- PHASE 1: Starting Architectural Discovery ---")
         dir_tree = RepoDiscoverer.generate_directory_tree(target_directory)
@@ -46,6 +47,7 @@ class DiscoveryPhase:
         config_json.setdefault("stack_vendor_guess", config_json.get("stack_vendor", "Unknown vendor"))
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
         config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
+        config_json.setdefault("application_root_guesses", config_json.get("application_roots", []))
         config_json["config_file_extensions"] = self._merge_discovery_rules(
             config_json.get("config_file_extensions"),
             RepoDiscoverer.DEFAULT_CONFIG_EXTENSIONS,
@@ -64,7 +66,7 @@ class DiscoveryPhase:
             if os.path.splitext(path)[1].lower() in RepoDiscoverer.SUPPORTED_CONFIG_EXTENSIONS
         ]
         config_json["ignored_config_candidates"] = len(discovered_config_files) - len(config_json["config_files"])
-        config_json["vendor_folders"] = config_json["likely_vendor_folders"]
+        config_json = self._normalize_scope(config_json, target_directory)
         config_json["app_domains"] = config_json["app_domain_guesses"]
         config_json["stack_vendor"] = config_json["stack_vendor_guess"]
 
@@ -74,6 +76,48 @@ class DiscoveryPhase:
         found_configs = config_json.get('config_files', [])
         if found_configs:
             logger.info(f"Discovery found {len(found_configs)} system configuration files.")
+        return config_json
+
+    @staticmethod
+    def _normalize_scope(config_json: dict, target_directory: str) -> dict:
+        """Make the vendor boundary deterministic even when the model under-infers it."""
+        vendor_folders = config_json.get("likely_vendor_folders", config_json.get("vendor_folders", []))
+        if not isinstance(vendor_folders, list):
+            vendor_folders = []
+        normalized = [str(folder).strip().strip('/\\') for folder in vendor_folders if str(folder).strip()]
+        stack_vendor = str(config_json.get("stack_vendor_guess", config_json.get("stack_vendor", ""))).strip()
+        target_names = set()
+        if os.path.isdir(target_directory):
+            target_names = {
+                entry.name.lower()
+                for entry in os.scandir(target_directory)
+                if entry.is_dir()
+            }
+        if stack_vendor and stack_vendor.lower() in target_names:
+            normalized.append(stack_vendor)
+        seen = set()
+        config_json["vendor_folders"] = [
+            folder for folder in normalized
+            if not (folder.lower() in seen or seen.add(folder.lower()))
+        ]
+        config_json["likely_vendor_folders"] = config_json["vendor_folders"]
+        app_roots = config_json.get("application_root_guesses", config_json.get("application_roots", []))
+        if not isinstance(app_roots, list):
+            app_roots = []
+        config_json["application_roots"] = [
+            str(folder).strip().strip('/\\')
+            for folder in app_roots
+            if (
+                str(folder).strip()
+                and str(folder).strip().strip('/\\').lower() in target_names
+                and str(folder).strip().strip('/\\').lower() not in {
+                    vendor.lower() for vendor in config_json["vendor_folders"]
+                }
+            )
+        ]
+        if not config_json["application_roots"] and "app" in target_names:
+            config_json["application_roots"] = ["app"]
+        config_json["application_root_guesses"] = config_json["application_roots"]
         return config_json
 
     @staticmethod

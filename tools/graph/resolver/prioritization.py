@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class PrioritizationMixin:
     """Deterministic (non-LLM) selection of the highest-risk scan targets."""
 
-    def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None) -> list:
+    def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None, vendor_folders: list[str] | None = None, application_roots: list[str] | None = None) -> list:
         # domain_filter/file_filter previously reached Cypher via f-string interpolation
         # (a Cypher-injection vector -- both values can originate from CLI args / the
         # Phase-1 discovery LLM output). Bound as query parameters instead; only the
@@ -24,6 +24,12 @@ class PrioritizationMixin:
         if file_filter:
             params["file_basename"] = os.path.basename(file_filter)
             cypher_filter += " AND f.storage_uri CONTAINS $file_basename"
+
+        params["vendor_folders"] = vendor_folders or []
+        cypher_filter += " AND NOT any(folder IN $vendor_folders WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
+        if application_roots:
+            params["application_roots"] = application_roots
+            cypher_filter += " AND any(folder IN $application_roots WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
 
         query = f"""
         MATCH (f:Function)

@@ -32,12 +32,14 @@ class ScanContext:
 class ScanOrchestrator:
     _MAX_TRIAGE_ATTEMPTS = 3
 
-    def __init__(self, runtime: AgentRuntime, graph_manager: GraphManager, platform_info: str = "Unknown Platform"):
+    def __init__(self, runtime: AgentRuntime, graph_manager: GraphManager, platform_info: str = "Unknown Platform", vendor_folders: list[str] | None = None, application_roots: list[str] | None = None):
         self.runtime = runtime
         self.graph_resolver = graph_manager.resolver
         self.tools_engine = AnalyzerTools(graph_manager)
         self.tool_registry = ReadOnlyToolRegistry(self.tools_engine)
         self.platform_info = platform_info
+        self.vendor_folders = [str(folder).strip().strip('/\\').lower() for folder in (vendor_folders or []) if str(folder).strip()]
+        self.application_roots = [str(folder).strip().strip('/\\').lower() for folder in (application_roots or []) if str(folder).strip()]
         self.candidate_scheduler = CandidateScheduler()
         self.triage_agent = TriageAgent(self.runtime, self._extract_json_object)
         self.deep_scan_agent = DeepScanAgent(self.runtime, self._extract_json_object)
@@ -45,7 +47,7 @@ class ScanOrchestrator:
     def usage_snapshot(self):
         """Return the centralized usage ledger, including phase totals."""
         return self.runtime.tracker.snapshot()
-        
+
     def _extract_json_object(self, response_text: str) -> dict[str, Any]:
         return extract_json_object(response_text)
 
@@ -66,7 +68,7 @@ class ScanOrchestrator:
             except ValueError:
                 logger.warning("Ignoring malformed triage candidate: %r", value)
         return candidates
-    
+
     async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> dict[str, Any]:
         return await run_triage(
             self.triage_agent,
@@ -124,8 +126,12 @@ class ScanOrchestrator:
 
     def _get_target_source(self, func_name: str) -> str:
         query = """
-        MATCH (f:Function {name: $func_name}) 
-        RETURN f.storage_uri AS uri, f.byte_span AS span LIMIT 1
+        MATCH (f:Function {name: $func_name})
+        RETURN f.storage_uri AS uri, f.byte_span AS span
+        ORDER BY coalesce(f.is_vendor_code, false),
+             CASE WHEN f.storage_uri ENDS WITH '.c' OR f.storage_uri ENDS WITH '.cpp' THEN 0 ELSE 1 END,
+             f.storage_uri
+        LIMIT 1
         """
         try:
             with self.tools_engine.db.driver.session() as session:
@@ -514,4 +520,6 @@ class ScanOrchestrator:
             max_targets,
             domain_filter,
             file_filter,
+            vendor_folders=self.vendor_folders,
+            application_roots=self.application_roots,
         )

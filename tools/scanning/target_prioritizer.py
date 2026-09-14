@@ -12,6 +12,8 @@ async def prioritize_targets(
     max_targets: int,
     domain_filter: str | None = None,
     file_filter: str | None = None,
+    vendor_folders: list[str] | None = None,
+    application_roots: list[str] | None = None,
 ) -> list[str]:
     """Select scan targets through the graph resolver without LLM ranking."""
     logger.info(
@@ -25,6 +27,8 @@ async def prioritize_targets(
             max_targets=max_targets,
             domain_filter=domain_filter,
             file_filter=file_filter,
+            vendor_folders=vendor_folders,
+            application_roots=application_roots,
         )
         logger.info("Target selection complete: %d targets", len(targets))
         return targets

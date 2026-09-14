@@ -51,8 +51,6 @@ class GraphDB:
         tx.run("CREATE INDEX typedefinition_name IF NOT EXISTS FOR (n:TypeDefinition) ON (n.name)")
         tx.run("CREATE INDEX macrodefinition_name IF NOT EXISTS FOR (n:MacroDefinition) ON (n.name)")
         tx.run("CREATE INDEX osresource_name IF NOT EXISTS FOR (n:OsResource) ON (n.name)")
-        tx.run("CREATE INDEX joern_source IF NOT EXISTS FOR (n) ON (n.source)")
-        tx.run("CREATE INDEX joern_file_line IF NOT EXISTS FOR (n:ASTNode) ON (n.file, n.line)")
 
     def ingest_batched(self, query: str, records: List[Dict[str, Any]], batch_size: int = 5000, max_retries: int = 5, base_delay: float = 2.0):
         total_records = len(records)

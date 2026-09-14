@@ -118,6 +118,9 @@ class SerializationMixin:
             variable_access: var_access,
             sanitizers: sanitizers
         } AS payload
+        ORDER BY coalesce(f.is_vendor_code, false),
+             CASE WHEN f.storage_uri ENDS WITH '.c' OR f.storage_uri ENDS WITH '.cpp' THEN 0 ELSE 1 END,
+             f.storage_uri
         LIMIT 1
         """
 
@@ -504,8 +507,8 @@ class SerializationMixin:
             "target_function": func_name,
             "contracts": contracts,
             "missing_facts": missing_facts,
-            "session_requirements": {"status": "unknown", "values": [], "missing_fact": "required diagnostic session"},
-            "security_requirements": {"status": "unknown", "values": [], "missing_fact": "required security level"},
+            "session_requirements": {"status": "unknown", "values": [], "missing_fact": "required diagnostic session", "enforcement": "preflight"},
+            "security_requirements": {"status": "unknown", "values": [], "missing_fact": "required security level", "enforcement": "preflight"},
             "response_oracle": {
                 "positive_response": "service byte + 0x40",
                 "negative_response": "0x7F service byte nrc",

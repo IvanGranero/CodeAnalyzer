@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class AnalyzerTools:
     """Deterministic tools exposed to the AnalyzerAgent for exploring the codebase."""
-    
+
     def __init__(self, graph_manager: GraphManager):
         self.db = graph_manager.db
         self.graph_resolver = graph_manager.resolver
@@ -99,6 +99,9 @@ class AnalyzerTools:
                did_details AS DidDetails,
                coalesce(f.is_vendor_code, false) AS IsVendorLibrary,
                f:Stub AS IsStubNode
+        ORDER BY coalesce(f.is_vendor_code, false),
+             CASE WHEN f.storage_uri ENDS WITH '.c' OR f.storage_uri ENDS WITH '.cpp' THEN 0 ELSE 1 END,
+             f.storage_uri
         LIMIT 1
         """
         try:
@@ -134,7 +137,7 @@ class AnalyzerTools:
         """Returns the source code snippet for a struct, enum, or typedef definition."""
         if self._check_cache("get_type_definition", type_name):
             return f"System Note: You have already requested the definition for type '{type_name}'."
-        
+
         query = "MATCH (t:TypeDefinition {name: $type_name}) RETURN t.storage_uri AS uri, t.byte_span AS span LIMIT 1"
         try:
             result = self._query_single(query, type_name=type_name)
