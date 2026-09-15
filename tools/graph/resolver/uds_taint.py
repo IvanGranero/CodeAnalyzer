@@ -31,7 +31,8 @@ class UdsTaintMixin:
         #  UdsService node instead of each getting an unrelated stand-in id.
         map_uds_query = """
         MATCH (f:Function)
-        WHERE f.name CONTAINS "_DID_" OR f.name CONTAINS "_RID_"
+                WHERE NOT (f)-[:HANDLES_UDS {source: "dispatch_table"}]->()
+                    AND (f.name CONTAINS "_DID_" OR f.name CONTAINS "_RID_"
            OR (
                 (f.name CONTAINS "DID" OR f.name CONTAINS "RID")
                 AND (
@@ -40,7 +41,7 @@ class UdsTaintMixin:
                      f.name ENDS WITH "_ConditionCheckWrite" OR f.name ENDS WITH "_Start" OR
                      f.name ENDS WITH "_Stop" OR f.name ENDS WITH "_RequestResults"
                 )
-              )
+              ))
           WITH f,
                  CASE
                 WHEN f.name CONTAINS "_DID_" THEN substring(split(f.name, "_DID_")[1], 0, 4)

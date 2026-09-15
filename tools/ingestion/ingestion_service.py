@@ -13,6 +13,7 @@ class IngestionService:
         report = IngestionPipeline(target_directory, graph).run(
             vendor_folders=config.get("vendor_folders", []),
             config_files=config.get("config_files", []),
+            vendor_parse_mode=config.get("vendor_parse_mode", "full"),
         )
         graph.resolver.run_all_passes()
         return report

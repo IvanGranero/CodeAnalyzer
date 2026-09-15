@@ -1,3 +1,4 @@
+from email.mime import message
 import os
 import json
 import logging
@@ -298,7 +299,15 @@ class LLMClient:
             lambda: self._request_legacy_chat(client, kwargs_chat, tool_handler),
             endpoint="/chat/completions",
         )
-        final_text = response.choices[0].message.content
+        message = response.choices[0].message
+        final_text = message.content
+        if not final_text:
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content:
+                logger.warning(
+                    "[LLM] Legacy response content was empty; using reasoning_content."
+                )
+                final_text = reasoning_content
         if final_text is None:
             raise RuntimeError("Legacy model returned no assistant message.")
         self._audit_log(
@@ -320,7 +329,7 @@ class LLMClient:
         for _ in range(4):
             response = await client.chat.completions.create(
                 **{**request_kwargs, "messages": router.messages}
-            )
+            )    
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
             if not tool_calls:

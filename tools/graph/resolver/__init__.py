@@ -76,12 +76,47 @@ class GraphResolver(
         ]
         failures = []
         for pass_fn in passes:
+            pass_name = pass_fn.__name__
+            before = self._relationship_counts()
+            logger.debug(
+                "Resolver pass %s before: relationships=%d by_type=%s",
+                pass_name,
+                before["total"],
+                before["by_type"],
+            )
             try:
                 pass_fn()
             except Exception as e:
                 failures.append((pass_fn.__name__, e))
+            after = self._relationship_counts()
+            logger.debug(
+                "Resolver pass %s after: relationships=%d delta=%+d by_type=%s",
+                pass_name,
+                after["total"],
+                after["total"] - before["total"],
+                after["by_type"],
+            )
         if failures:
             summary = "; ".join(f"{name}: {err}" for name, err in failures)
             logger.error(f"=== Graph Resolution FAILED for {len(failures)} pass(es): {summary} ===")
             raise RuntimeError(f"Graph resolution failed for pass(es): {summary}")
         logger.info("=== Graph Resolution Complete ===")
+
+    def _relationship_counts(self) -> dict[str, Any]:
+        """Return deterministic relationship totals for resolver-stage diagnostics."""
+        query = """
+        MATCH ()-[r]->()
+        RETURN type(r) AS relationship_type, count(r) AS relationship_count
+        ORDER BY relationship_type
+        """
+        try:
+            with self.db.driver.session() as session:
+                rows = session.run(query).data()
+            by_type = {
+                row["relationship_type"]: row["relationship_count"]
+                for row in rows
+            }
+            return {"total": sum(by_type.values()), "by_type": by_type}
+        except Exception as exc:
+            logger.warning("Unable to collect resolver relationship counts: %s", exc)
+            return {"total": -1, "by_type": {}}

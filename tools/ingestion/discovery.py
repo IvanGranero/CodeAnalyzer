@@ -23,6 +23,8 @@ class RepoDiscoverer:
         base_depth = target_dir.rstrip(os.sep).count(os.sep)
         
         for root, dirs, files in os.walk(target_dir):
+            dirs.sort(key=str.casefold)
+            files.sort(key=str.casefold)
             current_depth = root.count(os.sep) - base_depth
             if current_depth > max_depth:
                 del dirs[:]
@@ -92,7 +94,10 @@ class RepoDiscoverer:
             return extension_match
 
         return sorted(
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if path.is_file() and matches(path)
+            (
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file() and matches(path)
+            ),
+            key=str.casefold,
         )

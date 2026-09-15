@@ -118,6 +118,10 @@ class DiscoveryPhase:
         if not config_json["application_roots"] and "app" in target_names:
             config_json["application_roots"] = ["app"]
         config_json["application_root_guesses"] = config_json["application_roots"]
+        vendor_parse_mode = str(config_json.get("vendor_parse_mode", "full")).strip().lower()
+        if vendor_parse_mode not in {"full", "structure", "application_only"}:
+            vendor_parse_mode = "full"
+        config_json["vendor_parse_mode"] = vendor_parse_mode
         return config_json
 
     @staticmethod

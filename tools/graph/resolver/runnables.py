@@ -31,7 +31,6 @@ class RunnableBindingMixin:
         propagate_query = """
         MATCH (entry:Function)-[:IMPLEMENTS_TASK]->(t:OsTask)
         MATCH (entry)-[:CALLS*1..5]->(f:Function)
-        WHERE coalesce(f.is_vendor_code, false) = false
         MERGE (f)-[:IMPLEMENTS_TASK]->(t)
         RETURN count(DISTINCT f) AS propagated_bindings
         """

@@ -29,13 +29,22 @@ class IngestionPipeline:
             ".json": self.rte_json_parser,
         })
 
-    def run(self, vendor_folders: list = None, config_files: list = None) -> dict[str, Any]:
+    def run(
+        self,
+        vendor_folders: list = None,
+        config_files: list = None,
+        vendor_parse_mode: str = "full",
+    ) -> dict[str, Any]:
         if vendor_folders is None:
             vendor_folders = []
         if config_files is None:
             config_files = []
             
         vendor_folders_normalized = [vf.strip().strip('/\\').lower() for vf in vendor_folders]
+        if vendor_parse_mode not in {"full", "structure", "application_only"}:
+            raise ValueError(
+                "vendor_parse_mode must be one of: full, structure, application_only"
+            )
         
         logger.info(f"Starting pipeline. Tagging Vendor/Generated folders: {vendor_folders_normalized}")
         report: dict[str, Any] = {
@@ -47,7 +56,12 @@ class IngestionPipeline:
             "source_files_seen": 0,
             "source_files_parsed": 0,
             "source_files_failed": [],
+            "vendor_files": 0,
+            "application_files": 0,
+            "parser_edges_emitted": 0,
+            "vendor_parse_mode": vendor_parse_mode,
         }
+        self._active_report = report
         
         # --- 1. PARSE CONFIG FILES (ARXML, JSON, etc.) FIRST ---
         if config_files:
@@ -89,7 +103,16 @@ class IngestionPipeline:
         for idx, filepath in enumerate(all_files, 1):
             percent = (idx / total_files) * 100 if total_files else 100
             
-            is_vendor_code = is_vendor_file(filepath, set(vendor_folders_normalized))
+            is_vendor_code = is_vendor_file(
+                filepath,
+                set(vendor_folders_normalized),
+                root=self.target_dir,
+            )
+            if is_vendor_code:
+                report["vendor_files"] += 1
+            else:
+                report["application_files"] += 1
+            parse_vendor_internals = vendor_parse_mode == "full"
             
             indicator = "📦" if is_vendor_code else "🚀"
             short_path = os.path.join(*Path(filepath).parts[-2:])
@@ -98,7 +121,11 @@ class IngestionPipeline:
             sys.stdout.flush()
                 
             try:
-                self.parser.parse_file(str(filepath), is_vendor_code)
+                self.parser.parse_file(
+                    str(filepath),
+                    is_vendor_code,
+                    parse_vendor_internals=parse_vendor_internals,
+                )
                 report["source_files_parsed"] += 1
             except Exception as e:
                 print(f"\n❌ Crash while parsing {short_path}: {e}")
@@ -110,9 +137,17 @@ class IngestionPipeline:
         logger.info("Flushing final graph data to Neo4j...")
         final_batch = self.builder.flush_all()
         if final_batch.nodes or final_batch.edges:
+            report["parser_edges_emitted"] += len(final_batch.edges)
             self.graph_manager.ingest_batch(final_batch)
             
         logger.info("Ingestion pipeline finished.")
+        logger.debug(
+            "Ingestion metrics: vendor_files=%d application_files=%d parser_edges_emitted=%d vendor_parse_mode=%s",
+            report["vendor_files"],
+            report["application_files"],
+            report["parser_edges_emitted"],
+            report["vendor_parse_mode"],
+        )
         if (
             report["config_files_missing"]
             or report["config_files_outside_target"]
@@ -138,4 +173,5 @@ class IngestionPipeline:
         if self.builder.is_ready_to_flush():
             logger.debug("Batch threshold reached. Flushing to Neo4j...")
             batch = self.builder.flush_batch()
+            self._active_report["parser_edges_emitted"] += len(batch.edges)
             self.graph_manager.ingest_batch(batch)

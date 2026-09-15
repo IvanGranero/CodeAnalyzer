@@ -58,7 +58,12 @@ class ASTParser:
             br'[^{}]*?0x([0-9A-Fa-f]+)u\}\s*/\*\s*DID:\s*0x([0-9A-Fa-f]+)\s*\*/'
         )
 
-    def parse_file(self, filepath: str, is_vendor_code: bool = False):
+    def parse_file(
+        self,
+        filepath: str,
+        is_vendor_code: bool = False,
+        parse_vendor_internals: bool = True,
+    ):
         self._node_cache = {}
         try:
             with open(filepath, 'rb') as f:
@@ -94,7 +99,7 @@ class ASTParser:
                 tree = self.parser.parse(source_code)
 
                 # --- This block now skips internal parsing for vendor code ---
-                if not is_vendor_code:
+                if not is_vendor_code or parse_vendor_internals:
                     for child in tree.root_node.children:
                         if child.type == 'declaration':
                             for var_name in self._extract_all_declared_identifiers(child, source_code):
@@ -152,7 +157,7 @@ class ASTParser:
                         found_function_names.add(func_name)
                         
                         # --- OPTIMIZATION: Only process internals for non-vendor code ---
-                        if not is_vendor_code:
+                        if not is_vendor_code or parse_vendor_internals:
                             self._process_function_internals(func_node, source_code, func_id, func_name, file_global_ids)
             except Exception as e:
                 logger.error(f"AST Parsing failed on {filepath}: {e}")
