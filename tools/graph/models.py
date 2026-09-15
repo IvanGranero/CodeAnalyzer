@@ -17,7 +17,6 @@ class EdgeType(str, Enum):
     OS_LOCK_ACTION = "OS_LOCK_ACTION"
     RTE_DATA_FLOW = "RTE_DATA_FLOW"
     RELATED_TO = "RELATED_TO"
-    TAINTS = "TAINTS"
     LOCATED_IN = "LOCATED_IN"
 
 class NodeLabel(str, Enum):
@@ -41,9 +40,6 @@ class NodeLabel(str, Enum):
     # value) so this authoritative, name-convention-independent signal survives
     # ingestion batching/flushing the same way every other extracted fact does.
     DCM_DID_TABLE_ENTRY = "DcmDidTableEntry"
-    VULNERABILITY_CANDIDATE = "VulnerabilityCandidate"
-    TAINT_PATH = "TaintPath"
-    AST_NODE = "ASTNode"
 
 class GraphNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
