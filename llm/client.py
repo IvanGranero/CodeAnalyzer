@@ -161,10 +161,17 @@ class LLMClient:
         except openai.NotFoundError:
             logger.warning("[LLM] /responses returned 404; using /chat/completions.")
             self._use_legacy_endpoint = True
-            return await self._execute_legacy_chat(
-                client, system_prompt, user_prompt, model_settings,
-                context_id, tools, tool_handler, audit_metadata=audit_metadata,
-            )
+            try:
+                return await self._execute_legacy_chat(
+                    client, system_prompt, user_prompt, model_settings,
+                    context_id, tools, tool_handler, audit_metadata=audit_metadata,
+                )
+            except openai.NotFoundError as exc:
+                raise RuntimeError(
+                    f"LLM endpoint not found at '{self.base_url}'. "
+                    "Both /responses and /chat/completions returned 404; "
+                    "check the configured base URL and model endpoint."
+                ) from exc
 
         final_text = self._response_text(response, "Frontier")
         usage_dict = self._usage_dict(response)

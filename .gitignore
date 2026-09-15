@@ -23,7 +23,3 @@ htmlcov/
 build/
 dist/
 .DS_Store
-
-# Joern
-joern.py
-workspace/
