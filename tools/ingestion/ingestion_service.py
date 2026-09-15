@@ -14,8 +14,5 @@ class IngestionService:
             vendor_folders=config.get("vendor_folders", []),
             config_files=config.get("config_files", []),
         )
-        joern_export = config.get("joern_export")
-        if joern_export:
-            report["joern"] = graph.ingest_joern_export(joern_export)
         graph.resolver.run_all_passes()
         return report

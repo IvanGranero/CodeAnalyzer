@@ -335,13 +335,12 @@ class ScanTUI(App[None]):
             )
             await self.application.run(self.request)
         except Exception as exc:
-            logger.exception("Textual scan failed")
+            logger.error("Textual scan stopped: %s", exc)
             self.events.emit(
                 AppEvent(
                     phase="application",
                     kind=EventKind.ERROR,
                     message=f"{type(exc).__name__}: {exc}",
-                    payload={"traceback": traceback.format_exc()},
                 )
             )
 

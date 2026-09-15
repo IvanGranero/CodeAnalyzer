@@ -5,7 +5,6 @@ from tools.graph.db import GraphDB
 from tools.graph.resolver import GraphResolver
 from tools.graph.nl2cypher import NL2CypherEngine
 from tools.graph.models import GraphNode, GraphEdge, IngestBatch
-from tools.ingestion.joern import JoernExportAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +31,6 @@ class GraphManager:
             self._ingest_nodes(node_dicts)
         if edge_dicts:
             self._ingest_edges(edge_dicts)
-
-    def ingest_joern_export(self, path: str, timestamp: str | None = None) -> dict[str, int]:
-        """Ingest security evidence exported from Joern without importing its CPG."""
-        batch = JoernExportAdapter.from_file(path, timestamp=timestamp)
-        self.ingest_batch(batch)
-        return {"nodes": len(batch.nodes), "edges": len(batch.edges)}
 
     def _ingest_nodes(self, node_dicts: List[Dict[str, Any]]):
         grouped_nodes = {}

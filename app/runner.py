@@ -49,7 +49,8 @@ async def run(args) -> None:
         await application.run(request)
     except asyncio.CancelledError:
         logger.info("Main execution was cancelled.")
-    except Exception:
-        logger.exception("An unhandled error occurred during execution:")
+    except Exception as exc:
+        logger.error("Execution stopped: %s", exc)
+        sys.exit(1)
     finally:
         shutdown(app_context)

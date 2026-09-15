@@ -25,11 +25,27 @@ class PrioritizationMixin:
             params["file_basename"] = os.path.basename(file_filter)
             cypher_filter += " AND f.storage_uri CONTAINS $file_basename"
 
-        params["vendor_folders"] = vendor_folders or []
-        cypher_filter += " AND NOT any(folder IN $vendor_folders WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
+        params["vendor_folders"] = [
+            str(folder).strip().strip('/\\').lower()
+            for folder in (vendor_folders or [])
+            if str(folder).strip()
+        ]
+        cypher_filter += (
+            " AND NOT any(folder IN $vendor_folders WHERE "
+            "toLower(f.storage_uri) CONTAINS '/' + folder + '/' OR "
+            "toLower(f.storage_uri) CONTAINS '\\\\' + folder + '\\\\')"
+        )
         if application_roots:
-            params["application_roots"] = application_roots
-            cypher_filter += " AND any(folder IN $application_roots WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
+            params["application_roots"] = [
+                str(folder).strip().strip('/\\').lower()
+                for folder in application_roots
+                if str(folder).strip()
+            ]
+            cypher_filter += (
+                " AND any(folder IN $application_roots WHERE "
+                "toLower(f.storage_uri) CONTAINS '/' + folder + '/' OR "
+                "toLower(f.storage_uri) CONTAINS '\\\\' + folder + '\\\\')"
+            )
 
         query = f"""
         MATCH (f:Function)
