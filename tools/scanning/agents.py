@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from llm.runtime import AgentRuntime
-from tools.scanning.contracts import Finding, TriageResponse, parse_object
+from tools.scanning.contracts import Finding, TriageResponse, VulnerabilityClass, parse_object
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +37,13 @@ class TriageAgent(ScanAgent):
         directive: str,
         follow_up_context: str = "",
         target_func: str = "",
+        enable_tools: bool = True,
     ) -> dict[str, Any]:
         response_text = await self._runtime.execute(
             task_name="triage_agent",
             context_id=target_func,
             kwargs={
+                "target_function": target_func,
                 "graph_json": graph_json,
                 "graph_summary": graph_summary,
                 "source_code": source_code,
@@ -49,10 +51,13 @@ class TriageAgent(ScanAgent):
                 "follow_up_context": follow_up_context,
             },
             settings_override=(
-                {"reasoning_effort": "medium", "max_completion_tokens": 6000}
+                {
+                    "max_completion_tokens": 6000,
+                }
                 if follow_up_context.strip()
                 else None
             ),
+            enable_tools=enable_tools,
         )
         return parse_object(self._extract_json(response_text), TriageResponse).model_dump(mode="json")
 
@@ -77,7 +82,6 @@ class TriageAgent(ScanAgent):
             max_attempts,
         )
 
-
 async def run_triage(
     triage_agent: TriageAgent,
     graph_json: str,
@@ -100,6 +104,7 @@ async def run_triage(
                 retry_directive,
                 follow_up_context,
                 target_func,
+                enable_tools=attempt == 1,
             )
         except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = str(exc)
@@ -112,7 +117,9 @@ async def run_triage(
             )
             retry_directive = (
                 f"{directive}\n\nRETRY {attempt}: Your previous response failed contract validation. "
-                "Return one valid JSON object matching every required triage field. "
+                "The previous turn returned incomplete or non-final JSON. "
+                "Return the complete final decision envelope through the response text. "
+                "Do not call tools, do not return ran_tools/tool_calls metadata, and return one valid JSON object matching every required triage field. "
                 "Do not omit vulnerability_candidates or investigation_directive when escalating."
             )
 
@@ -138,13 +145,20 @@ class DeepScanAgent(ScanAgent):
         directive: str,
         follow_up_context: str = "",
         target_func: str = "",
+        enable_tools: bool = True,
     ) -> dict[str, Any]:
         effort = candidate.get("effort_estimate", "medium")
         settings = {
-            "low": {"reasoning_effort": "low", "max_completion_tokens": 3000},
-            "medium": {"reasoning_effort": "medium", "max_completion_tokens": 6000},
-            "high": {"reasoning_effort": "high", "max_completion_tokens": 10000},
-        }.get(effort, {"reasoning_effort": "medium", "max_completion_tokens": 6000})
+            "low": {"reasoning_effort": "low", "max_completion_tokens": 4096},
+            "medium": {"reasoning_effort": "medium", "max_completion_tokens": 6144},
+            "high": {"reasoning_effort": "medium", "max_completion_tokens": 6144},
+        }.get(effort, {"reasoning_effort": "medium", "max_completion_tokens": 6144})
+        if not enable_tools:
+            settings = {
+                **settings,
+                "reasoning_effort": "low",
+                "max_completion_tokens": max(6000, settings["max_completion_tokens"]),
+            }
         response_text = await self._runtime.execute(
             task_name="deep_scan_agent",
             context_id=f"{target_func}-{candidate.get('vulnerability_class', 'unknown')}",
@@ -158,6 +172,7 @@ class DeepScanAgent(ScanAgent):
                 "follow_up_context": follow_up_context,
             },
             settings_override=settings,
+            enable_tools=enable_tools,
         )
         return parse_object(self._extract_json(response_text), Finding).model_dump(mode="json")
 
@@ -179,6 +194,7 @@ class DeepScanAgent(ScanAgent):
                 return await self.run(
                     candidate, graph_json, graph_summary, source_code,
                     directive, follow_up_context, target_func,
+                    enable_tools=attempt == 1,
                 )
             except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 last_error = str(exc)
@@ -188,6 +204,19 @@ class DeepScanAgent(ScanAgent):
                 )
                 follow_up_context = (
                     f"{follow_up_context}\nRETRY {attempt}: Return one JSON object matching the Finding contract. "
-                    "Use status='unknown' and needs_human_review=true when graph evidence is insufficient."
+                    "Your previous response was incomplete or non-final. "
+                    "Return the complete final Finding JSON through the response text. "
+                    "Do not call tools or return tool-call metadata. Use status='unknown' and needs_human_review=true "
+                    "when graph evidence is insufficient."
                 )
-        raise ValueError(f"Deep scan failed after bounded retries: {last_error}")
+        vulnerability_type = candidate.get("vulnerability_class", "other")
+        if vulnerability_type not in {member.value for member in VulnerabilityClass}:
+            vulnerability_type = "other"
+        return Finding(
+            vulnerability_type=vulnerability_type,
+            status="unknown",
+            vulnerability_found=False,
+            details=f"Deep scan returned no valid final response after bounded retries: {last_error}",
+            evidence="No contract-valid model verdict was returned.",
+            needs_human_review=True,
+        ).model_dump(mode="json")

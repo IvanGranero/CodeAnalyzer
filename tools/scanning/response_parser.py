@@ -5,8 +5,8 @@ import json
 
 def extract_json_object(response_text: str) -> dict:
     """Extract one JSON object from a raw or Markdown-wrapped model response."""
-    if not response_text:
-        raise ValueError("Empty response from LLM")
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise ValueError("empty_response: model returned no structured content")
 
     try:
         decoded = json.loads(response_text)

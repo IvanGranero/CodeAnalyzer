@@ -17,6 +17,14 @@ ToolDefinition = Mapping[str, Any]
 ToolHandler = Callable[[str, Mapping[str, Any]], str]
 UsageCallback = Callable[[Mapping[str, Any], float], None | Awaitable[None]]
 
+
+class EmptyLLMResponseError(RuntimeError):
+    """The provider returned no assistant content after a successful request."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 class LLMClient:
     def __init__(
         self,
@@ -25,7 +33,7 @@ class LLMClient:
         base_url: str,
         default_headers: str = "",
         extra_query: str = "",
-        audit_log_dir: str = "logs/llm_audit"
+        audit_log_dir: str = "logs/llm_audit",
     ):
         self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
         if not self.api_keys:
@@ -38,6 +46,8 @@ class LLMClient:
         os.makedirs(self.audit_log_dir, exist_ok=True)
 
         self._use_legacy_endpoint = False
+        self._endpoint_probe_complete = False
+        self._endpoint_probe_lock = asyncio.Lock()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_audit_file = os.path.join(self.audit_log_dir, f"llm_session_{timestamp}.txt")
 
@@ -149,33 +159,74 @@ class LLMClient:
             kwargs_responses["max_output_tokens"] = model_settings["max_completion_tokens"]
         elif "max_tokens" in model_settings:
             kwargs_responses["max_output_tokens"] = model_settings["max_tokens"]
-        if "reasoning_effort" in model_settings:
+        if model_settings.get("reasoning_effort") is not None:
             kwargs_responses["reasoning"] = {"effort": model_settings["reasoning_effort"]}
         if model_settings.get("response_format") == "json_object":
             kwargs_responses["text"] = {"format": {"type": "json_object"}}
 
+        if self._use_legacy_endpoint:
+            return await self._execute_legacy_chat(
+                client, system_prompt, user_prompt, model_settings,
+                context_id, tools, tool_handler, audit_metadata=audit_metadata,
+            )
+
+        async def request_response_text() -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+            response, tool_calls = await self._request_responses(
+                client, kwargs_responses, tool_handler
+            )
+            return self._response_text(response, "Frontier"), self._usage_dict(response), tool_calls
+
+        if not self._endpoint_probe_complete:
+            async with self._endpoint_probe_lock:
+                if self._use_legacy_endpoint:
+                    return await self._execute_legacy_chat(
+                        client, system_prompt, user_prompt, model_settings,
+                        context_id, tools, tool_handler, audit_metadata=audit_metadata,
+                    )
+                if not self._endpoint_probe_complete:
+                    try:
+                        final_text, usage_dict, tool_calls = await self._retry_request(
+                            request_response_text,
+                            endpoint="/responses",
+                        )
+                        self._endpoint_probe_complete = True
+                    except openai.NotFoundError:
+                        logger.warning("[LLM] /responses returned 404; using /chat/completions for this client")
+                        self._use_legacy_endpoint = True
+                        self._endpoint_probe_complete = True
+                        try:
+                            return await self._execute_legacy_chat(
+                                client, system_prompt, user_prompt, model_settings,
+                                context_id, tools, tool_handler, audit_metadata=audit_metadata,
+                            )
+                        except openai.NotFoundError as exc:
+                            raise RuntimeError(
+                                f"LLM endpoint not found at '{self.base_url}'. "
+                                "Both /responses and /chat/completions returned 404; "
+                                "check the configured base URL and model endpoint."
+                            ) from exc
+
+        if self._use_legacy_endpoint:
+            return await self._execute_legacy_chat(
+                client, system_prompt, user_prompt, model_settings,
+                context_id, tools, tool_handler, audit_metadata=audit_metadata,
+            )
+        if not self._endpoint_probe_complete:
+            raise RuntimeError("LLM endpoint probe completed without selecting an endpoint")
         try:
-            response, tool_calls = await self._retry_request(
-                lambda: self._request_responses(client, kwargs_responses, tool_handler),
+            final_text, usage_dict, tool_calls = await self._retry_request(
+                request_response_text,
                 endpoint="/responses",
             )
         except openai.NotFoundError:
-            logger.warning("[LLM] /responses returned 404; using /chat/completions.")
+            logger.warning("[LLM] /responses became unavailable; using /chat/completions for this client")
             self._use_legacy_endpoint = True
-            try:
-                return await self._execute_legacy_chat(
-                    client, system_prompt, user_prompt, model_settings,
-                    context_id, tools, tool_handler, audit_metadata=audit_metadata,
-                )
-            except openai.NotFoundError as exc:
-                raise RuntimeError(
-                    f"LLM endpoint not found at '{self.base_url}'. "
-                    "Both /responses and /chat/completions returned 404; "
-                    "check the configured base URL and model endpoint."
-                ) from exc
+            self._endpoint_probe_complete = True
+            return await self._execute_legacy_chat(
+                client, system_prompt, user_prompt, model_settings,
+                context_id, tools, tool_handler, audit_metadata=audit_metadata,
+            )
 
-        final_text = self._response_text(response, "Frontier")
-        usage_dict = self._usage_dict(response)
         self._audit_log(
             kwargs_responses, final_text, "/responses", context_id, tool_calls,
             audit_metadata,
@@ -202,6 +253,8 @@ class LLMClient:
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, EmptyLLMResponseError):
+            return exc.retryable
         if isinstance(exc, openai.NotFoundError):
             return False
         if isinstance(exc, (APIConnectionError, openai.RateLimitError)):
@@ -254,8 +307,12 @@ class LLMClient:
     def _response_text(response: Any, model_name: str) -> str:
         for block in response.output:
             if getattr(block, "type", None) == "message":
-                return block.content[0].text
-        raise RuntimeError(f"{model_name} model returned no assistant message.")
+                content = getattr(block, "content", None) or []
+                text = getattr(content[0], "text", "") if content else ""
+                if isinstance(text, str) and text.strip():
+                    return text
+                break
+        raise EmptyLLMResponseError(f"empty_response: {model_name} returned no assistant content")
 
     async def _execute_legacy_chat(
         self,
@@ -281,7 +338,7 @@ class LLMClient:
             kwargs_chat["max_completion_tokens"] = model_settings["max_completion_tokens"]
         elif "max_tokens" in model_settings:
             kwargs_chat["max_tokens"] = model_settings["max_tokens"]
-        if "reasoning_effort" in model_settings:
+        if model_settings.get("reasoning_effort") is not None:
             kwargs_chat["reasoning_effort"] = model_settings["reasoning_effort"]
         if model_settings.get("response_format") == "json_object":
             kwargs_chat["response_format"] = {"type": "json_object"}
@@ -295,26 +352,35 @@ class LLMClient:
                 for tool in tools
             ]
 
-        response, tool_calls = await self._retry_request(
-            lambda: self._request_legacy_chat(client, kwargs_chat, tool_handler),
+        async def request_legacy_response() -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
+            response, tool_calls = await self._request_legacy_chat(
+                client, kwargs_chat, tool_handler
+            )
+            return response, self._usage_dict(response), tool_calls
+        response, usage_dict, tool_calls = await self._retry_request(
+            request_legacy_response,
             endpoint="/chat/completions",
         )
         message = response.choices[0].message
-        final_text = message.content
-        if not final_text:
-            reasoning_content = getattr(message, "reasoning_content", None)
-            if reasoning_content:
-                logger.warning(
-                    "[LLM] Legacy response content was empty; using reasoning_content."
-                )
-                final_text = reasoning_content
-        if final_text is None:
-            raise RuntimeError("Legacy model returned no assistant message.")
+        final_text = getattr(message, "content", None)
+        if not isinstance(final_text, str) or not final_text.strip():
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            refusal = getattr(message, "refusal", None)
+            returned_tool_calls = getattr(message, "tool_calls", None) or []
+            details = [f"finish_reason={finish_reason!r}"]
+            if refusal:
+                details.append(f"refusal={refusal!r}")
+            if returned_tool_calls:
+                details.append(f"tool_calls={len(returned_tool_calls)}")
+            raise EmptyLLMResponseError(
+                "empty_response: model returned no assistant content (" + ", ".join(details) + ")",
+                retryable=finish_reason not in {"length", "content_filter"},
+            )
         self._audit_log(
             kwargs_chat, final_text, "/chat/completions", context_id, tool_calls,
             audit_metadata,
         )
-        return final_text, self._usage_dict(response)
+        return final_text, usage_dict
 
     async def _request_legacy_chat(
         self,
@@ -329,14 +395,14 @@ class LLMClient:
         for _ in range(4):
             response = await client.chat.completions.create(
                 **{**request_kwargs, "messages": router.messages}
-            )    
+            )
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
             if not tool_calls:
                 return response, invocation_log.records
             if invoker is None:
                 raise RuntimeError("model returned tool calls but no tool handler is configured")
-            router.append_assistant([message])
+            router.append_assistant([self._legacy_assistant_payload(message)])
             tool_results = []
             for tool_call in tool_calls:
                 bound = binder.bind(
@@ -353,3 +419,27 @@ class LLMClient:
                 tool_results.append(binder.legacy_result(bound, output))
             router.append_tool_results(tool_results)
         raise RuntimeError("Model exceeded the maximum tool-call rounds")
+
+    @staticmethod
+    def _legacy_assistant_payload(message: Any) -> dict[str, Any]:
+        """Convert an SDK assistant message into JSON-safe request data."""
+        payload: dict[str, Any] = {
+            "role": getattr(message, "role", None) or "assistant",
+            "content": getattr(message, "content", None),
+        }
+        tool_calls = []
+        for call in getattr(message, "tool_calls", None) or []:
+            function = getattr(call, "function", None)
+            tool_calls.append(
+                {
+                    "id": getattr(call, "id", ""),
+                    "type": getattr(call, "type", None) or "function",
+                    "function": {
+                        "name": getattr(function, "name", ""),
+                        "arguments": getattr(function, "arguments", ""),
+                    },
+                }
+            )
+        if tool_calls:
+            payload["tool_calls"] = tool_calls
+        return payload

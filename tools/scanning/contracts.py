@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class VulnerabilityClass(str, Enum):
@@ -146,6 +146,11 @@ class Finding(BaseModel):
     needs_human_review: bool = False
     evidence_references: List[EvidenceReference] = Field(default_factory=list)
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalize_missing_severity(cls, value: Any) -> str:
+        return "Informational" if value is None else value
+
     def as_report_dict(self) -> Dict[str, Any]:
         result = self.model_dump(mode="json", exclude_none=True)
         result["vulnerability_found"] = self.status == FindingStatus.SUPPORTED
@@ -241,5 +246,16 @@ class ScanReport(BaseModel):
 def parse_object(value: Any, model: type[BaseModel]) -> BaseModel:
     """Validate a decoded LLM object and reject arrays/scalars at the boundary."""
     if not isinstance(value, dict):
-        raise ValueError(f"Expected JSON object, got {type(value).__name__}")
-    return model.model_validate(value)
+        raise ValueError(f"response_contract_invalid: expected JSON object, got {type(value).__name__}")
+    try:
+        return model.model_validate(value)
+    except ValidationError as exc:
+        fields = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", ())) or "response"
+            if location not in fields:
+                fields.append(location)
+        field_text = ", ".join(fields[:6])
+        if len(fields) > 6:
+            field_text += ", ..."
+        raise ValueError(f"response_contract_invalid: missing or invalid fields: {field_text}") from None

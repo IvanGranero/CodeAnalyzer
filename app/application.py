@@ -19,6 +19,7 @@ from app.phases.reporting_phase import generate_final_report
 from app.phases.scan_phase import ScanPhase, resolve_scan_limit
 from app.state import ScanSession
 from app.storage.repositories import ScanCacheRepository
+from app.storage.agent_trace_repository import AgentTraceRepository
 from tools.scanning import ScanService
 from tools.scanning.orchestrator import ScanOrchestrator
 from tools.scanning.reporter import ScanReporter
@@ -158,7 +159,7 @@ class ScanApplication:
             with discovery_path.open("r", encoding="utf-8") as stream:
                 discovery_config = json.load(stream)
         exploit_phase = ExploitPhase(
-            self.context.runtime,
+            self.context.llm,
             cache_dir=self.report_dir,
             event_sink=self.event_sink,
             graph_manager=self.context.graph,
@@ -218,11 +219,12 @@ class ScanApplication:
         vendor = config_json.get("stack_vendor", "Generic AutoSAR")
         platform_info = f"Hardware: {mcu}, Stack: {vendor}"
         orchestrator = ScanOrchestrator(
-            self.context.runtime,
+            self.context.llm,
             self.context.graph,
             platform_info=platform_info,
             vendor_folders=config_json.get("vendor_folders", []),
             application_roots=config_json.get("application_roots", []),
+            trace_repository=AgentTraceRepository(self.cache_dir),
         )
         scan_service = ScanService(orchestrator)
         selected_domain = await self._resolve_interaction(
@@ -260,7 +262,7 @@ class ScanApplication:
                 )
 
         exploit_phase = ExploitPhase(
-            self.context.runtime,
+            self.context.llm,
             self.cache_dir,
             skip=request.skip_exploit,
             event_sink=self.event_sink,

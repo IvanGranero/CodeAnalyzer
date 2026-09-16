@@ -3,7 +3,6 @@ from dataclasses import dataclass
 
 from llm.service import LLMService
 from llm.router import TieredLLMService
-from llm.runtime import AgentRuntime
 from tools.graph.manager import GraphManager
 from config import settings
 from llm.tracker import TokenTracker
@@ -13,7 +12,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AppContext:
     llm: TieredLLMService
-    runtime: AgentRuntime
     graph: GraphManager
 
 
@@ -44,7 +42,7 @@ def build_app_context() -> AppContext:
         password=settings.neo4j_password,
     )
     llm = TieredLLMService(cheap_llm, strong_llm)
-    return AppContext(llm=llm, runtime=AgentRuntime(llm), graph=graph)
+    return AppContext(llm=llm, graph=graph)
 
 
 def shutdown(app_context: AppContext) -> None:

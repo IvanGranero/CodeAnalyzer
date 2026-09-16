@@ -92,6 +92,8 @@ class SerializationMixin:
                 file: f.storage_uri,
                 tainted_by_uds: coalesce(f.tainted_by_uds, false),
                 reachable_dids: coalesce(f.reachable_from_dids, []),
+                taint_depth: coalesce(f.taint_depth, f.taint_hops, null),
+                memory_region: coalesce(f.memory_region, f.memory_class, null),
                 is_vendor_library: coalesce(f.is_vendor_code, false),
                 is_hardware_entry: coalesce(f.is_hardware_entry, false),
                 has_data_race_risk: coalesce(f.has_data_race_risk, false),
@@ -166,6 +168,8 @@ class SerializationMixin:
                 file=target.get("file"),
                 tainted_by_uds=target.get("tainted_by_uds", False),
                 reachable_dids=target.get("reachable_dids", []),
+                taint_depth=target.get("taint_depth"),
+                memory_region=target.get("memory_region"),
                 is_vendor_library=target.get("is_vendor_library", False),
                 is_hardware_entry=target.get("is_hardware_entry", False),
                 has_data_race_risk=target.get("has_data_race_risk", False),
@@ -392,8 +396,14 @@ class SerializationMixin:
 
             if verbosity == "full":
                 payload["graph"]["all_paths"] = top_paths
-                payload["graph"]["node_types"] = sorted({node["type"] for node in nodes})
-                payload["graph"]["edge_types"] = sorted({edge["type"] for edge in edges})
+                payload["graph"]["node_types"] = sorted(
+                    {node.get("type") for node in nodes if node.get("type") is not None},
+                    key=str,
+                )
+                payload["graph"]["edge_types"] = sorted(
+                    {edge.get("type") for edge in edges if edge.get("type") is not None},
+                    key=str,
+                )
             elif verbosity == "compact":
                 payload["graph"] = {"nodes": nodes[:10], "edges": edges[:20], "paths": top_paths}
 
@@ -482,7 +492,10 @@ class SerializationMixin:
                     "identifier": f"0x{identifier[-4:]}", "subfunction": subfunction,
                     "operation": operation or None, "minimum_length": persisted.get("minimum_length"),
                     "request_layout": persisted.get("request_layout"), "request_length": persisted.get("request_length"),
-                    "missing_facts": sorted(set(missing)), "confidence": persisted.get("confidence", "partial"),
+                    "missing_facts": sorted(
+                        {str(fact) for fact in missing if fact is not None},
+                        key=str,
+                    ), "confidence": persisted.get("confidence", "partial"),
                     "source": persisted.get("source") or source.get("source", "unknown"),
                 })
             else:
@@ -497,11 +510,22 @@ class SerializationMixin:
                     "identifier": f"0x{identifier[-4:]}", "operation": operation or None,
                     "data_length": persisted.get("data_length"), "minimum_length": persisted.get("minimum_length"),
                     "request_layout": persisted.get("request_layout"), "request_length": persisted.get("request_length"),
-                    "missing_facts": sorted(set(missing)),
+                    "missing_facts": sorted(
+                        {str(fact) for fact in missing if fact is not None},
+                        key=str,
+                    ),
                     "confidence": persisted.get("confidence") or source.get("protocol_confidence", "partial"),
                     "source": persisted.get("source") or source.get("source", "unknown"),
                 })
-        missing_facts = sorted({fact for item in contracts for fact in item.get("missing_facts", [])})
+        missing_facts = sorted(
+            {
+                str(fact)
+                for item in contracts
+                for fact in item.get("missing_facts", [])
+                if fact is not None
+            },
+            key=str,
+        )
         return {
             "status": "available" if contracts and not missing_facts else "partial",
             "target_function": func_name,

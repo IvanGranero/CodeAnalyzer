@@ -2,6 +2,7 @@ import os
 import logging
 import fnmatch
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,91 @@ class RepoDiscoverer:
     DEFAULT_CONFIG_PATTERNS = (
         "*.arxml", "*.oil", "CMakeLists.txt", "Makefile", "*.ld",
     )
+
+    @classmethod
+    def build_repo_manifest(cls, target_dir: str) -> dict:
+        """Return deterministic aggregates for embedded source and configuration files."""
+        root = Path(target_dir).resolve()
+        records = defaultdict(lambda: {
+            "file_count": 0,
+            "source_file_count": 0,
+            "extensions": Counter(),
+            "sample_files": [],
+            "generator_markers": [],
+        })
+        source_suffixes = {".c", ".cc", ".cpp", ".h", ".hh", ".hpp"}
+        relevant_suffixes = source_suffixes | {
+            ".arxml", ".cdd", ".cfg", ".ini", ".json", ".ld", ".mk", ".oil",
+            ".rte", ".sct", ".xml",
+        }
+        relevant_names = {"CMakeLists.txt", "Makefile"}
+        generator_patterns = (
+            re.compile(r"^rte_.*\.(c|h|cpp|hpp|arxml|xml)$", re.IGNORECASE),
+            re.compile(r"^dcm_.*\.(c|h|cpp|hpp|arxml|xml)$", re.IGNORECASE),
+            re.compile(r"_cfg\.(c|h|cpp|hpp)$", re.IGNORECASE),
+            re.compile(r"(generated|autosar|autosar).*\.(c|h|cpp|hpp|arxml|xml)$", re.IGNORECASE),
+        )
+
+        paths = (
+            item for item in root.rglob("*")
+            if item.is_file()
+            and (item.suffix.casefold() in relevant_suffixes or item.name in relevant_names)
+        )
+        for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix().casefold()):
+            relative = path.relative_to(root).as_posix()
+            parent_parts = Path(relative).parts[:-1]
+            for depth in range(1, len(parent_parts) + 1):
+                directory = "/".join(parent_parts[:depth])
+                record = records[directory]
+                record["file_count"] += 1
+                suffix = path.suffix.lower() or "[no_extension]"
+                record["extensions"][suffix] += 1
+                if suffix in source_suffixes:
+                    record["source_file_count"] += 1
+                if depth <= 2 and len(record["sample_files"]) < 6:
+                    record["sample_files"].append(relative)
+                if depth <= 2 and any(pattern.search(path.name) for pattern in generator_patterns):
+                    marker = path.name
+                    if marker not in record["generator_markers"] and len(record["generator_markers"]) < 6:
+                        record["generator_markers"].append(marker)
+
+        directories = []
+        for directory in sorted(records, key=str.casefold):
+            record = records[directory]
+            directories.append({
+                "path": directory,
+                "depth": directory.count("/") + 1,
+                "file_count": record["file_count"],
+                "source_file_count": record["source_file_count"],
+                "extensions": dict(sorted(record["extensions"].items())),
+                "sample_files": record["sample_files"],
+                "generator_markers": record["generator_markers"],
+            })
+
+        components = sorted(
+            {part.casefold() for directory in directories for part in Path(directory["path"]).parts},
+        )
+        application_names = {
+            "app", "application", "src", "source", "tools", "lib", "include",
+        }
+        deterministic_vendor_folders = sorted({
+            Path(directory["path"]).name.casefold()
+            for directory in directories
+            if len(directory["generator_markers"]) >= 2
+            and Path(directory["path"]).name.casefold() not in application_names
+        })
+        return {
+            "root": root.name,
+            "directory_count": len(directories),
+            "file_count": sum(item["file_count"] for item in directories if item["depth"] == 1),
+            "top_level_directories": sorted(
+                {directory["path"].split("/", 1)[0] for directory in directories},
+                key=str.casefold,
+            ),
+            "directory_components": components,
+            "deterministic_vendor_folders": deterministic_vendor_folders,
+            "directories": directories,
+        }
 
     @staticmethod
     def generate_directory_tree(target_dir: str, max_depth: int = 4) -> str:

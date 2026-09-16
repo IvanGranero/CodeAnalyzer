@@ -32,17 +32,28 @@ class ScanContext:
 class ScanOrchestrator:
     _MAX_TRIAGE_ATTEMPTS = 3
 
-    def __init__(self, runtime: AgentRuntime, graph_manager: GraphManager, platform_info: str = "Unknown Platform", vendor_folders: list[str] | None = None, application_roots: list[str] | None = None):
-        self.runtime = runtime
+    def __init__(self, llm, graph_manager: GraphManager, platform_info: str = "Unknown Platform", vendor_folders: list[str] | None = None, application_roots: list[str] | None = None, trace_repository=None):
         self.graph_resolver = graph_manager.resolver
         self.tools_engine = AnalyzerTools(graph_manager)
         self.tool_registry = ReadOnlyToolRegistry(self.tools_engine)
+        self.runtime = AgentRuntime(llm, tool_registry=self.tool_registry)
         self.platform_info = platform_info
         self.vendor_folders = [str(folder).strip().strip('/\\').lower() for folder in (vendor_folders or []) if str(folder).strip()]
         self.application_roots = [str(folder).strip().strip('/\\').lower() for folder in (application_roots or []) if str(folder).strip()]
+        self.trace_repository = trace_repository
         self.candidate_scheduler = CandidateScheduler()
         self.triage_agent = TriageAgent(self.runtime, self._extract_json_object)
         self.deep_scan_agent = DeepScanAgent(self.runtime, self._extract_json_object)
+
+    def _trace(self, target: str, turn_id: str, record: dict[str, Any]) -> None:
+        if self.trace_repository is not None:
+            self.trace_repository.append(
+                f"scan-{target}",
+                phase="scan",
+                target=target,
+                turn_id=turn_id,
+                record=record,
+            )
 
     def usage_snapshot(self):
         """Return the centralized usage ledger, including phase totals."""
@@ -105,10 +116,12 @@ class ScanOrchestrator:
                 target_func,
                 max_attempts=2,
             )
-            return self._reconcile_single_finding(finding, graph_json)
+            finding = self._reconcile_single_finding(finding, graph_json)
+            self._trace(target_func or candidate.get("function_name", "unknown"), f"deep-scan-{candidate.get('vulnerability_class', 'unknown')}", {"candidate": candidate, "finding": finding})
+            return finding
         except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
             logger.warning(f"Deep scan for candidate '{vuln_class}' did not return JSON. Error: {exc}")
-            return Finding(
+            finding = Finding(
                 vulnerability_type=vuln_class if vuln_class in {member.value for member in VulnerabilityClass} else "other",
                 status="unknown",
                 vulnerability_found=False,
@@ -117,6 +130,8 @@ class ScanOrchestrator:
                 confidence="low",
                 needs_human_review=True,
             ).model_dump(mode="json")
+            self._trace(target_func or candidate.get("function_name", "unknown"), f"deep-scan-{candidate.get('vulnerability_class', 'unknown')}-error", {"candidate": candidate, "finding": finding})
+            return finding
 
     async def _run_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str, target_func: str) -> dict[str, Any]:
         """Run one focused deep scan using evidence collected by triage."""
@@ -189,6 +204,7 @@ class ScanOrchestrator:
             directive,
             target_func=target,
         )
+        self._trace(target, "triage", triage)
         if triage.get("decision") != "escalate":
             return triage, "", [], True
 

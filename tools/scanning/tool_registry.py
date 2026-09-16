@@ -104,18 +104,26 @@ TOOL_DEFINITIONS = [
         "description": "Get a preprocessor macro definition.",
         "parameters": {"type": "object", "properties": {"macro_name": {"type": "string"}}, "required": ["macro_name"]},
     },
+    {
+        "type": "function",
+        "name": "read_file_span",
+        "description": "Read an explicitly authorized source byte span from the evidence bundle.",
+        "parameters": {"type": "object", "properties": {"storage_uri": {"type": "string"}, "byte_span": {"type": "string"}}, "required": ["storage_uri", "byte_span"]},
+    },
 ]
 
 
 class ReadOnlyToolRegistry:
-    def __init__(self, analyzer_tools, allowed_tools=None, audit_callback=None):
+    def __init__(self, analyzer_tools, allowed_tools=None, audit_callback=None, allowed_file_spans=None, allowed_functions=None):
         self.tools = analyzer_tools
         self.activity_callback = None
         self.audit_callback = audit_callback
         self.allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
+        self.allowed_file_spans = None if allowed_file_spans is None else frozenset(allowed_file_spans)
+        self.allowed_functions = None if allowed_functions is None else frozenset(allowed_functions)
         self.handlers = {
             "get_function_metadata": lambda function_name: self.tools.get_function_metadata(function_name),
-            "get_uds_contract": lambda function_name: self.tools.get_uds_contract(function_name),
+            "get_uds_contract": self._get_uds_contract,
             "get_callers_and_entry_points": lambda function_name: self.tools.get_callers_and_entry_points(function_name),
             "get_callees": lambda function_name: self.tools.get_callees(function_name),
             "get_variable_access": lambda function_name: self.tools.get_variable_access(function_name),
@@ -130,7 +138,22 @@ class ReadOnlyToolRegistry:
             "get_type_definition": self.tools.get_type_definition,
             "get_type_layout": self.tools.get_type_layout,
             "get_macro_definition": self.tools.get_macro_definition,
+            "read_file_span": self._read_file_span,
         }
+
+    def _check_function_scope(self, function_name: str) -> None:
+        if self.allowed_functions is not None and function_name not in self.allowed_functions:
+            raise ValueError(f"Function '{function_name}' is outside the evidence scope.")
+
+    def _get_uds_contract(self, function_name: str) -> str:
+        self._check_function_scope(function_name)
+        return self.tools.get_uds_contract(function_name)
+
+    def _read_file_span(self, storage_uri: str, byte_span: str) -> str:
+        key = (storage_uri, byte_span)
+        if self.allowed_file_spans is not None and key not in self.allowed_file_spans:
+            raise ValueError("Requested source span is outside the evidence scope.")
+        return self.tools.read_file_span(storage_uri, byte_span)
 
     def definitions(self):
         definitions = TOOL_DEFINITIONS if self.allowed_tools is None else [
@@ -147,11 +170,13 @@ class ReadOnlyToolRegistry:
             strict.append(item)
         return strict
 
-    def scoped(self, allowed_tools, audit_callback=None):
+    def scoped(self, allowed_tools, audit_callback=None, allowed_file_spans=None, allowed_functions=None):
         scoped_registry = ReadOnlyToolRegistry(
             self.tools,
             allowed_tools=allowed_tools,
             audit_callback=audit_callback,
+            allowed_file_spans=allowed_file_spans,
+            allowed_functions=allowed_functions,
         )
         scoped_registry.activity_callback = self.activity_callback
         return scoped_registry

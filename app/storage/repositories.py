@@ -15,7 +15,12 @@ class ScanCacheRepository:
         self.store.save(name, validated.as_report_dict())
 
     def load_all(self, *, exclude: set[str] | None = None) -> dict[str, dict[str, Any]]:
-        return self.store.load_all(exclude=exclude)
+        reports = self.store.load_all(exclude=exclude)
+        return {
+            name: report
+            for name, report in reports.items()
+            if not name.startswith("agent-trace-")
+        }
 
 
 class ExploitReportRepository:
