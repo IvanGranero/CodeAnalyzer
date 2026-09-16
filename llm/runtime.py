@@ -2,30 +2,15 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-OperationResult = TypeVar("OperationResult")
 ToolHandler = Callable[[str, Mapping[str, Any]], str]
-
-
-@dataclass
-class MessageRouter:
-    """Own provider message ordering for one model invocation."""
-
-    messages: list[Any] = field(default_factory=list)
-
-    def append_assistant(self, items: Sequence[Any]) -> None:
-        self.messages.extend(items)
-
-    def append_tool_results(self, items: Sequence[Any]) -> None:
-        self.messages.extend(items)
 
 
 @dataclass(frozen=True)
@@ -109,64 +94,6 @@ class CallBinder:
                     raise ValueError(f"tool '{name}' argument '{key}' must be >= {minimum}")
                 if maximum is not None and value > maximum:
                     raise ValueError(f"tool '{name}' argument '{key}' must be <= {maximum}")
-
-
-class ToolInvoker:
-    """Invoke only validated, allow-listed tools."""
-
-    def __init__(self, handler: ToolHandler) -> None:
-        self._handler = handler
-
-    def invoke(self, call: BoundCall) -> str:
-        try:
-            output = self._handler(call.name, call.arguments)
-            return output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-        except Exception as exc:
-            logger.exception("Tool '%s' failed", call.name)
-            return json.dumps({"error": f"Tool '{call.name}' failed: {exc}"})
-
-
-class RetryController:
-    """Retry transient operations with bounded exponential backoff."""
-
-    def __init__(
-        self,
-        retryable: Callable[[Exception], bool],
-        max_attempts: int = 3,
-        base_delay: float = 2.0,
-    ) -> None:
-        self.retryable = retryable
-        self.max_attempts = max(1, max_attempts)
-        self.base_delay = max(0.0, base_delay)
-
-    async def run(
-        self,
-        operation: Callable[[], Awaitable[OperationResult]],
-        on_retry: Callable[[int, Exception, float], None] | None = None,
-    ) -> OperationResult:
-        import asyncio
-
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                return await operation()
-            except Exception as exc:
-                if attempt == self.max_attempts or not self.retryable(exc):
-                    raise
-                delay = self.base_delay * (2 ** (attempt - 1))
-                if on_retry:
-                    on_retry(attempt, exc, delay)
-                await asyncio.sleep(delay)
-        raise AssertionError("retry controller exited without a result")
-
-
-@dataclass
-class InvocationLog:
-    """Invocation-local records, safe to use for concurrent agent calls."""
-
-    records: list[dict[str, Any]] = field(default_factory=list)
-
-    def record(self, **values: Any) -> None:
-        self.records.append(dict(values))
 
 
 class AgentRuntime:

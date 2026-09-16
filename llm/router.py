@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any
 
-from llm.client import ToolDefinition, ToolHandler, UsageCallback
+from llm.langchain_client import ToolDefinition, ToolHandler, UsageCallback
 
 
 class ModelTier(str, Enum):

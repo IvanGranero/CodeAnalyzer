@@ -67,9 +67,8 @@ pip install -r requirements.txt
 **4. Configure Environment Variables**
 Ensure your `.env` or `config.py` file is populated with your specific database and LLM credentials:
 * `neo4j_uri`, `neo4j_user`, `neo4j_password`
-* `genai_subscription_key`, `genai_subscription_header`
-* `cheap_model_id`, `cheap_base_url`, `cheap_api_version`
-* `strong_model_id`, `strong_base_url`, `strong_api_version`
+* `cheap_subscription_key`, `cheap_model_id`, `cheap_deployment`, `cheap_base_url`, `cheap_headers`, `cheap_api_version`
+* `strong_subscription_key`, `strong_model_id`, `strong_deployment`, `strong_base_url`, `strong_headers`, `strong_api_version`
 
 Optional scan controls:
 

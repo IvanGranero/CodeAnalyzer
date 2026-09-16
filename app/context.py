@@ -21,18 +21,20 @@ def build_app_context() -> AppContext:
     cheap_llm = LLMService(
         api_key=settings.cheap_subscription_key,
         model_name=settings.cheap_model_id,
+        deployment=settings.cheap_deployment,
         base_url=settings.cheap_base_url,
-        default_headers=settings.cheap_default_headers,
-        extra_query=settings.cheap_extra_query,
+        default_headers=settings.cheap_headers,
+        api_version=settings.cheap_api_version,
         pricing=settings.cheap_token_pricing,
         tracker=tracker,
     )
     strong_llm = LLMService(
         api_key=settings.strong_subscription_key,
         model_name=settings.strong_model_id,
+        deployment=settings.strong_deployment,
         base_url=settings.strong_base_url,
-        default_headers=settings.strong_default_headers,
-        extra_query=settings.strong_extra_query,
+        default_headers=settings.strong_headers,
+        api_version=settings.strong_api_version,
         pricing=settings.strong_token_pricing,
         tracker=tracker,
     )

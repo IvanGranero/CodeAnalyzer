@@ -17,7 +17,7 @@ class TokenPricing(BaseModel):
 
 class AppConfig(BaseSettings):
     """
-    Centralized configuration. 
+    Centralized configuration.
     Pydantic automatically matches these lowercase variables to the UPPERCASE keys in the .env file.
     """
     model_config = SettingsConfigDict(
@@ -29,16 +29,18 @@ class AppConfig(BaseSettings):
 
     # --- Cheap tier ("orchestrator") -----------------------------------------
     cheap_subscription_key: str
-    cheap_default_headers: str = ""
-    cheap_extra_query: str = ""
+    cheap_headers: str
+    cheap_api_version: str
     cheap_model_id: str
+    cheap_deployment: str
     cheap_base_url: str
 
     # --- Strong tier ("code analyzer") ---------------------------------------
     strong_subscription_key: str
-    strong_default_headers: str = ""
-    strong_extra_query: str = ""
+    strong_headers: str
+    strong_api_version: str
     strong_model_id: str
+    strong_deployment: str
     strong_base_url: str
 
     # --- Optional pricing ----------------------------------------------------
@@ -48,7 +50,7 @@ class AppConfig(BaseSettings):
 
     # --- Optional TLS override -----------------------------------------------
     # Pydantic natively understands "false", "0", "off" from the .env file
-    codegraph_tls_verify: bool = True 
+    codegraph_tls_verify: bool = True
 
     # --- Neo4j / GraphDB -----------------------------------------------------
     neo4j_uri: str = "neo4j://127.0.0.1:7687"

@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from llm.client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
+from llm.langchain_client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
 from llm.tracker import TokenTracker
 from config import TokenPricing
 
@@ -22,19 +22,21 @@ class LLMService:
         self,
         api_key: str,
         model_name: str,
+        deployment: str,
         base_url: str,
         pricing: TokenPricing,
         default_headers: str = "",
-        extra_query: str = "",
+        api_version: str = "",
         usage_listener: UsageCallback | None = None,
         tracker: TokenTracker | None = None,
     ) -> None:
         self.client = LLMClient(
             api_key=api_key,
             model_name=model_name,
+            deployment=deployment,
             base_url=base_url,
             default_headers=default_headers,
-            extra_query=extra_query,
+            api_version=api_version,
         )
         self.prompts = self._load_prompts()
         self.tracker = tracker or TokenTracker()
