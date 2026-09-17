@@ -15,6 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scan-all", action="store_true", help="Scan all discovered targets in scope, bypassing the limit.")
     parser.add_argument("--target-file", type=str, help="Restrict the scan to a specific file (e.g., 'bsw/Com.c').")
+    parser.add_argument(
+        "--uds-only",
+        action="store_true",
+        help="Scan only functions reachable through UDS/DID/RID graph evidence.",
+    )
 
     parser.add_argument("--resume", action="store_true", help="Resume from cached scans.")
     parser.add_argument("--skip-ingest", action="store_true", help="Skip the graph building phase.")

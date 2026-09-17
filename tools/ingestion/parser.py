@@ -19,6 +19,7 @@ PRIMITIVE_TYPES = {
 class ASTParser:
     def __init__(self, builder: GraphPayloadBuilder):
         self.builder = builder
+        self._cancel_event = None
         self.lang = Language(tree_sitter_c.language())
         self.parser = Parser(self.lang) 
         
@@ -63,8 +64,11 @@ class ASTParser:
         filepath: str,
         is_vendor_code: bool = False,
         parse_vendor_internals: bool = True,
+        cancel_event=None,
     ):
         self._node_cache = {}
+        self._cancel_event = cancel_event
+        self._check_cancel(cancel_event)
         try:
             with open(filepath, 'rb') as f:
                 raw_code = f.read()
@@ -81,6 +85,7 @@ class ASTParser:
 
         is_config_file = any(filepath.endswith(ext) for ext in ['_Cfg.c', '_PBcfg.c', '_Lcfg.c', '_LCfg.c'])
         source_code = self._clean_autosar_macros(raw_code)
+        self._check_cancel(cancel_event)
         file_global_ids: dict = {}
 
         if file_size <= 10 * 1024 * 1024 and not is_config_file:
@@ -88,6 +93,7 @@ class ASTParser:
                 
                 
                 def source_reader(byte_offset, _point):
+                    self._check_cancel(cancel_event)
                     return source_code[byte_offset:byte_offset + 64 * 1024]
 
                 tree = self.parser.parse(source_reader)
@@ -95,6 +101,7 @@ class ASTParser:
                 
                 if not is_vendor_code or parse_vendor_internals:
                     for child in tree.root_node.children:
+                        self._check_cancel(cancel_event)
                         if child.type == 'declaration':
                             for var_name in self._extract_all_declared_identifiers(child, source_code):
                                 var_id = self.builder.add_global_variable(var_name, uri, f"{child.start_byte}-{child.end_byte}")
@@ -106,9 +113,11 @@ class ASTParser:
                                 self.builder.add_type_definition(type_name, uri, f"{child.start_byte}-{child.end_byte}")
 
                 for macro_def_node in self._find_nodes_of_type(tree.root_node, 'preproc_function_def'):
+                    self._check_cancel(cancel_event)
                     self._process_macro_alias(macro_def_node, source_code)
 
                 for preproc_def_node in self._find_nodes_of_type(tree.root_node, 'preproc_def'):
+                    self._check_cancel(cancel_event)
                     name_node = preproc_def_node.child_by_field_name('name')
                     val_node = preproc_def_node.child_by_field_name('value')
                     if not name_node:
@@ -122,6 +131,7 @@ class ASTParser:
                 
                 func_nodes = self._find_nodes_of_type(tree.root_node, 'function_definition')
                 for func_node in func_nodes:
+                    self._check_cancel(cancel_event)
                     func_name = self._extract_function_name(func_node, source_code)
                     if func_name:
                         byte_span = f"{func_node.start_byte}-{func_node.end_byte}"
@@ -134,12 +144,19 @@ class ASTParser:
             except Exception as e:
                 logger.error(f"AST Parsing failed on {filepath}: {e}")
 
-        self._regex_autosar_fallback(raw_code, uri, found_function_names, is_vendor_code)
-        self._extract_dcm_did_table_entries(raw_code)
+        self._check_cancel(cancel_event)
+        self._regex_autosar_fallback(raw_code, uri, found_function_names, is_vendor_code, cancel_event)
+        self._extract_dcm_did_table_entries(raw_code, cancel_event)
 
-    def _extract_dcm_did_table_entries(self, raw_code: bytes):
+    def _check_cancel(self, cancel_event=None):
+        cancel_event = cancel_event or self._cancel_event
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt
+
+    def _extract_dcm_did_table_entries(self, raw_code: bytes, cancel_event=None):
         """Scrapes (function, DID) pairs directly from a generated Dcm DID dispatch table, if this file has one."""
         for func_name, func_class_hex, did_hex in self.dcm_did_table_entry_re.findall(raw_code):
+            self._check_cancel(cancel_event)
             self.builder.add_dcm_did_table_entry(
                 func_name.decode('utf8', errors='ignore'),
                 did_hex.decode('utf8', errors='ignore'),
@@ -154,7 +171,7 @@ class ASTParser:
         text = re.sub(r'TASK\s*\(\s*([a-zA-Z0-9_]+)\s*\)', lambda m: f"void {m.group(1)}()".ljust(len(m.group(0))), text)
         return text.encode('utf-8')
 
-    def _regex_autosar_fallback(self, raw_code: bytes, uri: str, found_function_names: set, is_vendor_code: bool):
+    def _regex_autosar_fallback(self, raw_code: bytes, uri: str, found_function_names: set, is_vendor_code: bool, cancel_event=None):
         def process_discovered_func(func_name, byte_span, is_isr_task=False):
             if func_name not in found_function_names:
                 func_id = self.builder.add_function_node(func_name, uri, byte_span, is_vendor_code, is_isr_task)
@@ -186,9 +203,11 @@ class ASTParser:
                 self.builder.add_network_signal(func_id, sig_name, direction)
 
         for match in self.autosar_func_re.finditer(raw_code):
+            self._check_cancel(cancel_event)
             process_discovered_func(match.group(1).decode('utf8', errors='ignore'), f"{match.start()}-{match.end()}")
                 
         for match in self.autosar_task_re.finditer(raw_code):
+            self._check_cancel(cancel_event)
             process_discovered_func(match.group(1).decode('utf8', errors='ignore'), f"{match.start()}-{match.end()}", is_isr_task=True)
 
     def _process_function_internals(self, func_node, source_code: bytes, caller_id: str, func_name: str, file_global_ids: dict = None):
@@ -202,10 +221,12 @@ class ASTParser:
         call_target_spans = set()
 
         for call_node in self._find_nodes_of_type(func_node, 'call_expression'):
+            self._check_cancel()
             args = []
             args_node = call_node.child_by_field_name('arguments')
             if args_node:
                 for arg_node in args_node.children:
+                    self._check_cancel()
                     if arg_node.is_named:
                         args.append(source_code[arg_node.start_byte:arg_node.end_byte].decode('utf8', errors='ignore'))
 
@@ -224,13 +245,16 @@ class ASTParser:
         
         local_vars = set()
         for param_node in self._find_nodes_of_type(func_node, 'parameter_declaration'):
+            self._check_cancel()
             p_var = self._extract_first_identifier(param_node, source_code)
             if p_var: local_vars.add(p_var)
         for decl_node in self._find_nodes_of_type(func_node, 'declaration'):
+            self._check_cancel()
             local_vars.update(self._extract_all_declared_identifiers(decl_node, source_code))
 
         written_vars = set()
         for assign_node in self._find_nodes_of_type(func_node, 'assignment_expression'):
+            self._check_cancel()
             left_side = assign_node.child_by_field_name('left')
             if left_side:
                 var_name = self._extract_first_identifier(left_side, source_code)
@@ -238,11 +262,13 @@ class ASTParser:
                     written_vars.add(var_name)
 
         for update_node in self._find_nodes_of_type(func_node, 'update_expression'):
+            self._check_cancel()
             var_name = self._extract_first_identifier(update_node, source_code)
             if var_name and var_name not in local_vars:
                 written_vars.add(var_name)
 
         for ident in self._find_nodes_of_type(func_node, 'identifier'):
+            self._check_cancel()
             if (ident.start_byte, ident.end_byte) in call_target_spans:
                 continue
             var_name = source_code[ident.start_byte:ident.end_byte].decode('utf8', errors='ignore')
@@ -262,6 +288,7 @@ class ASTParser:
         results = []
         stack = [node]
         while stack:
+            self._check_cancel()
             current = stack.pop()
             if current.type == target_type:
                 results.append(current)

@@ -34,6 +34,7 @@ class AppConfig(BaseSettings):
     cheap_model_id: str
     cheap_deployment: str = ""
     cheap_base_url: str
+    cheap_api_style: str = "chat_responses"
 
     
     strong_subscription_key: str
@@ -42,6 +43,8 @@ class AppConfig(BaseSettings):
     strong_model_id: str
     strong_deployment: str = ""
     strong_base_url: str
+    strong_api_style: str = "chat_responses"
+    triage_model_tier: str = "cheap"
 
     
     cheap_token_pricing: TokenPricing = Field(default_factory=TokenPricing)

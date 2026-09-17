@@ -27,6 +27,7 @@ class LLMService:
         pricing: TokenPricing,
         default_headers: str = "",
         api_version: str = "",
+        api_style: str = "chat_completions",
         usage_listener: UsageCallback | None = None,
         tracker: TokenTracker | None = None,
     ) -> None:
@@ -37,6 +38,7 @@ class LLMService:
             base_url=base_url,
             default_headers=default_headers,
             api_version=api_version,
+            api_style=api_style,
         )
         self.prompts = self._load_prompts()
         self.tracker = tracker or TokenTracker()

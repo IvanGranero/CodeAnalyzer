@@ -25,6 +25,7 @@ def build_app_context() -> AppContext:
         base_url=settings.cheap_base_url,
         default_headers=settings.cheap_headers,
         api_version=settings.cheap_api_version,
+        api_style=settings.cheap_api_style,
         pricing=settings.cheap_token_pricing,
         tracker=tracker,
     )
@@ -35,6 +36,7 @@ def build_app_context() -> AppContext:
         base_url=settings.strong_base_url,
         default_headers=settings.strong_headers,
         api_version=settings.strong_api_version,
+        api_style=settings.strong_api_style,
         pricing=settings.strong_token_pricing,
         tracker=tracker,
     )

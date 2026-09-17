@@ -2,6 +2,7 @@
 
 import json
 import ast
+import asyncio
 from copy import deepcopy
 from typing import Callable
 from llm.runtime import CallBinder
@@ -117,6 +118,7 @@ class ReadOnlyToolRegistry:
     def __init__(self, analyzer_tools, allowed_tools=None, audit_callback=None, allowed_file_spans=None, allowed_functions=None):
         self.tools = analyzer_tools
         self.activity_callback = None
+        self._activity_loop = None
         self.audit_callback = audit_callback
         self.allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
         self.allowed_file_spans = None if allowed_file_spans is None else frozenset(allowed_file_spans)
@@ -179,10 +181,15 @@ class ReadOnlyToolRegistry:
             allowed_functions=allowed_functions,
         )
         scoped_registry.activity_callback = self.activity_callback
+        scoped_registry._activity_loop = self._activity_loop
         return scoped_registry
 
     def set_activity_callback(self, callback) -> None:
         self.activity_callback = callback
+        try:
+            self._activity_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._activity_loop = None
 
     def call(self, name: str, arguments: dict) -> str:
         if self.allowed_tools is not None and name not in self.allowed_tools:
@@ -190,10 +197,18 @@ class ReadOnlyToolRegistry:
         if self.activity_callback is not None:
             callback = getattr(self.activity_callback, "tool", None)
             if callback is not None:
-                import asyncio
                 result = callback(name)
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    try:
+                        current_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        current_loop = None
+                    if current_loop is self._activity_loop:
+                        current_loop.create_task(result)
+                    elif self._activity_loop is not None:
+                        asyncio.run_coroutine_threadsafe(result, self._activity_loop)
+                    else:
+                        result.close()
         handler: Callable | None = self.handlers.get(name)
         if handler is None:
             return json.dumps({"error": f"Tool '{name}' is not allow-listed."})

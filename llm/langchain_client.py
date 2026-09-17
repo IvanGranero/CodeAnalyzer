@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import hashlib
 import json
 import logging
@@ -13,8 +12,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langchain_google_vertexai.model_garden import ChatAnthropicVertex
-from langchain_litellm import ChatLiteLLM
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
+
+from llm.native_chat_model import NativeOpenAIChatModel
 
 logger = logging.getLogger(__name__)
 ToolDefinition = Mapping[str, Any]
@@ -86,6 +87,7 @@ class LLMClient:
         base_url: str,
         default_headers: str = "",
         api_version: str = "",
+        api_style: str = "chat_completions",
         audit_log_dir: str = "logs/llm_audit",
     ) -> None:
         self.api_keys = [key.strip() for key in api_key.split(",") if key.strip()]
@@ -96,6 +98,7 @@ class LLMClient:
         self.base_url = base_url.rstrip('/')
         self.default_headers = self._parse_pairs(default_headers)
         self.api_version = api_version
+        self.api_style = api_style
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
         self._current_index = 0
@@ -109,7 +112,6 @@ class LLMClient:
         return dict(zip(parts[::2], parts[1::2]))
 
     def _build_model(self, api_key: str, settings: Mapping[str, Any]) -> BaseChatModel:
-        
         if self.model_name.startswith("anthropic/"):
             return ChatAnthropicVertex(
                 access_token=api_key,
@@ -117,34 +119,35 @@ class LLMClient:
                 location="_",
                 model=self.deployment,
                 base_url=self.base_url,
+                timeout=300.0,
+                max_retries=0,
             )
 
-        
         deployment_base_url = f"{self.base_url.rstrip('/')}/{self.deployment}"
-        os.environ["OPENAI_API_KEY"] = api_key
-        if self.model_name.startswith("openai/"):
-            os.environ["OPENAI_API_BASE"] = deployment_base_url
-        else:
-            os.environ["AZURE_API_BASE"] = deployment_base_url
-            os.environ["AZURE_API_KEY"] = api_key
-        if self.api_version:
-            os.environ["AZURE_API_VERSION"] = self.api_version
-
-        model_kwargs: dict[str, Any] = {"headers": self.default_headers} if self.default_headers else {}
-        if settings.get("reasoning_effort") is not None:
-            model_kwargs["reasoning_effort"] = settings["reasoning_effort"]
-        if settings.get("response_format") == "json_object":
-            model_kwargs["response_format"] = {"type": "json_object"}
-        constructor_args: dict[str, Any] = {
-            "model": self.model_name,
-            "request_timeout": 300.0,
-            "max_retries": 0,
-            "model_kwargs": model_kwargs,
-        }
-        token_limit = settings.get("max_completion_tokens", settings.get("max_tokens"))
-        if token_limit is not None:
-            constructor_args["max_tokens"] = token_limit
-        return ChatLiteLLM(**constructor_args)
+        is_azure = self.model_name.startswith("azure/")
+        api_style = self.api_style
+        model_name = self.model_name.split("/", 1)[1] if "/" in self.model_name else self.model_name
+        if is_azure:
+            model_name = self.deployment or model_name
+        base_url = deployment_base_url if self.deployment else self.base_url
+        default_query = {"api-version": self.api_version} if is_azure and self.api_version else None
+        async_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            default_headers=self.default_headers or None,
+            default_query=default_query,
+            timeout=300.0,
+            max_retries=0,
+        )
+        return NativeOpenAIChatModel(
+            model=model_name,
+            api_style=api_style,
+            max_completion_tokens=settings.get("max_completion_tokens", settings.get("max_tokens")),
+            max_tool_calls=int(settings.get("max_tool_calls", 6)),
+            reasoning_effort=settings.get("reasoning_effort"),
+            response_format={"type": "json_object"} if settings.get("response_format") == "json_object" else None,
+            async_client=async_client,
+        )
 
     @staticmethod
     def _tool_schema(definition: ToolDefinition) -> tuple[str, str, Mapping[str, Any]]:
@@ -190,6 +193,18 @@ class LLMClient:
             ))
         return result
 
+    @staticmethod
+    def _text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, Mapping) and block.get("type") == "text"
+            )
+        return ""
+
     async def generate_chat(
         self,
         system_prompt: str,
@@ -209,33 +224,36 @@ class LLMClient:
         tool_actions: list[Any] = []
 
         if tools and tool_handler:
-            from langchain.agents import AgentExecutor, create_tool_calling_agent
-            from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+            from langchain.agents import create_agent
 
             lc_tools = self._tools(tools, tool_handler)
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                ("human", "{input}"),
-                MessagesPlaceholder("agent_scratchpad"),
-            ])
-            agent = create_tool_calling_agent(model, lc_tools, prompt)
-            executor = AgentExecutor(
-                agent=agent,
+            agent = create_agent(
+                model,
                 tools=lc_tools,
-                max_iterations=4,
-                return_intermediate_steps=True,
-                verbose=False,
-            ).with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
-            result = await executor.ainvoke(
-                {"input": user_prompt},
-                config={"callbacks": [usage_capture]},
+                system_prompt=system_prompt,
             )
-            text = result.get("output", "")
-            tool_actions = result.get("intermediate_steps", [])
+            result = await agent.ainvoke(
+                {"messages": messages},
+                config={
+                    "callbacks": [usage_capture],
+                    "recursion_limit": int(settings.get("agent_recursion_limit", 16)),
+                },
+            )
+            result_messages = result.get("messages", [])
+            final_message = next(
+                (message for message in reversed(result_messages) if isinstance(message, AIMessage)),
+                None,
+            )
+            text = self._text_content(final_message.content) if final_message is not None else ""
+            tool_actions = [
+                message
+                for message in result_messages
+                if getattr(message, "type", None) == "tool"
+            ]
         else:
             runnable = model.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
             response = await runnable.ainvoke(messages, config={"callbacks": [usage_capture]})
-            text = response.content if isinstance(response, AIMessage) else str(response)
+            text = self._text_content(response.content) if isinstance(response, AIMessage) else str(response)
             usage_capture.usage = _usage_dict(response) or usage_capture.usage
 
         if not isinstance(text, str) or not text.strip():

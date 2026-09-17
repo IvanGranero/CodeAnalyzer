@@ -61,9 +61,18 @@ class ScanPhase:
         self.max_concurrent = max_concurrent
         self.progress = ScanProgress(event_sink=event_sink)
 
-    async def prioritize(self, max_targets: int, domain_filter: Optional[str], file_filter: Optional[str]) -> list:
+    async def prioritize(
+        self,
+        max_targets: int,
+        domain_filter: Optional[str],
+        file_filter: Optional[str],
+        uds_only: bool = False,
+    ) -> list:
         return await self.orchestrator.prioritize_targets(
-            max_targets=max_targets, domain_filter=domain_filter, file_filter=file_filter
+            max_targets=max_targets,
+            domain_filter=domain_filter,
+            file_filter=file_filter,
+            uds_only=uds_only,
         )
 
     async def run(
@@ -132,6 +141,10 @@ class ScanPhase:
             report["_target_function"] = target_func
             self.report_store.save(cache_name, report)
             await self.progress.target_finished(target_func, report)
+
+            if report.get("scan_status") == "error":
+                logger.error(f"[SCAN ERROR] -> {target_func}: {report.get('error', report.get('details', 'unknown error'))}")
+                return
 
             if not report.get("vulnerability_found"):
                 logger.info(f"✔ [CLEAN] -> {target_func}")

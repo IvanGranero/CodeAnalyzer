@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+from threading import Event
 from pathlib import Path
 from typing import Any
 from tools.graph.manager import GraphManager
@@ -34,6 +35,7 @@ class IngestionPipeline:
         vendor_folders: list = None,
         config_files: list = None,
         vendor_parse_mode: str = "full",
+        cancel_event: Event | None = None,
     ) -> dict[str, Any]:
         if vendor_folders is None:
             vendor_folders = []
@@ -101,6 +103,8 @@ class IngestionPipeline:
 
         print("")
         for idx, filepath in enumerate(all_files, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
             percent = (idx / total_files) * 100 if total_files else 100
             
             is_vendor_code = is_vendor_file(
@@ -125,6 +129,7 @@ class IngestionPipeline:
                     str(filepath),
                     is_vendor_code,
                     parse_vendor_internals=parse_vendor_internals,
+                    cancel_event=cancel_event,
                 )
                 report["source_files_parsed"] += 1
             except KeyboardInterrupt:

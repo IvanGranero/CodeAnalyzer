@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -42,6 +43,7 @@ class ScanRequest:
     limit: int | None = None
     scan_all: bool = False
     target_file: str | None = None
+    uds_only: bool = False
     resume: bool = False
     skip_ingest: bool = False
     skip_exploit: bool = False
@@ -109,6 +111,7 @@ class ScanApplication:
                         limit=request.limit,
                         scan_all=request.scan_all,
                         target_file=request.target_file,
+                        uds_only=request.uds_only,
                         resume=request.resume,
                         skip_ingest=request.skip_ingest,
                         skip_exploit=request.skip_exploit,
@@ -192,12 +195,20 @@ class ScanApplication:
             logger.info("--- PHASE 2: Skipped (using cached graph) ---")
         else:
             self._emit(AppEvent(phase="ingestion", kind=EventKind.PHASE_STARTED))
-            ingestion_report = await asyncio.to_thread(
-                IngestionPhase().run,
-                str(request.source_directory),
-                self.context.graph,
-                config_json,
-            )
+            ingestion_cancel_event = threading.Event()
+            ingestion_worker = asyncio.create_task(asyncio.to_thread(
+                    IngestionPhase().run,
+                    str(request.source_directory),
+                    self.context.graph,
+                    config_json,
+                    ingestion_cancel_event,
+                ))
+            try:
+                ingestion_report = await ingestion_worker
+            except asyncio.CancelledError:
+                ingestion_cancel_event.set()
+                await asyncio.shield(ingestion_worker)
+                raise
             self._emit(
                 AppEvent(
                     phase="ingestion",
@@ -281,6 +292,7 @@ class ScanApplication:
             max_targets=scan_limit,
             domain_filter=selected_domain,
             file_filter=request.target_file,
+            uds_only=request.uds_only,
         )
         targets_to_scan = [
             target

@@ -40,6 +40,7 @@ async def run(args) -> None:
         limit=args.limit,
         scan_all=args.scan_all,
         target_file=args.target_file,
+        uds_only=args.uds_only,
         resume=args.resume,
         skip_ingest=args.skip_ingest,
         skip_exploit=args.skip_exploit,

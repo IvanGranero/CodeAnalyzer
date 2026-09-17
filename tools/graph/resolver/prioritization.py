@@ -8,13 +8,28 @@ logger = logging.getLogger(__name__)
 class PrioritizationMixin:
     """Deterministic (non-LLM) selection of the highest-risk scan targets."""
 
-    def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None, vendor_folders: list[str] | None = None, application_roots: list[str] | None = None) -> list:
+    def get_prioritized_targets(
+        self,
+        max_targets: int,
+        domain_filter: str = None,
+        file_filter: str = None,
+        vendor_folders: list[str] | None = None,
+        application_roots: list[str] | None = None,
+        uds_only: bool = False,
+    ) -> list:
         
         
         
         
         cypher_filter = ""
         params: Dict[str, Any] = {}
+
+        if uds_only:
+            cypher_filter += (
+                " AND (coalesce(f.tainted_by_uds, false) = true "
+                "OR size(coalesce(f.reachable_from_dids, [])) > 0 "
+                "OR EXISTS { MATCH (f)-[:HANDLES_UDS]->() })"
+            )
 
         if domain_filter:
             cypher_filter += " AND (f.storage_uri CONTAINS $domain_slash OR f.storage_uri CONTAINS $domain_backslash)"

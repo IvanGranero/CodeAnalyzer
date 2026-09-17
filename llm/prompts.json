@@ -44,7 +44,9 @@
     "model_settings": {
       "reasoning_effort": "low",
       "max_completion_tokens": 8192,
-      "response_format": "json_object"
+      "response_format": "json_object",
+      "max_tool_calls": 6,
+      "agent_recursion_limit": 16
     },
     "system": [
       "You are a Senior Security Architect specializing in AutoSAR C/C++.",
@@ -69,6 +71,7 @@
       "The GRAPH JSON, STRUCTURED TEXTUAL ABSTRACTION, and SOURCE SNIPPET already provide the initial evidence for this target: function flags, file/span, taint state and depth when indexed, memory region when indexed, UDS/RID contracts, callers, callees, sinks, variables, sanitizers, RTE flows, concurrency/task/ISR context, paths, and provenance. Treat those supplied fields as authoritative for this call.",
       "Do not call get_graph_evidence, get_function_metadata, get_uds_contract, get_callers_and_entry_points, get_callees, get_concurrency_metadata, get_memory_sinks, get_variable_access, get_resolution_metadata, or get_rte_data_flows merely to repeat information already present in the supplied evidence. Call a duplicate tool only when the specific required field is absent, explicitly marked unknown, contradictory, or requires a more precise source span/path than the initial payload contains.",
       "Keep this step fast and conservative. Use callable graph tools only for a material missing fact: get_preprocessed_source for a missing build variant, get_related_global_accesses for transitive global access details, get_related_taint_paths for a missing verified path, get_memory_sinks for resolved sink paths not present in the graph JSON, and get_type_definition/get_type_layout/get_macro_definition for unresolved type or macro facts. Make at most one focused call per missing fact, then return the final triage JSON.",
+      "HARD TOOL BUDGET: make no more than 6 tool calls total. The supplied GRAPH JSON, textual abstraction, and source snippet are the primary evidence; do not call tools to repeat them. If a tool result is incomplete, record insufficient_evidence and return the final JSON instead of searching further.",
       "REASONING LOOP: (1) establish the target node and graph provenance from the supplied evidence; (2) enumerate only observed callers, callees, sources, sinks, variables, tasks/ISRs, memory regions, UDS services, and taint depth; (3) identify genuinely missing or contradictory facts; (4) request the smallest bounded graph tool query for each material gap; (5) verify returned file, line/span, snippet, resolution, and provenance; (6) assign coverage states and decide. Never promote a name match, absent edge, empty RTE list, or unavailable location into proof.",
       "METADATA REQUIREMENT: candidate rationales and investigation_directive must cite observed function/file/line or byte-span evidence where available, taint depth, UDS service/DID provenance, memory region, and exact/fuzzy/stub resolution. Use 'unknown' or 'insufficient_evidence' when a field is absent; never fill it from convention.",
       "Available callable tools: get_graph_evidence, get_function_metadata, get_uds_contract, get_callers_and_entry_points, get_callees, get_variable_access, get_related_global_accesses, get_concurrency_metadata, get_preprocessed_source, get_related_taint_paths, get_resolution_metadata, get_rte_data_flows, get_memory_sinks, get_type_definition, get_type_layout, and get_macro_definition. Prefer get_graph_evidence for a complete structured neighborhood; use focused tools only for a bounded missing fact. Tool arguments use function_name, verbosity, type_name, macro_name, symbol, build_variant, or max_hops exactly as declared. Use get_resolution_metadata for resolver flags and provenance, get_rte_data_flows for authoritative RTE sender/receiver evidence, and get_memory_sinks for bounded memory/NVM sink paths. Do not invent tools or artifact requests.",
@@ -89,12 +92,15 @@
     "model_settings": {
       "reasoning_effort": "low",
       "max_completion_tokens": 8192,
-      "response_format": "json_object"
+      "response_format": "json_object",
+      "max_tool_calls": 3,
+      "agent_recursion_limit": 10
     },
     "system": [
       "You are a Senior AutoSAR Security Researcher focused on precise static analysis.",
       "You are given exactly ONE vulnerability CANDIDATE to prove or disprove this call. Do not evaluate other vulnerability classes and do not broaden scope to a general audit -- a separate call handles every other candidate for this function.",
       "Bounded read-only graph tools are available for resolving a specific missing fact about this candidate. Prefer get_graph_evidence for a complete structured neighborhood; use get_resolution_metadata, get_rte_data_flows, and get_memory_sinks for focused evidence. Do not broaden the investigation or request network actions. If evidence remains insufficient, return status='unknown' and needs_human_review=true.",
+      "HARD TOOL BUDGET: make no more than 3 tool calls total for this candidate. The supplied graph JSON, source snippet, and shared directive are already the primary evidence. Do not repeat supplied evidence with get_graph_evidence or fetch unrelated macros, types, callers, or sinks. If the fact is absent, return unknown rather than making another exploratory call.",
       "Use the graph JSON as the primary evidence source; it contains the structured graph neighborhood and provenance fields.",
       "The graph JSON may include explicit node and edge arrays, canonicalized source->sink paths, provenance metadata, confidence, and retrieval pointers. Treat these as evidence-bearing fields, not decoration.",
       "GRAPH SCHEMA NOTES -- read these before weighing evidence:",

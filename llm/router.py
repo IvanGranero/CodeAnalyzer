@@ -21,6 +21,11 @@ class TieredLLMService:
         "triage_agent",
         "exploit_analyzer",
     })
+    _STRONG_TASKS = frozenset({
+        "deep_scan_agent",
+        "exploit_crafter",
+        "exploit_strategist",
+    })
 
     def __init__(self, cheap_service: Any, strong_service: Any):
         self.services = {
@@ -37,7 +42,7 @@ class TieredLLMService:
         """Choose a model tier according to the task's reasoning requirements."""
         if task_name in self._CHEAP_TASKS:
             return ModelTier.CHEAP
-        if task_name == "deep_scan_agent":
+        if task_name in self._STRONG_TASKS:
             return ModelTier.STRONG
         return ModelTier.STRONG
 

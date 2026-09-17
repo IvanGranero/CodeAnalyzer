@@ -530,7 +530,13 @@ class ScanOrchestrator:
             ],
         }).model_dump(mode="json")
 
-    async def prioritize_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None) -> list:
+    async def prioritize_targets(
+        self,
+        max_targets: int,
+        domain_filter: str = None,
+        file_filter: str = None,
+        uds_only: bool = False,
+    ) -> list:
         return await prioritize_targets(
             self.graph_resolver,
             max_targets,
@@ -538,4 +544,5 @@ class ScanOrchestrator:
             file_filter,
             vendor_folders=self.vendor_folders,
             application_roots=self.application_roots,
+            uds_only=uds_only,
         )
