@@ -76,7 +76,7 @@ class NL2CypherEngine:
             if result:
                 return str(result[0]['value'])
         except Exception as e:
-            logger.warning(f"Could not retrieve schema via APOC: {e}")
+            logger.debug("APOC schema procedure unavailable; using static graph schema: %s", e)
         return self._static_schema_summary()
 
     def _build_prompt(self, user_query: str, schema: str) -> str:

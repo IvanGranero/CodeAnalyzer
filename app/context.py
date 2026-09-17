@@ -18,15 +18,26 @@ class AppContext:
 def build_app_context() -> AppContext:
     """Bootstraps the LLM service and graph manager from validated Settings."""
     tracker = TokenTracker()
-    cheap_llm = LLMService(
-        api_key=settings.cheap_subscription_key,
-        model_name=settings.cheap_model_id,
-        deployment=settings.cheap_deployment,
-        base_url=settings.cheap_base_url,
-        default_headers=settings.cheap_headers,
-        api_version=settings.cheap_api_version,
-        api_style=settings.cheap_api_style,
-        pricing=settings.cheap_token_pricing,
+    lite_llm = LLMService(
+        api_key=settings.lite_subscription_key,
+        model_name=settings.lite_model_id,
+        deployment=settings.lite_deployment,
+        base_url=settings.lite_base_url,
+        default_headers=settings.lite_headers,
+        api_version=settings.lite_api_version,
+        api_style=settings.lite_api_style,
+        pricing=settings.lite_token_pricing,
+        tracker=tracker,
+    )
+    medium_llm = LLMService(
+        api_key=settings.medium_subscription_key,
+        model_name=settings.medium_model_id,
+        deployment=settings.medium_deployment,
+        base_url=settings.medium_base_url,
+        default_headers=settings.medium_headers,
+        api_version=settings.medium_api_version,
+        api_style=settings.medium_api_style,
+        pricing=settings.medium_token_pricing,
         tracker=tracker,
     )
     strong_llm = LLMService(
@@ -45,7 +56,7 @@ def build_app_context() -> AppContext:
         user=settings.neo4j_user,
         password=settings.neo4j_password,
     )
-    llm = TieredLLMService(cheap_llm, strong_llm)
+    llm = TieredLLMService(lite_llm, medium_llm, strong_llm)
     return AppContext(llm=llm, graph=graph)
 
 

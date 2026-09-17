@@ -28,15 +28,22 @@ class AppConfig(BaseSettings):
     )
 
     
-    cheap_subscription_key: str
-    cheap_headers: str = ""
-    cheap_api_version: str = ""
-    cheap_model_id: str
-    cheap_deployment: str = ""
-    cheap_base_url: str
-    cheap_api_style: str = "chat_responses"
+    lite_subscription_key: str
+    lite_headers: str = ""
+    lite_api_version: str = ""
+    lite_model_id: str
+    lite_deployment: str = ""
+    lite_base_url: str
+    lite_api_style: str = "chat_responses"
 
-    
+    medium_subscription_key: str
+    medium_headers: str = ""
+    medium_api_version: str = ""
+    medium_model_id: str
+    medium_deployment: str = ""
+    medium_base_url: str
+    medium_api_style: str = "chat_responses"
+
     strong_subscription_key: str
     strong_headers: str = ""
     strong_api_version: str = ""
@@ -44,10 +51,9 @@ class AppConfig(BaseSettings):
     strong_deployment: str = ""
     strong_base_url: str
     strong_api_style: str = "chat_responses"
-    triage_model_tier: str = "cheap"
 
-    
-    cheap_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
+    lite_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
+    medium_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
     strong_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
 
 

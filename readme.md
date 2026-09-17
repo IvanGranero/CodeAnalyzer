@@ -90,7 +90,7 @@ A failed connection is retried for the current vulnerability before the exploit 
 
 Run the orchestrator using the main `codeanalyzer.py` entrypoint. Point it at the root directory of your AutoSAR source code.
 
-Running `python codeanalyzer.py` without arguments prints the command help and exits. The current directory is used only when a scan option is supplied without an explicit source directory, such as `--tui`.
+Running `python codeanalyzer.py` without arguments prints the command help and exits. The current directory is used only when a scan option is supplied without an explicit source directory, such as `--repl`.
 
 ### Command-Line Options
 
@@ -112,7 +112,7 @@ Command-line parsing happens before environment configuration is loaded, so `--h
 | `--skip-exploit` | Disables the dynamic exploit validation phase for UDS-reachable findings. |
 | `--resume` | Loads completed reports from `scan_cache/` and schedules unfinished scans and UDS exploit validations. |
 | `--exploit-only REPORT.json` | Skips discovery, ingestion, domain selection, and static scanning, then executes the exploit loop for each vulnerability in the supplied JSON report. |
-| `--tui` | Runs the Textual interface with live phase, target, finding, and cancellation status. |
+| `--repl` | Runs the text-based graph, scan, and exploit exploration session. |
 
 The normal scan flow is discovery, graph ingestion, domain selection, static scanning, and exploit validation for findings that are reachable through UDS/DoIP. The `--exploit-only` option is a separate direct-validation mode and does not require a new scan.
 
@@ -171,15 +171,23 @@ The report must be a JSON object keyed by function name. Each value should conta
 
 The domain is inferred from the first report entry and passed to every exploit in direct mode. Exploit results are printed in the final log output; this mode does not write a new consolidated scan report.
 
-### Textual Interface
+### Interactive REPL
 
-Use the optional Textual interface for live scan progress without terminal log output:
+Use the REPL to query the graph, inspect nodes and edges, scan a selected function, and validate the last vulnerable scan result:
 
 ```bash
-python codeanalyzer.py ./path/to/AutoSAR_Project/ --tui --limit 10
+python codeanalyzer.py ./path/to/AutoSAR_Project/ --repl
 ```
 
-The interface provides a live scan overview with stage, completed and remaining targets, active workers, errors, token/cost usage, and pause state. Findings are listed individually with severity, confidence, classification, file location, target function, exploitability, and review status. Select a finding to inspect its source snippet, byte spans, taint and call paths, CFG blocks, concurrency relationships, unresolved references, and agent rationale when available. Press `p` to pause or resume queued target work, or `q` to exit. Active target analyses finish before a pause takes effect. The first TUI screen intentionally avoids stdin-based domain selection; use `--target-file`, `--scan-all`, or `--limit` to define the scan scope.
+```text
+:query show me who calls functionX
+:nodes
+:select functionX
+:scan
+:exploit
+:status
+:quit
+```
 
 ## 🏗️ Architecture Pipeline
 

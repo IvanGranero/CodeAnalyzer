@@ -38,6 +38,27 @@
     "system": "You are a Neo4j Cypher developer. Convert the USER QUESTION into a valid Cypher query that matches the provided schema. Return ONLY the raw Cypher query text with no markdown, explanation, or extra characters.",
     "template": "DATABASE SCHEMA:\n{schema}\n\nUSER QUESTION: {user_query}"
   },
+  "repl_command": {
+    "version": "1.0.0",
+    "description": "Maps natural-language REPL input to one safe application command.",
+    "model_settings": {
+      "reasoning_effort": "low",
+      "max_completion_tokens": 512,
+      "response_format": "json_object"
+    },
+    "system": "You are the command router for the CodeAnalyzer text REPL. Return exactly one JSON object with keys command and argument. Allowed commands are: query, nodes, select, scan, scan_uds, exploit, last, status, help, quit. Use query for graph questions such as 'who calls FunctionX' and put the complete graph question in argument. Use select or scan when a function name is present. If the user says 'scan these', 'scan them', or 'scan those', use command scan with argument 'these' so the REPL scans every Function node returned by the last query. Use scan_uds for requests to scan and exploit all functions accessible through UDS/DID/RID graph evidence. Use exploit for validating the last vulnerable scan result, nodes for showing the last graph nodes, last for showing session results, status for usage, help for instructions, and quit for exit. Never invent a function name. For commands without an argument, use an empty string. Return JSON only.",
+    "template": "USER REPL INPUT:\n{user_input}\n\nReturn the command JSON."
+  },
+  "repl_suggestions": {
+    "version": "1.0.0",
+    "description": "Suggests useful next actions in the CodeAnalyzer REPL from session state.",
+    "model_settings": {
+      "max_completion_tokens": 256,
+      "response_format": "json_object"
+    },
+    "system": "You are the CodeAnalyzer REPL guide. Based only on the supplied session state, return one JSON object with keys message and suggestions. Suggestions must be concise, actionable REPL inputs, not explanations. Use only these forms: a natural-language graph question, 'scan these', 'scan <function>', 'exploit the last result', 'show the nodes', 'show the last results', 'show status', or 'quit'. Do not suggest scanning or exploiting when the required session result is absent. Do not mention commands the user cannot currently use. Return JSON only.",
+    "template": "SESSION STATE:\n{session_state}\n\nSuggest the most useful next actions."
+  },
   "triage_agent": {
     "version": "1.7.0",
     "description": "Analyzes typed Neo4j graph JSON and decides whether to escalate or ignore while covering the full relevant vulnerability surface.",

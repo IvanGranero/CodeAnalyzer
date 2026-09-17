@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Literal, Sequence
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -9,6 +10,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.outputs import ChatGeneration, ChatResult
 from openai import AsyncOpenAI
 from pydantic import ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 
 class NativeOpenAIChatModel(BaseChatModel):
@@ -167,8 +170,18 @@ def _chat_message(response: Any) -> AIMessage:
             "id": call.id,
             "type": "tool_call",
         })
+    content = _message_content(message)
+    if not content and not tool_calls:
+        logger.warning(
+            "Native chat response contained no assistant text: finish_reason=%s refusal=%s "
+            "message_fields=%s usage=%s",
+            getattr(choice, "finish_reason", None),
+            bool(getattr(message, "refusal", None)),
+            sorted(_object_fields(message)),
+            _usage_metadata(response),
+        )
     return AIMessage(
-        content=message.content or "",
+        content=content,
         tool_calls=tool_calls,
         response_metadata={"finish_reason": choice.finish_reason},
         usage_metadata=_usage_metadata(response),
@@ -191,7 +204,39 @@ def _responses_message(response: Any) -> AIMessage:
                 "id": item.call_id,
                 "type": "tool_call",
             })
+    if not content:
+        logger.warning(
+            "Native Responses API response contained no output text: status=%s output_items=%s usage=%s",
+            getattr(response, "status", None),
+            len(getattr(response, "output", []) or []),
+            _usage_metadata(response),
+        )
     return AIMessage(content=content, tool_calls=tool_calls, usage_metadata=_usage_metadata(response))
+
+
+def _message_content(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {"text", "output_text"}
+        )
+    refusal = getattr(message, "refusal", None)
+    if refusal:
+        return str(refusal)
+    reasoning = getattr(message, "reasoning_content", None)
+    return str(reasoning) if reasoning else ""
+
+
+def _object_fields(value: Any) -> set[str]:
+    if hasattr(value, "model_fields_set"):
+        return set(value.model_fields_set)
+    if hasattr(value, "__dict__"):
+        return {key for key in vars(value) if not key.startswith("_")}
+    return set()
 
 
 def _usage_metadata(response: Any) -> dict[str, int] | None:

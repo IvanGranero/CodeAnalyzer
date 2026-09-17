@@ -25,5 +25,5 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-ingest", action="store_true", help="Skip the graph building phase.")
     parser.add_argument("--skip-exploit", action="store_true", help="Skip the dynamic exploit validation phase.")
     parser.add_argument("--exploit-only", type=str, help="Path to a vulnerability JSON report to exploit directly.")
-    parser.add_argument("--tui", action="store_true", help="Run the interactive Textual interface.")
+    parser.add_argument("--repl", action="store_true", help="Run the text-based graph and analysis REPL.")
     return parser

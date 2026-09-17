@@ -3,6 +3,7 @@
 from typing import Any
 
 from tools.graph.manager import GraphManager
+from tools.graph.query_service import GraphQueryService
 
 
 class GraphService:
@@ -10,6 +11,7 @@ class GraphService:
 
     def __init__(self, graph: GraphManager):
         self.graph = graph
+        self.query_service = GraphQueryService(graph.db, graph.nl_engine)
 
     @property
     def resolver(self):
@@ -23,3 +25,6 @@ class GraphService:
 
     def close(self) -> None:
         self.graph.close()
+
+    def ask(self, question: str) -> dict[str, Any]:
+        return self.query_service.ask(question)

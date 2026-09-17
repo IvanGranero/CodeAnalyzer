@@ -43,10 +43,20 @@ def main() -> None:
     try:
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        if args.tui:
-            from app.tui import run_tui
+        if args.repl:
+            from pathlib import Path
 
-            run_tui(args)
+            from app.context import build_app_context, shutdown
+            from app.repl import ApplicationRepl
+
+            source_directory = Path(args.source_dir).resolve()
+            if not source_directory.is_dir():
+                parser.error(f"The directory '{source_directory}' does not exist.")
+            app_context = build_app_context()
+            try:
+                ApplicationRepl(app_context, source_directory).run()
+            finally:
+                shutdown(app_context)
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

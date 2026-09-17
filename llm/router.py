@@ -1,4 +1,4 @@
-"""Task-aware routing between cheap and strong LLM services."""
+"""Task-aware routing between lite, medium, and strong LLM services."""
 
 from collections.abc import Mapping, Sequence
 from enum import Enum
@@ -8,16 +8,21 @@ from llm.langchain_client import ToolDefinition, ToolHandler, UsageCallback
 
 
 class ModelTier(str, Enum):
-    CHEAP = "cheap"
+    LITE = "lite"
+    MEDIUM = "medium"
     STRONG = "strong"
 
 
 class TieredLLMService:
-    """Route prompt tasks to cheap or strong services by investigation cost."""
+    """Route prompt tasks to lite, medium, or strong services by investigation cost."""
 
-    _CHEAP_TASKS = frozenset({
+    _LITE_TASKS = frozenset({
         "discovery",
         "nl2cypher",
+        "repl_command",
+        "repl_suggestions",
+    })
+    _MEDIUM_TASKS = frozenset({
         "triage_agent",
         "exploit_analyzer",
     })
@@ -27,9 +32,10 @@ class TieredLLMService:
         "exploit_strategist",
     })
 
-    def __init__(self, cheap_service: Any, strong_service: Any):
+    def __init__(self, lite_service: Any, medium_service: Any, strong_service: Any):
         self.services = {
-            ModelTier.CHEAP: cheap_service,
+            ModelTier.LITE: lite_service,
+            ModelTier.MEDIUM: medium_service,
             ModelTier.STRONG: strong_service,
         }
 
@@ -40,8 +46,10 @@ class TieredLLMService:
         settings_override: Mapping[str, Any] | None = None,
     ) -> ModelTier:
         """Choose a model tier according to the task's reasoning requirements."""
-        if task_name in self._CHEAP_TASKS:
-            return ModelTier.CHEAP
+        if task_name in self._LITE_TASKS:
+            return ModelTier.LITE
+        if task_name in self._MEDIUM_TASKS:
+            return ModelTier.MEDIUM
         if task_name in self._STRONG_TASKS:
             return ModelTier.STRONG
         return ModelTier.STRONG
