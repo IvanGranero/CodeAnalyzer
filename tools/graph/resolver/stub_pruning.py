@@ -13,10 +13,10 @@ class StubPruningMixin:
         We delete them to keep the graph lean.
         """
         logger.info("Pruning local variable stubs to optimize graph size...")
-        # NOTE: stubs with an incoming READS_VAR/WRITES_VAR edge are NOT pruned here.
-        # Those edges are exactly the evidence a vulnerability finding relies on ("this
-        # function writes to X") -- deleting the stub silently destroys that evidence.
-        # Only truly orphaned stubs (created but never actually referenced) are cleaned up.
+        
+        
+        
+        
         query = """
         MATCH (n:Stub)
         WHERE NOT ()-[:CALLS]->(n)

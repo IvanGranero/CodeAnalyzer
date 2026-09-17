@@ -716,8 +716,8 @@ def run_tui(args) -> None:
         exploit_only=Path(args.exploit_only) if args.exploit_only else None,
     )
     try:
-        # Console logging writes directly into the terminal surface Textual is
-        # composing, which causes redraw artifacts while a scan is active.
+        
+        
         previous_disable = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
         ScanTUI(request, context).run()

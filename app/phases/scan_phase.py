@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_SCANS = 1
 
-# Applied only when no domain was selected and no --target-file was given (an
-# unscoped, whole-repository scan) and the user did not pass --limit explicitly.
-# Keeps the historical safety default for that one case; a domain-scoped scan
-# defaults to exhaustive instead (see resolve_scan_limit).
+
+
+
+
 DEFAULT_GLOBAL_SCAN_LIMIT = 50
 
 
@@ -146,7 +146,7 @@ class ScanPhase:
                 return
 
             await self.exploit_phase.enqueue(report, target_func, selected_domain)
-            # Keep one target's triage, deep scans, and exploit validation together.
+            
             await self.exploit_phase.wait_until_idle()
 
     @staticmethod

@@ -27,7 +27,7 @@ class AppConfig(BaseSettings):
         extra='ignore',
     )
 
-    # --- Cheap tier ("orchestrator") -----------------------------------------
+    
     cheap_subscription_key: str
     cheap_headers: str = ""
     cheap_api_version: str = ""
@@ -35,7 +35,7 @@ class AppConfig(BaseSettings):
     cheap_deployment: str = ""
     cheap_base_url: str
 
-    # --- Strong tier ("code analyzer") ---------------------------------------
+    
     strong_subscription_key: str
     strong_headers: str = ""
     strong_api_version: str = ""
@@ -43,22 +43,22 @@ class AppConfig(BaseSettings):
     strong_deployment: str = ""
     strong_base_url: str
 
-    # --- Optional pricing ----------------------------------------------------
+    
     cheap_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
     strong_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
 
 
-    # --- Optional TLS override -----------------------------------------------
-    # Pydantic natively understands "false", "0", "off" from the .env file
+    
+    
     codegraph_tls_verify: bool = True
 
-    # --- Neo4j / GraphDB -----------------------------------------------------
+    
     neo4j_uri: str = "neo4j://127.0.0.1:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str
 
 
-# Initialize the settings globally
+
 try:
     settings = AppConfig()
 except ValidationError as e:

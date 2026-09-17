@@ -6,8 +6,8 @@ from tools.ingestion.builder import GraphPayloadBuilder
 
 logger = logging.getLogger(__name__)
 
-# --- NEW: Blacklist of common C and AUTOSAR primitive types ---
-# This prevents creating useless TypeDefinition nodes for 'uint8', etc.
+
+
 PRIMITIVE_TYPES = {
     'void', 'char', 'int', 'short', 'long', 'float', 'double',
     'uint8', 'uint16', 'uint32', 'uint64', 'sint8', 'sint16', 'sint32', 'sint64',
@@ -24,35 +24,35 @@ class ASTParser:
         
         self.autosar_func_re = re.compile(br'FUNC\s*\([^)]+\)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
         self.autosar_task_re = re.compile(br'(?:TASK|ISR)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)')
-        # Matches a function-like macro body that is a pure pass-through call to
-        # another identically-shaped identifier, e.g. "Rte_IrvRead_LONG_NAME(data)" --
-        # the standard RTE-generated port-accessor alias pattern. Captures the target's
-        # identifier only.
+        
+        
+        
+        
         self.macro_alias_target_re = re.compile(r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-        # Matches a function-like macro body that is a pointer/address-of expression
-        # rather than a call to another function -- the shape used by Vector MICROSAR's
-        # Rte_Pim_*/Rte_CData_* (and similar) late-bound accessor macros, confirmed
-        # against real generated headers:
-        #   #define Rte_CData_RomData_VIN() (&(Rte_..._RomData_VIN[0]))
-        #   #define Rte_Pim_DCM_VIN_F190_NvmData_17() (&((*RtePim_..._17())[0]))
-        # The second form nests an extra pointer-dereference paren -- a naive
-        # "one optional '(' " check misses it -- so this allows an arbitrary run of
-        # '(', '&', '*' (any order/depth) before the first real identifier character,
-        # rather than assuming a fixed nesting depth.
-        # These are NOT unresolved/missing calls -- they are placeholders that bind to
-        # real memory/config at build time, since the source tree is parsed as-is, not
-        # built. A call site using such a name must never be classified the same way as
-        # a genuinely broken/unresolved call target.
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         self.accessor_macro_body_re = re.compile(r'^\s*\((?:[\s&*(]*)[A-Za-z_]')
-        # Matches one entry of Vector MICROSAR's generated Dcm DID dispatch table
-        # (Dcm_Lcfg.c/Dcm_PBcfg.c's Dcm_CfgDidMgrSignalOpClassInfo[]/similar arrays):
-        #   { ((Dcm_DidMgrOpFuncType)(Rte_Call_DataServices_DID_0004_..._ReadData)),
-        #      1u, 1u, 0x0002u} /* DID: 0x0004 */
-        # This is the module's own authoritative DID-to-callback source of truth,
-        # confirmed against a real generated Dcm_Lcfg.c (1,736/1,736 entries matched).
-        # Applied to every file's raw bytes -- like the existing AUTOSAR fallback
-        # regexes -- since it's cheap and simply won't match outside this exact
-        # generated-table shape.
+        
+        
+        
+        
+        
+        
+        
+        
+        
         self.dcm_did_table_entry_re = re.compile(
             br'\(\(Dcm_DidMgrOpFuncType\)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\)'
             br'[^{}]*?0x([0-9A-Fa-f]+)u\}\s*/\*\s*DID:\s*0x([0-9A-Fa-f]+)\s*\*/'
@@ -81,24 +81,18 @@ class ASTParser:
 
         is_config_file = any(filepath.endswith(ext) for ext in ['_Cfg.c', '_PBcfg.c', '_Lcfg.c', '_LCfg.c'])
         source_code = self._clean_autosar_macros(raw_code)
-        # Names declared at file (translation-unit) scope in THIS file, mapped to their
-        # real node id. Used so that variable accesses inside functions in this file can
-        # resolve to an exact node instead of falling back to an unscoped, cross-codebase
-        # fuzzy name match (see ingest/builder.py::add_var_access_edge).
         file_global_ids: dict = {}
 
-        # Raised from 2MB to 10MB: several legitimate, large generated RTE glue headers
-        # (e.g. a real Rte_Dcm.h at 2.03MB, Rte_SUM_ERRH.h at 4.5MB) were landing just
-        # over the old 2MB cutoff and being skipped by tree-sitter entirely -- meaning
-        # NONE of their function/macro-alias/declaration data was ever extracted.
-        # Measured parse time up to 8.6MB stays well under 1s in this codebase (worst
-        # case observed: 4.7s for one 4.5MB file); the separate 50MB hard cutoff above
-        # already excludes the genuinely pathological 100MB+ generated files.
         if file_size <= 10 * 1024 * 1024 and not is_config_file:
             try:
-                tree = self.parser.parse(source_code)
+                
+                
+                def source_reader(byte_offset, _point):
+                    return source_code[byte_offset:byte_offset + 64 * 1024]
 
-                # --- This block now skips internal parsing for vendor code ---
+                tree = self.parser.parse(source_reader)
+
+                
                 if not is_vendor_code or parse_vendor_internals:
                     for child in tree.root_node.children:
                         if child.type == 'declaration':
@@ -111,31 +105,9 @@ class ASTParser:
                             if type_name and type_name not in PRIMITIVE_TYPES:
                                 self.builder.add_type_definition(type_name, uri, f"{child.start_byte}-{child.end_byte}")
 
-                # --- Macro definitions/aliases are ALWAYS parsed, even for vendor code. ---
-                # These are RTE-generated glue headers (tagged vendor/generated), which is
-                # exactly where the Rte_Read_/Rte_Write_/Rte_Call_/Rte_IrvRead_/
-                # Rte_IrvWrite_ port accessor short-name aliases are defined. Skipping
-                # vendor code here would mean the one file that actually defines each
-                # alias is never read.
-                #
-                # Uses a full depth-first search, NOT tree.root_node.children: these RTE
-                # headers wrap their content in an `extern "C" { ... }` C++-compat guard,
-                # which tree-sitter-c represents as a `linkage_specification` node, so
-                # every preproc_function_def/preproc_def in a real Rte_*.h file is nested
-                # one level deeper than a top-level-children scan reaches (confirmed
-                # empirically -- a shallow scan found 0 of 249 such macros in a real
-                # 314KB RTE header).
                 for macro_def_node in self._find_nodes_of_type(tree.root_node, 'preproc_function_def'):
                     self._process_macro_alias(macro_def_node, source_code)
 
-                # Object-like macros: `#define NAME value`. Most are ordinary constant
-                # definitions, but RTE-generated code also uses this exact form for a
-                # SECOND alias pattern with no parentheses at all:
-                #   #define Rte_Call_SHORT Rte_Call_LONG
-                # (as distinct from the parenthesized Rte_IrvRead_-style alias handled
-                # above). Both are recorded as macro definitions; only the ones whose
-                # value is a single bare identifier different from the macro's own name
-                # are ALSO treated as a call-target alias.
                 for preproc_def_node in self._find_nodes_of_type(tree.root_node, 'preproc_def'):
                     name_node = preproc_def_node.child_by_field_name('name')
                     val_node = preproc_def_node.child_by_field_name('value')
@@ -147,7 +119,7 @@ class ASTParser:
                     if m_val and m_val != m_name and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', m_val):
                         self.builder.add_macro_alias(m_name, m_val)
 
-                # --- Function definitions are ALWAYS parsed, even for vendor code, to build the call graph ---
+                
                 func_nodes = self._find_nodes_of_type(tree.root_node, 'function_definition')
                 for func_node in func_nodes:
                     func_name = self._extract_function_name(func_node, source_code)
@@ -156,7 +128,7 @@ class ASTParser:
                         func_id = self.builder.add_function_node(func_name, uri, byte_span, is_vendor_code)
                         found_function_names.add(func_name)
                         
-                        # --- OPTIMIZATION: Only process internals for non-vendor code ---
+                        
                         if not is_vendor_code or parse_vendor_internals:
                             self._process_function_internals(func_node, source_code, func_id, func_name, file_global_ids)
             except Exception as e:
@@ -196,9 +168,9 @@ class ASTParser:
                 parts = func_name.split("_DID_") if "_DID_" in func_name else func_name.split("_RID_")
                 if len(parts) > 1:
                     raw_identifier = parts[1].split("_", 1)[0]
-                    # AUTOSAR DIDs and RIDs are two-byte identifiers. Some
-                    # generated symbols include a wider padded/vendor prefix;
-                    # retain the protocol identifier's final four hex digits.
+                    
+                    
+                    
                     did_hex = raw_identifier[-4:]
                     operation = (
                         "Read" if "Read" in func_name else
@@ -220,13 +192,13 @@ class ASTParser:
             process_discovered_func(match.group(1).decode('utf8', errors='ignore'), f"{match.start()}-{match.end()}", is_isr_task=True)
 
     def _process_function_internals(self, func_node, source_code: bytes, caller_id: str, func_name: str, file_global_ids: dict = None):
-        # This function is now only called for non-vendor code, drastically reducing relationship count.
+        
         file_global_ids = file_global_ids or {}
 
-        # Byte-spans of identifiers that are themselves call *targets* (e.g. the `Foo` in
-        # `Foo(x)`). These must never also be counted as a variable READ below, or every
-        # call site double-emits a spurious READS_VAR edge to whatever node fuzzily
-        # matches the callee's name (see graph/manager.py's fuzzy-resolution path).
+        
+        
+        
+        
         call_target_spans = set()
 
         for call_node in self._find_nodes_of_type(func_node, 'call_expression'):
@@ -247,9 +219,9 @@ class ASTParser:
                     pointer_expr = source_code[func_target.start_byte:func_target.end_byte].decode('utf8', errors='ignore')
                     self.builder.add_call_edge(caller_id, pointer_expr, arguments=args, is_pointer=True)
 
-        # Locals include both block-scope declarations AND function parameters. Parameters
-        # were previously omitted here, so common out-parameter names (e.g. RequestResultPtr)
-        # were treated as unresolved globals and fuzzy-merged onto unrelated nodes codebase-wide.
+        
+        
+        
         local_vars = set()
         for param_node in self._find_nodes_of_type(func_node, 'parameter_declaration'):
             p_var = self._extract_first_identifier(param_node, source_code)
@@ -276,9 +248,9 @@ class ASTParser:
             var_name = source_code[ident.start_byte:ident.end_byte].decode('utf8', errors='ignore')
             if var_name and var_name != func_name and var_name not in local_vars:
                 is_write = var_name in written_vars
-                # If this name is a global declared in THIS file, resolve it exactly.
-                # Otherwise let the builder mark it as an unresolved reference rather than
-                # silently defaulting to a codebase-wide, label-blind fuzzy match.
+                
+                
+                
                 target_id = file_global_ids.get(var_name)
                 self.builder.add_var_access_edge(caller_id, var_name, is_write, target_id=target_id)
 
@@ -326,18 +298,18 @@ class ASTParser:
 
         match = self.macro_alias_target_re.match(replacement_text)
         if not match:
-            # Not a "calls another function" shape. Check whether it's instead a
-            # late-bound RTE accessor macro (pointer/address-of expression) before
-            # giving up -- these are common enough (Rte_Pim_/Rte_CData_ alone
-            # accounted for ~14,760 permanently-unresolvable CALLS stubs in a real
-            # codebase) that they must be classified, not silently dropped.
-            #
-            # The name MUST be Rte_-prefixed: the body-shape regex alone is far too
-            # permissive (confirmed against a real run -- it swept up 8,176 unrelated
-            # macros like MATCH_CGM_ETH_DIAG_FRAME, GET_OFFSET, ReadAddrLong,
-            # Com_ReceiveShadowSignal, since plenty of ordinary cast/getter macros also
-            # start with a paren-wrapped expression). Scoping to the RTE accessor
-            # namespace is what makes this safe.
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
             if short_name.startswith('Rte_') and self.accessor_macro_body_re.match(replacement_text):
                 self.builder.mark_late_bound_accessor(short_name)
             return
@@ -363,8 +335,8 @@ class ASTParser:
                 if name:
                     names.append(name)
         if not found_any:
-            # Node shape we don't explicitly enumerate (e.g. struct/enum specifiers) --
-            # fall back to the original single-identifier behavior.
+            
+            
             single = self._extract_first_identifier(node, source_code)
             if single:
                 names.append(single)
@@ -372,7 +344,7 @@ class ASTParser:
 
     def _extract_first_identifier(self, node, source_code: bytes):
         stack = [node]
-        # Ignore common C modifiers that Tree-sitter sometimes misclassifies
+        
         ignored_keywords = {'STATIC', 'CONST', 'VOLATILE', 'EXTERN', 'INLINE', 'static', 'const', 'extern'}
         
         while stack:

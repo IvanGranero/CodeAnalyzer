@@ -75,17 +75,17 @@ class AnalyzerTools:
         return self._remember(self._location_cache, cache_key, location.copy())
 
     def get_function_metadata(self, func_name: str) -> str:
-        # NOTE: fields are returned as separate top-level aliases, NOT as a single
-        # map aliased "metadata" -- `RETURN {...} AS metadata` used to make every row
-        # come back as {"metadata": {FilePath: ..., ...}}, one nesting level deeper
-        # than every consumer expects (scan_function's `metadata_list[0]`,
-        # scan/reporter.py, app/phases/scan_phase.py's TaintedByUDS exploit-routing
-        # check, exploit/orchestrator.py's DID context builder). Confirmed against a
-        # real run: 100% of cached reports had this double-nested shape, so
-        # metadata.get("TaintedByUDS") always silently returned the False default --
-        # meaning every found vulnerability was skipped for exploit regardless of
-        # actual UDS reachability -- and the DIDs-truncation/stub-warning
-        # post-processing two lines below never fired either.
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         query = """
         MATCH (f:Function {name: $func_name})
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
@@ -147,7 +147,7 @@ class AnalyzerTools:
         except Exception as e:
             return f"Error executing tool: {e}"
 
-    # --- NEW: Tool to get the definition of a preprocessor macro ---
+    
     def get_macro_definition(self, macro_name: str) -> str:
         """Returns the '#define' value of a macro."""
         if self._check_cache("get_macro_definition", macro_name):
@@ -163,7 +163,7 @@ class AnalyzerTools:
             return f"Error executing tool: {e}"
 
     def get_callees(self, func_name: str) -> str:
-        # (This function remains the same)
+        
         if self._check_cache("get_callees", func_name):
             return f"System Note: Callees for '{func_name}' are already in your conversation history."
         query = """
@@ -209,7 +209,7 @@ class AnalyzerTools:
             return self._error(exc)
 
     def read_file_span(self, storage_uri: str, byte_span: str) -> str:
-        # (This function remains the same)
+        
         if not storage_uri or not byte_span:
             return "Error: Must provide both storage_uri and byte_span."
         cache_key = (storage_uri, byte_span)

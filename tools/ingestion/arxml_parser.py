@@ -14,8 +14,8 @@ class ARXMLParser:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 raw_xml = f.read()
                 
-            # ARXML namespaces are notoriously strict and version-dependent.
-            # Stripping them out entirely makes parsing 100x easier and robust across vendors.
+            
+            
             clean_xml = re.sub(r'\sxmlns="[^"]+"', '', raw_xml, count=1)
             root = ET.fromstring(clean_xml)
             
@@ -31,7 +31,7 @@ class ARXMLParser:
         AUTOSAR OS configurations are stored in ECUC-CONTAINER-VALUE blocks.
         We look for specific DEFINITION-REFs that indicate Tasks, ISRs, and Resources.
         """
-        # Find all ECUC containers anywhere in the document
+        
         for container in root.findall('.//ECUC-CONTAINER-VALUE'):
             def_ref_node = container.find('DEFINITION-REF')
             if def_ref_node is None or not def_ref_node.text:
@@ -44,7 +44,7 @@ class ARXMLParser:
                 
             short_name = short_name_node.text
 
-            # 1. Extract OS Tasks
+            
             if def_ref.endswith('/OsTask'):
                 priority = self._get_parameter_value(container, 'OsTaskPriority') or "0"
                 activation = self._get_parameter_value(container, 'OsTaskActivation') or "1"
@@ -55,7 +55,7 @@ class ARXMLParser:
                     properties={"priority": int(priority), "max_activations": int(activation)}
                 )
 
-            # 2. Extract OS Interrupts (ISRs)
+            
             elif def_ref.endswith('/OsIsr'):
                 category = self._get_parameter_value(container, 'OsIsrCategory') or "2"
                 self.builder.add_os_entity(
@@ -65,7 +65,7 @@ class ARXMLParser:
                     properties={"isr_category": category}
                 )
 
-            # 3. Extract OS Resources (Mutexes/Spinlocks)
+            
             elif def_ref.endswith('/OsResource'):
                 res_property = self._get_parameter_value(container, 'OsResourceProperty') or "STANDARD"
                 self.builder.add_os_entity(
@@ -77,7 +77,7 @@ class ARXMLParser:
 
     def _get_parameter_value(self, container: ET.Element, param_name: str) -> str:
         """Helper to dig into AUTOSAR parameter values."""
-        # Check numerical/text parameters
+        
         for param in container.findall('.//ECUC-NUMERICAL-PARAM-VALUE') + container.findall('.//ECUC-TEXTUAL-PARAM-VALUE'):
             def_ref = param.find('DEFINITION-REF')
             if def_ref is not None and def_ref.text and def_ref.text.endswith(f'/{param_name}'):

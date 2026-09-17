@@ -14,7 +14,7 @@ class RunnableBindingMixin:
         """
         logger.info("Binding RTE Runnables to Functions...")
 
-        # Phase 1: Merge the explicit JSON Stubs
+        
         json_bind_query = """
         MATCH (s:GraphNode)-[r:IMPLEMENTS_TASK]->(t:OsTask)
         WHERE s.name IS NOT NULL
@@ -27,7 +27,7 @@ class RunnableBindingMixin:
         RETURN count(rel) AS explicit_bindings
         """
 
-        # Phase 2: Propagate bindings down the call tree (The Fallback)
+        
         propagate_query = """
         MATCH (entry:Function)-[:IMPLEMENTS_TASK]->(t:OsTask)
         MATCH (entry)-[:CALLS*1..5]->(f:Function)

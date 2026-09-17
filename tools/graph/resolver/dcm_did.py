@@ -21,12 +21,12 @@ class DcmDidMixin:
         and dead-code exclusion both see the complete HANDLES_UDS picture.
         """
         logger.info("Resolving Dcm DID dispatch table entries...")
-        # entry.function_name is very often itself an RTE macro-alias short name (e.g.
-        # "Rte_Call_DataServices_DID_0004_..." aliasing to
-        # "Rte_Call_Dcm_DataServices_DID_0004_..."), not a real Function's name -- so
-        # the alias is resolved one hop via the deterministic "stub::<name>" node
-        # BEFORE looking for the real Function (confirmed empirically: 0/1736 entries
-        # matched a real Function directly by name; every one needed this hop).
+        
+        
+        
+        
+        
+        
         query = """
         MATCH (entry:DcmDidTableEntry)
         OPTIONAL MATCH (alias_stub:GraphNode {id: "stub::" + entry.function_name})

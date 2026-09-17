@@ -12,23 +12,23 @@ class UdsTaintMixin:
         and traces the taint down the call stack.
         """
         logger.info("Resolving UDS Attack Surface Entry Points...")
-        # Two detection tiers:
-        #  1. "_DID_"/"_RID_" (underscore-flanked) -- the DID/RID hex code is literally
-        #     embedded in the name (e.g. DataServices_DID_F129_..._ReadData). Extract
-        #     the real hex code as the UdsService key.
-        #  2. Broader: the name contains "DID"/"RID" ANYWHERE and ends with one of the
-        #     well-known Dcm/RTE-generated diagnostic-callback suffixes. This catches
-        #     the very common convention <SignalName>DID_ReadData /
-        #     <SignalName>DID_ConditionCheckRead / RID_..._Start etc., where there is no
-        #     underscore before "DID"/"RID" and often no hex code in the name at all
-        #     (the DID is symbolic, defined only in ARXML config). Confirmed against a
-        #     real ingested codebase: tier 1 alone missed 2,193 real, non-vendor DID
-        #     callback functions, which were then incorrectly flagged as dead code and
-        #     silently excluded from scanning entirely.
-        #  When no hex code is extractable, a synthetic per-signal key (everything
-        #  before "DID"/"RID" in the name) is used instead, so ReadData/WriteData/
-        #  ConditionCheckRead variants of the SAME signal still merge onto one
-        #  UdsService node instead of each getting an unrelated stand-in id.
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         map_uds_query = """
         MATCH (f:Function)
                 WHERE NOT (f)-[:HANDLES_UDS {source: "dispatch_table"}]->()
@@ -104,12 +104,12 @@ class UdsTaintMixin:
     def _flag_dead_code(self):
         """Finds isolated functions (no callers, no UDS links, no Network links, no Hardware entries)."""
         logger.info("Flagging Unreachable / Dead Code...")
-        # NOTE: this SETs is_dead_code = false for non-isolated functions too, not just
-        # true for isolated ones. Previously it only ever set the flag to true and never
-        # cleared it, so re-running resolution after improving upstream detection (e.g.
-        # UDS entry-point detection in _resolve_uds_taint) would NOT retroactively
-        # un-flag functions that are now correctly known to be reachable -- the pass
-        # wasn't idempotent.
+        
+        
+        
+        
+        
+        
         query = """
         MATCH (f:Function)
         WITH f, (

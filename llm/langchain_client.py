@@ -119,7 +119,7 @@ class LLMClient:
                 base_url=self.base_url,
             )
 
-        # LiteLLM resolves openai/azure credentials from env vars
+        
         deployment_base_url = f"{self.base_url.rstrip('/')}/{self.deployment}"
         os.environ["OPENAI_API_KEY"] = api_key
         if self.model_name.startswith("openai/"):

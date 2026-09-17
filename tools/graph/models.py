@@ -32,13 +32,13 @@ class NodeLabel(str, Enum):
     OS_ISR = "OsIsr"
     OS_RESOURCE = "OsResource"
     STUB = "Stub"
-    # A single (function_name, did_hex) pair scraped from a generated Dcm DID
-    # dispatch table (e.g. Dcm_Lcfg.c's Dcm_CfgDidMgrSignalOpClassInfo[]). This is raw,
-    # unresolved evidence -- graph/resolver.py's _resolve_dcm_did_table_entries later
-    # resolves the function_name to a real Function node and creates the actual
-    # HANDLES_UDS edge. Kept as its own node/label (rather than a transient Python
-    # value) so this authoritative, name-convention-independent signal survives
-    # ingestion batching/flushing the same way every other extracted fact does.
+    
+    
+    
+    
+    
+    
+    
     DCM_DID_TABLE_ENTRY = "DcmDidTableEntry"
 
 class GraphNode(BaseModel):

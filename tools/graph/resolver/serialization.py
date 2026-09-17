@@ -19,7 +19,7 @@ class SerializationMixin:
     ) -> Tuple[str, str]:
         """Query a function neighborhood from Neo4j and serialize it as structured graph JSON."""
 
-        # --- FIXED FOR NEO4J 5 GQL COMPLIANCE AND EDGE PROPERTIES ---
+        
         query = """
         MATCH (f:Function {name: $func_name})
 
@@ -267,10 +267,10 @@ class SerializationMixin:
                         "type": var.get("access_type", "READS_VAR"),
                         "from": target.get("id"),
                         "to": var.get("id"),
-                        # "resolution" tells the LLM/report whether this edge was matched
-                        # exactly (declared in the same file as the accessing function) or
-                        # fuzzily (name+label matched elsewhere) -- fuzzy evidence should be
-                        # treated with lower confidence than exact evidence.
+                        
+                        
+                        
+                        
                         "properties": {"access_type": var.get("access_type"), "resolution": var.get("resolution", "unknown")}
                     })
 

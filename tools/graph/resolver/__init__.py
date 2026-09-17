@@ -58,17 +58,17 @@ class GraphResolver(
         """
         logger.info("=== Starting Graph Resolution & Completion Passes ===")
         passes = [
-            # _resolve_dcm_did_table_entries must run BEFORE _resolve_macro_call_aliases:
-            # it needs to read the alias_target property off a "stub::<name>" node that
-            # the alias pass deletes once it has redirected that stub's CALLS edges.
+            
+            
+            
             self._resolve_dcm_did_table_entries,
             self._resolve_macro_call_aliases,
             self._prune_local_variable_stubs,
             self._bind_runnables_to_tasks,
             self._resolve_os_concurrency,
             self._resolve_uds_taint,
-            # Dead-code detection only needs resolved reachability and signal
-            # edges; later annotation passes do not affect its isolation query.
+            
+            
             self._flag_dead_code,
             self._resolve_rte_data_flow,
             self._flag_dangerous_sinks,

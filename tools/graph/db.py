@@ -10,8 +10,8 @@ class GraphDB:
         """
         Initializes the Neo4j driver with connection pooling.
         """
-        # The Neo4j driver inherently manages a connection pool. 
-        # Tuning max_connection_pool_size is helpful for highly concurrent ingestion.
+        
+        
         self.driver = GraphDatabase.driver(
             uri, 
             auth=(user, password),
@@ -34,17 +34,17 @@ class GraphDB:
 
     @staticmethod
     def _create_constraints_and_indexes(tx):
-        # 1. Unique ID constraint (Guarantees local scoping doesn't merge incorrectly)
+        
         tx.run("CREATE CONSTRAINT graphnode_id IF NOT EXISTS FOR (n:GraphNode) REQUIRE n.id IS UNIQUE")
         
-        # 2. Name index (Drastically speeds up Late-Binding edge queries!)
+        
         tx.run("CREATE INDEX graphnode_name IF NOT EXISTS FOR (n:GraphNode) ON (n.name)")
 
-        # 3. Label-specific name indexes. The generic GraphNode.name index above still
-        # requires Neo4j to filter by label after the index lookup; resolver.py's passes
-        # and the fuzzy-edge-resolution queries in this module both filter by a specific
-        # label (Function/GlobalVariable) + name very frequently, so a composite/scoped
-        # index avoids that extra filter step at scale.
+        
+        
+        
+        
+        
         tx.run("CREATE INDEX function_name IF NOT EXISTS FOR (n:Function) ON (n.name)")
         tx.run("CREATE INDEX globalvariable_name IF NOT EXISTS FOR (n:GlobalVariable) ON (n.name)")
         tx.run("CREATE INDEX udsservice_did IF NOT EXISTS FOR (n:UdsService) ON (n.did)")
@@ -54,11 +54,11 @@ class GraphDB:
 
     def ingest_batched(self, query: str, records: List[Dict[str, Any]], batch_size: int = 5000, max_retries: int = 5, base_delay: float = 2.0):
         total_records = len(records)
-        # Downgrade from INFO to DEBUG
+        
         logger.debug(f"Starting batched ingestion of {total_records} records in chunks of {batch_size}.")
 
-        # Keep one session for the complete ingestion call. Creating a session for
-        # every chunk adds measurable pool/context overhead on large source trees.
+        
+        
         with self.driver.session() as session:
             for i in range(0, total_records, batch_size):
                 batch = records[i : i + batch_size]
@@ -70,7 +70,7 @@ class GraphDB:
                         logger.debug(f"Successfully ingested batch {batch_num}")
                         break
                     except exceptions.TransientError as e:
-                        # Retry transient failures without reopening the session.
+                        
                         if attempt == max_retries:
                             logger.error(f"Transient error on batch {batch_num} after {max_retries} attempts, giving up on this batch: {e}")
                             raise

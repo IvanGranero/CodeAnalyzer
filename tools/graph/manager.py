@@ -12,12 +12,12 @@ class GraphManager:
     def __init__(self, uri: str, user: str, password: str, llm_client: Any = None):
         logger.info("Initializing GraphManager...")
         self.db = GraphDB(uri, user, password)
-        # NOTE: LLM context-building goes exclusively through
-        # GraphResolver.serialize_function_neighborhood (see scan/orchestrator.py) -- the
-        # previous GraphRetriever/graph/retrieve.py path queried a schema vocabulary
-        # (USES, Variable, RunnableEntity, RtePort) that didn't match what's actually
-        # ingested (READS_VAR/WRITES_VAR, GlobalVariable, HANDLES_UDS), was unreachable
-        # from the real scan path, and has been removed rather than left as dead code.
+        
+        
+        
+        
+        
+        
         self.nl_engine = NL2CypherEngine(self.db, llm_client) if llm_client else None
         self.db.initialize_schema()
         self.resolver = GraphResolver(self.db)
@@ -50,11 +50,11 @@ class GraphManager:
             """
             self.db.ingest_batched(query, batch)
 
-    # Which label a fuzzy (name-only) edge target should be scoped to, keyed by
-    # relationship type. Scoping by label prevents e.g. a WRITES_VAR edge from
-    # fuzzily landing on an unrelated Function/Macro/Stub node that happens to
-    # share the same name (a real collision seen in production: a call target's
-    # identifier was previously eligible to match a GlobalVariable-typed search).
+    
+    
+    
+    
+    
     _FUZZY_TARGET_LABEL = {
         "CALLS": "Function",
         "READS_VAR": "GlobalVariable",
@@ -93,16 +93,16 @@ class GraphManager:
                 self.db.ingest_batched(query_exact, exact_batch)
 
             if fuzzy_batch:
-                # Creates stubs. We will garbage collect local var stubs later in resolver.py
-                #
-                # Two correctness fixes vs. the original query:
-                #  1. The OPTIONAL MATCH is scoped by label (via _FUZZY_TARGET_LABEL), so a
-                #     name can only match a node of the semantically correct type.
-                #  2. The subquery returns at most ONE candidate (ORDER BY + LIMIT 1). The
-                #     previous unbounded OPTIONAL MATCH fanned out to every node sharing that
-                #     name anywhere in the graph, silently creating one edge per match -- this
-                #     is what produced identical WRITES_VAR target ids across unrelated
-                #     functions in different files/domains.
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
                 target_label = self._FUZZY_TARGET_LABEL.get(rel_type, "GraphNode")
                 query_fuzzy = f"""
                 UNWIND $batch AS record

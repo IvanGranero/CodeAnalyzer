@@ -9,10 +9,10 @@ class PrioritizationMixin:
     """Deterministic (non-LLM) selection of the highest-risk scan targets."""
 
     def get_prioritized_targets(self, max_targets: int, domain_filter: str = None, file_filter: str = None, vendor_folders: list[str] | None = None, application_roots: list[str] | None = None) -> list:
-        # domain_filter/file_filter previously reached Cypher via f-string interpolation
-        # (a Cypher-injection vector -- both values can originate from CLI args / the
-        # Phase-1 discovery LLM output). Bound as query parameters instead; only the
-        # LIMIT integer (validated as int by argparse/callers) is still interpolated.
+        
+        
+        
+        
         cypher_filter = ""
         params: Dict[str, Any] = {}
 
@@ -70,8 +70,8 @@ class PrioritizationMixin:
         ORDER BY DataRace DESC, UdsTaint DESC
         """
 
-        # If max_targets is 0 (uncapped), we drop the LIMIT clause entirely.
-        # max_targets is an int from argparse/internal callers, never user-controlled text.
+        
+        
         if max_targets > 0:
             query += " LIMIT $max_targets"
             params["max_targets"] = max_targets

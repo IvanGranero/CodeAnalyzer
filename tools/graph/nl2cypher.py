@@ -1,17 +1,17 @@
 import logging
 import re
 from typing import Dict, Any, List, Optional
-# Assuming you have access to your GraphDB instance from db.py
+
 from tools.graph.db import GraphDB
 from tools.graph.models import EdgeType, NodeLabel
 
 logger = logging.getLogger(__name__)
 
-# Clauses that mutate the graph. An LLM-generated query containing any of these is
-# rejected unless the caller explicitly opts in via allow_write=True. Without this,
-# an NL query (which can itself be influenced by untrusted content flowing through the
-# discovery/ingest LLM prompts) could run e.g. "MATCH (n) DETACH DELETE n" with full
-# write privileges against the production graph.
+
+
+
+
+
 _WRITE_CLAUSE_RE = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV)\b", re.IGNORECASE)
 
 class NL2CypherEngine:
@@ -24,11 +24,11 @@ class NL2CypherEngine:
         self.db = db
         self.llm_client = llm_client
         
-        # Domain-specific examples for the prompt (Few-Shot), kept in sync with the
-        # actual node/edge vocabulary in graph/models.py -- previously these referenced
-        # a "USES"/"Variable" schema that was never ingested (the real relationships are
-        # READS_VAR/WRITES_VAR against GlobalVariable), which could steer the LLM into
-        # generating cypher against a vocabulary that doesn't exist in this graph.
+        
+        
+        
+        
+        
         self.few_shot_examples = [
             {
                 "question": "Find all functions that call Rte_Write_PortA.",
@@ -71,7 +71,7 @@ class NL2CypherEngine:
         enum-derived summary (always in sync with graph/models.py) if APOC is unavailable."""
         query = "CALL apoc.meta.schema() YIELD value RETURN value"
         try:
-            # Requires APOC plugin installed in Neo4j
+            
             result = self.db.retrieve(query)
             if result:
                 return str(result[0]['value'])
@@ -115,13 +115,13 @@ EXAMPLES:
 
         while attempt <= max_retries:
             if attempt > 0:
-                # Append the error to the prompt for correction
+                
                 correction_prompt = prompt + f"\n\nYour last query failed with this error:\n{last_error}\nPlease fix the syntax and try again."
                 cypher_query = self.llm_client.generate(correction_prompt)
             else:
                 cypher_query = self.llm_client.generate(prompt)
 
-            # Clean up the output in case the LLM ignored instructions and used markdown
+            
             cypher_query = cypher_query.replace("```cypher", "").replace("```", "").strip()
 
             if _WRITE_CLAUSE_RE.search(cypher_query) and not allow_write:

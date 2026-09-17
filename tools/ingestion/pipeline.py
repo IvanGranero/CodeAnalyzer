@@ -7,7 +7,7 @@ from tools.graph.manager import GraphManager
 from tools.ingestion.builder import GraphPayloadBuilder
 from tools.ingestion.parser import ASTParser
 from tools.ingestion.arxml_parser import ARXMLParser
-# Assume we will create a new parser for these specific JSON files
+
 from tools.ingestion.rte_json_parser import RteJsonParser 
 from tools.ingestion.dispatch import ConfigParserDispatcher
 from tools.ingestion.source_discovery import discover_source_files, is_vendor_file
@@ -21,7 +21,7 @@ class IngestionPipeline:
         self.builder = GraphPayloadBuilder(batch_size=5000)
         self.parser = ASTParser(self.builder)
         self.arxml_parser = ARXMLParser(self.builder)
-        # --- NEW: Initialize the JSON parser with the same builder ---
+        
         self.rte_json_parser = RteJsonParser(self.builder)
         self.config_dispatcher = ConfigParserDispatcher({
             ".arxml": self.arxml_parser,
@@ -63,7 +63,7 @@ class IngestionPipeline:
         }
         self._active_report = report
         
-        # --- 1. PARSE CONFIG FILES (ARXML, JSON, etc.) FIRST ---
+        
         if config_files:
             logger.info(f"Parsing {len(config_files)} OS/System configuration files...")
             report["config_files_seen"] = len(config_files)
@@ -92,7 +92,7 @@ class IngestionPipeline:
                     logger.warning(f"Config file not found on disk: {full_path}")
                     report["config_files_missing"].append(config_file)
 
-        # --- 2. PARSE C/C++ SOURCE CODE ---
+        
         all_files = discover_source_files(self.target_dir)
                     
         total_files = len(all_files)
@@ -127,6 +127,10 @@ class IngestionPipeline:
                     parse_vendor_internals=parse_vendor_internals,
                 )
                 report["source_files_parsed"] += 1
+            except KeyboardInterrupt:
+                print(f"\n⏹ Parsing interrupted at {short_path}")
+                self._flush_pending_batch()
+                raise
             except Exception as e:
                 print(f"\n❌ Crash while parsing {short_path}: {e}")
                 report["source_files_failed"].append({"file": str(filepath), "error": str(e)})
@@ -173,5 +177,11 @@ class IngestionPipeline:
         if self.builder.is_ready_to_flush():
             logger.debug("Batch threshold reached. Flushing to Neo4j...")
             batch = self.builder.flush_batch()
+            self._active_report["parser_edges_emitted"] += len(batch.edges)
+            self.graph_manager.ingest_batch(batch)
+
+    def _flush_pending_batch(self):
+        batch = self.builder.flush_all()
+        if batch.nodes or batch.edges:
             self._active_report["parser_edges_emitted"] += len(batch.edges)
             self.graph_manager.ingest_batch(batch)

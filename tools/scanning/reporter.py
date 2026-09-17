@@ -36,7 +36,7 @@ class ScanReporter:
         Generates one master Markdown and SARIF report containing all
         vulnerabilities found during the scan.
         """
-        # Filter for only the reports that found vulnerabilities
+        
         vulnerabilities = {
             func: report for func, report in all_scan_results.items()
             if report.get("vulnerability_found")
@@ -48,7 +48,7 @@ class ScanReporter:
             
         logger.info(f"Consolidating {len(vulnerabilities)} vulnerabilities into master reports...")
 
-        # Generate each consolidated report type
+        
         self.save_raw_json(vulnerabilities)
         self.save_markdown_report(vulnerabilities)
         self.save_sarif_report(vulnerabilities)
@@ -73,7 +73,7 @@ class ScanReporter:
             metadata = report.get("metadata", {})
             file_path = self._parse_file_path(metadata.get("FilePath"))
             
-            # --- FIX: Safely handle None for ByteSpan ---
+            
             location = self.locations.resolve(metadata.get("FilePath"), metadata.get("ByteSpan"))
 
             md.append("---")
@@ -116,7 +116,7 @@ class ScanReporter:
         sarif_results = []
         for func, report in vulnerabilities.items():
             metadata = report.get("metadata", {})
-            # --- FIX: Safely handle None for ByteSpan in SARIF generation ---
+            
             location = self.locations.resolve(metadata.get("FilePath"), metadata.get("ByteSpan"))
 
             exploit_data = report.get("exploit_validation")
@@ -128,10 +128,10 @@ class ScanReporter:
                     exploit_suffix += f"\nVerified Payload: {exploit_data.get('final_payload')}"
                 exploit_suffix += f"\nDeterministic Oracle Confirmed: {exploit_data.get('oracle_confirmed', False)}"
 
-            # One SARIF result PER FINDING, not per function -- a function with multiple
-            # independently-real vulnerability classes (e.g. buffer overflow AND a data
-            # race) previously collapsed into a single result and every class but one was
-            # invisible to any SARIF-consuming tool (GitHub Security, SonarQube, etc.).
+            
+            
+            
+            
             for finding in self._supported_findings(report):
                 sev = str(finding.get("severity", report.get("severity", ""))).lower()
                 severity_level = "note"
@@ -146,10 +146,10 @@ class ScanReporter:
                     message_text += f"\nMitigation: {finding['mitigation']}"
                 message_text += exploit_suffix
 
-                # Defense in depth: vulnerability_type is supposed to be a short
-                # canonical slug (see llm/prompts.json), but a SARIF ruleId must stay a
-                # stable, punctuation-free identifier even if a model drifts and emits
-                # a prose phrase -- sanitize instead of embedding raw spaces/punctuation.
+                
+                
+                
+                
                 rule_slug = re.sub(r"[^A-Za-z0-9_]+", "_", str(vuln_type)).strip("_").upper()
                 sarif_results.append({
                     "ruleId": f"AUTOSAR-SEC-{rule_slug}" if rule_slug and vuln_type != "unspecified" else "AUTOSAR-SEC-01",
@@ -235,11 +235,11 @@ class ScanReporter:
                         md.append(f"- **Error:** `{step.get('error')}`")
                     md.append("")
                     
-        # Render before opening the file: open(..., "w") truncates immediately, so if
-        # rendering failed partway through and we opened first, a pre-existing report
-        # (or a fresh empty file) would be left silently blank instead of surfacing the
-        # error. _stringify above should make this join always succeed on well-formed
-        # findings, but a malformed one should still fail loud rather than truncate.
+        
+        
+        
+        
+        
         try:
             content = "\n".join(md)
         except Exception as e:

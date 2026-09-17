@@ -131,9 +131,9 @@ class RepoDiscoverer:
             display_files = (important_files + other_files)[:5] 
             
             for f in display_files: 
-                # Create a relative path from the root and normalize separators
+                
                 relative_path = os.path.relpath(os.path.join(root, f), target_dir)
-                normalized_path = Path(relative_path).as_posix() # <-- POSIX uses '/'
+                normalized_path = Path(relative_path).as_posix() 
                 tree.append(f"{indent}  - {normalized_path}")
             
             if len(files) > 5:

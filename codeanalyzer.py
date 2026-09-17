@@ -19,7 +19,7 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(_QuietTransportFilter())
 logger = logging.getLogger(__name__)
 
-# Suppress noisy third-party library logs
+
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("openai").setLevel(logging.ERROR)

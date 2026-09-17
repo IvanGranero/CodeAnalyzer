@@ -39,7 +39,7 @@ class RteJsonParser:
 
     def _extract_tasks_and_runnables(self, data: Dict[str, Any], uri: str) -> None:
         """Maps Runnable entities to their hosting OsTasks with exact execution order/timing."""
-        # 1. Inspect Tasks collection
+        
         tasks = (
             data.get("Tasks")
             or data.get("tasks")
@@ -64,7 +64,7 @@ class RteJsonParser:
                 priority = 0
             task_id = self.builder.generate_node_id(NodeLabel.OS_TASK, task_name, uri)
             
-            # Register or update the Task Node
+            
             self.builder._nodes[task_id] = GraphNode(
                 id=task_id,
                 labels=[NodeLabel.OS_TASK],
@@ -75,14 +75,14 @@ class RteJsonParser:
                 }
             )
 
-            # Map Runnables under this Task
+            
             runnables = task.get("MappedRunnables") or task.get("Runnables") or task.get("runnables") or []
             for r in runnables:
                 r_symbol = r.get("Symbol") or r.get("symbol") or r.get("Name") or r.get("name")
                 if not r_symbol:
                     continue
 
-                # Add IMPLEMENTS_TASK edge from the function/runnable to the OsTask
+                
                 self.builder._edges.append(GraphEdge(
                     source_id=f"stub::{r_symbol}",
                     target_name=task_name,
@@ -93,8 +93,8 @@ class RteJsonParser:
                     }
                 ))
 
-            # RteAnalyzerConfiguration.json's TaskList records task entry
-            # symbols directly and does not contain a runnable collection.
+            
+            
             if not runnables and task.get("TaskName"):
                 self.builder._edges.append(GraphEdge(
                     source_id=f"stub::{task_name}",
@@ -103,7 +103,7 @@ class RteJsonParser:
                     properties={"binding_source": "rte_task_list"},
                 ))
 
-        # 2. Inspect standalone Runnables collection if formatted separately
+        
         runnable_list = data.get("Runnables") or data.get("runnables") or []
         for r in runnable_list:
             symbol = r.get("Symbol") or r.get("symbol") or r.get("Name")
@@ -138,7 +138,7 @@ class RteJsonParser:
                 }
             )
 
-            # Link accessing runnables to the Exclusive Area Resource
+            
             accessing_runnables = ea.get("AccessingRunnables") or ea.get("Runnables") or []
             for r in accessing_runnables:
                 r_symbol = r if isinstance(r, str) else (r.get("Symbol") or r.get("name"))

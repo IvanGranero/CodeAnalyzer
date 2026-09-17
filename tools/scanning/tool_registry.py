@@ -198,8 +198,8 @@ class ReadOnlyToolRegistry:
         if handler is None:
             return json.dumps({"error": f"Tool '{name}' is not allow-listed."})
         try:
-            # Apply the same schema boundary to direct calls that provider-backed
-            # calls receive through AgentRuntime/CallBinder.
+            
+            
             bound = CallBinder(self.definitions()).bind("direct-call", name, arguments)
             result = handler(**bound.arguments)
             if isinstance(result, str):

@@ -55,12 +55,12 @@ class GraphPayloadBuilder:
 
     def add_os_entity(self, entity_type: str, name: str, uri: str, properties: dict):
         """Creates OsTask, OsIsr, or OsResource nodes from ARXML configuration."""
-        # Convert string entity_type to NodeLabel enum safely
+        
         label = NodeLabel(entity_type) 
         
         node_id = self.generate_node_id(label, name, uri)
         
-        # Merge base properties with specific properties (like priority)
+        
         final_props = {"name": name, "storage_uri": uri}
         final_props.update(properties)
         
@@ -200,9 +200,9 @@ class GraphPayloadBuilder:
     def add_var_access_edge(self, func_id: str, var_name: str, is_write: bool, target_id: Optional[str] = None):
         edge_type = EdgeType.WRITES_VAR if is_write else EdgeType.READS_VAR
         if target_id:
-            # Exact match: this variable is a global declared in the same file as the
-            # accessing function, so we already know its real node id — no fuzzy
-            # name-based resolution needed at ingestion time.
+            
+            
+            
             self._edges.append(GraphEdge(
                 source_id=func_id,
                 target_id=target_id,
