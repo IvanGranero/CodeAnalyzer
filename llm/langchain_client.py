@@ -7,7 +7,6 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
-#from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -94,7 +93,7 @@ class LLMClient:
             raise ValueError("At least one non-empty LLM API key is required")
         self.model_name = model_name
         self.deployment = deployment
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
         self.default_headers = self._parse_pairs(default_headers)
         self.api_version = api_version
         self.audit_log_dir = audit_log_dir
@@ -110,25 +109,34 @@ class LLMClient:
         return dict(zip(parts[::2], parts[1::2]))
 
     def _build_model(self, api_key: str, settings: Mapping[str, Any]) -> BaseChatModel:
+        
         if self.model_name.startswith("anthropic/"):
             return ChatAnthropicVertex(
                 access_token=api_key,
                 project="_",
                 location="_",
-                model=self.deployment or self.model_name.removeprefix("anthropic/"),
+                model=self.deployment,
                 base_url=self.base_url,
             )
 
-        model_kwargs: dict[str, Any] = {}
+        # LiteLLM resolves openai/azure credentials from env vars
+        deployment_base_url = f"{self.base_url.rstrip('/')}/{self.deployment}"
+        os.environ["OPENAI_API_KEY"] = api_key
+        if self.model_name.startswith("openai/"):
+            os.environ["OPENAI_API_BASE"] = deployment_base_url
+        else:
+            os.environ["AZURE_API_BASE"] = deployment_base_url
+            os.environ["AZURE_API_KEY"] = api_key
+        if self.api_version:
+            os.environ["AZURE_API_VERSION"] = self.api_version
+
+        model_kwargs: dict[str, Any] = {"headers": self.default_headers} if self.default_headers else {}
         if settings.get("reasoning_effort") is not None:
             model_kwargs["reasoning_effort"] = settings["reasoning_effort"]
         if settings.get("response_format") == "json_object":
             model_kwargs["response_format"] = {"type": "json_object"}
         constructor_args: dict[str, Any] = {
             "model": self.model_name,
-            "api_key": api_key,
-            "api_base": self.base_url,
-            "extra_headers": self.default_headers or None,
             "request_timeout": 300.0,
             "max_retries": 0,
             "model_kwargs": model_kwargs,

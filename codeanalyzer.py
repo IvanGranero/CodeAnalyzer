@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("openai").setLevel(logging.ERROR)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 warnings.filterwarnings(

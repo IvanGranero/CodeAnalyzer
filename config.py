@@ -29,18 +29,18 @@ class AppConfig(BaseSettings):
 
     # --- Cheap tier ("orchestrator") -----------------------------------------
     cheap_subscription_key: str
-    cheap_headers: str
-    cheap_api_version: str
+    cheap_headers: str = ""
+    cheap_api_version: str = ""
     cheap_model_id: str
-    cheap_deployment: str
+    cheap_deployment: str = ""
     cheap_base_url: str
 
     # --- Strong tier ("code analyzer") ---------------------------------------
     strong_subscription_key: str
-    strong_headers: str
-    strong_api_version: str
+    strong_headers: str = ""
+    strong_api_version: str = ""
     strong_model_id: str
-    strong_deployment: str
+    strong_deployment: str = ""
     strong_base_url: str
 
     # --- Optional pricing ----------------------------------------------------
