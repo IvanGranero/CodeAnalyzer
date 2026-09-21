@@ -52,16 +52,24 @@ class GraphQueryService:
                 "message": "No NL-to-Cypher engine is configured.",
             }
         original_question = question
+        parameters: dict[str, Any] = {}
         if function_names:
+            parameters["previous_function_names"] = list(dict.fromkeys(function_names))
             question = question + (
                 "\n\nPREVIOUS_RESULT_SCOPE (mandatory): The user is asking about the immediately "
                 "previous result. Restrict the query to Function.name values in this "
                 "exact JSON list. Do not search functions outside this list, and do not "
-                "treat these names as a new unconstrained search:\n"
+                "treat these names as a new unconstrained search. Use the Neo4j parameter "
+                "$PREVIOUS_RESULT_SCOPE in the Function.name predicate:\n"
                 + json.dumps(function_names, ensure_ascii=False)
             )
         try:
-            result = self.nl_engine.query_and_execute(question, allow_write=False)
+            result = self.nl_engine.query_and_execute(
+                question,
+                allow_write=False,
+                parameters=parameters,
+                require_function_scope=bool(function_names),
+            )
         except Exception as exc:
             return {
                 "status": "error",
@@ -74,7 +82,7 @@ class GraphQueryService:
         return GraphQueryResult(
             question=original_question,
             cypher=str(result.get("cypher", "")),
-            parameters={},
+            parameters=parameters,
             rows=rows,
             projection=project_records(rows),
             answer=self._generic_answer(rows),

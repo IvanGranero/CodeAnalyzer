@@ -67,8 +67,8 @@ REPL_ACTION_TOOLS = [
     {
         "type": "function",
         "name": "validate_finding",
-        "description": "Run dynamic exploit validation for the most recent scan result, but only when that result reports a vulnerability. Use when the user asks to exploit, validate, or test the last finding.",
-        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Run dynamic exploit validation for one scanned vulnerable function. Use function_name when the user names a specific function after a multi-target scan; omit it only when there is exactly one current vulnerable result.",
+        "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "additionalProperties": False},
     },
     {
         "type": "function",
@@ -265,7 +265,7 @@ class ApplicationRepl:
         action = self._run(self._translate_command(text))
         if action is None:
             raise ValueError("The REPL router did not select an action tool")
-        if self._last_router_output.strip():
+        if self._last_router_output.strip() and self._last_router_output.strip() != "{}":
             print(self._last_router_output.strip())
         self._execute_action(action)            
         return action["name"] != "end_session"
@@ -273,6 +273,20 @@ class ApplicationRepl:
     @staticmethod
     def _is_exit_command(text: str) -> bool:
         return text.strip().lower() in {":quit", ":exit", "quit", "exit"}
+
+    @staticmethod
+    def _refers_to_previous_results(text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        return any(phrase in normalized for phrase in (
+            "from this list",
+            "from the list",
+            "these functions",
+            "those functions",
+            "previous result",
+            "previous results",
+            "these results",
+            "those results",
+        ))
 
     def _repl_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         """Queue one semantic REPL action; execute it after the LLM loop returns."""
@@ -303,7 +317,7 @@ class ApplicationRepl:
             "scan_function": lambda args: self._scan(str(args["function_name"])),
             "scan_previous_results": lambda args: self._scan_last_query(),
             "scan_uds_targets": lambda args: self._scan_uds(),
-            "validate_finding": lambda args: self._exploit(),
+            "validate_finding": lambda args: self._exploit(args.get("function_name")),
             "show_last_result": lambda args: self._show_last(),
             "show_status": lambda args: self._status(),
             "show_help": lambda args: self._suggestions(),
@@ -362,6 +376,12 @@ class ApplicationRepl:
                     name=call["name"],
                 )
             )
+        if (
+            self._pending_action["name"] == "query_graph"
+            and self.last_query_functions
+            and self._refers_to_previous_results(text)
+        ):
+            self._pending_action.setdefault("arguments", {})["use_previous_results"] = True
         self._trim_message_history()
         self.last_command = self._pending_action["name"]
         return self._pending_action
@@ -519,18 +539,27 @@ class ApplicationRepl:
 
     @staticmethod
     def _functions_from_rows(rows: list[dict[str, Any]]) -> list[str]:
-        function_fields = {"function", "f", "caller", "callee", "source", "target"}
+        function_fields = {
+            "function", "function_name", "f", "f.name", "caller", "callee",
+            "source", "target", "originfunction", "reachablefunction",
+        }
         names: list[str] = []
         for row in rows:
             for field, value in row.items():
-                if field not in function_fields:
+                normalized_field = str(field).lower()
+                dotted_prefix = normalized_field.rsplit(".", 1)[0] if "." in normalized_field else ""
+                function_name_field = normalized_field.endswith(".name") and dotted_prefix in {
+                    "f", "function", "caller", "callee", "source", "target",
+                    "start", "originfunction", "reachablefunction",
+                }
+                if normalized_field not in function_fields and not function_name_field:
                     continue
                 if isinstance(value, dict):
                     name = value.get("name")
                 elif hasattr(value, "get"):
                     name = value.get("name")
                 else:
-                    name = None
+                    name = value if isinstance(value, str) else None
                 if not name:
                     continue
                 names.append(str(name))
@@ -573,6 +602,7 @@ class ApplicationRepl:
             return
         self.last_scan_function = function_name
         self.last_scan = self._run(self._scan_one(function_name))
+        self._persist_scan_reports({function_name: self.last_scan})
         print(self.reporter.render_individual_report(function_name, self.last_scan))
 
     def _scan_last_query(self) -> None:
@@ -598,8 +628,16 @@ class ApplicationRepl:
             "results": results,
             "count": len(results),
         }
+        self._persist_scan_reports(results)
         for function_name, report in results.items():
             print(self.reporter.render_individual_report(function_name, report))
+
+    def _persist_scan_reports(self, reports: dict[str, dict[str, Any]]) -> None:
+        """Write the same report artifacts as the non-REPL scan workflow."""
+        for function_name, report in reports.items():
+            if report.get("vulnerability_found"):
+                self.reporter.generate_individual_report(function_name, report)
+        self.reporter.generate_consolidated_reports(reports)
 
     def _scan_uds(self) -> None:
         self._run(self._scan_uds_and_exploit())
@@ -611,43 +649,58 @@ class ApplicationRepl:
         progress = ScanProgress(sink=self._progress_sink)
         await progress.start(len(targets))
         orchestrator.set_progress_callback(progress)
-        exploit = ExploitPhase(
-            self.context.llm,
-            cache_dir="reports",
-            graph_manager=self.context.graph,
-            progress_sink=self._progress_sink,
+        results: dict[str, dict[str, Any]] = {}
+        for function_name in targets:
+            report = await self._scan_one_with_progress(
+                orchestrator, progress, function_name
+            )
+            results[function_name] = report
+        self.last_scan_results = results
+        self.last_scan_function = None
+        self.last_scan = {
+            "scan_status": "batch",
+            "results": results,
+            "count": len(results),
+        }
+        self._persist_scan_reports(results)
+        self._emit_progress(
+            f"UDS scan complete: {len(results)} functions; use 'run an exploit for <function>' "
+            "to validate one finding."
         )
-        exploit.start()
-        try:
-            for index, function_name in enumerate(targets, 1):
-                report = await self._scan_one_with_progress(
-                    orchestrator, progress, function_name
-                )
-                self.last_scan_function = function_name
-                self.last_scan = report
-                if report.get("vulnerability_found"):
-                    self._emit_progress(
-                        f"{function_name} | vulnerability found: {report.get('severity', 'unknown')}"
-                    )
-                    await exploit.enqueue(report, function_name, "")
-                elif report.get("scan_status") == "error":
-                    self._emit_progress(
-                        f"{function_name} | scan error: {report.get('error', report.get('details', 'unknown'))}"
-                    )
-                else:
-                    self._emit_progress(f"{function_name} | no supported vulnerability")
-        finally:
-            await exploit.drain()
 
-    def _exploit(self) -> None:
-        if not self.last_scan:
-            print("No scan result to exploit.")
+    def _exploit(self, function_name: str | None = None) -> None:
+        report, selected_name = self._select_exploit_target(function_name)
+        if report is None:
+            print("No scanned vulnerable result matched that function.")
             return
-        if not self.last_scan.get("vulnerability_found"):
-            print("The last scan did not produce a vulnerability to exploit.")
+        if not report.get("vulnerability_found"):
+            print(f"'{selected_name}' did not produce a vulnerability to exploit.")
             return
+        self.last_scan = report
+        self.last_scan_function = selected_name
         self._run(self._run_exploit())
-        print("Exploit validation completed.")
+        print(f"Exploit validation completed for {selected_name}.")
+
+    def _select_exploit_target(
+        self, function_name: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        results = self.last_scan_results
+        if function_name:
+            report = results.get(function_name)
+            if report is None and self.last_scan_function == function_name and self.last_scan:
+                report = self.last_scan
+            return report, function_name if report is not None else None
+        if self.last_scan_function and self.last_scan:
+            return self.last_scan, self.last_scan_function
+        vulnerable = [
+            (name, report) for name, report in results.items()
+            if report.get("vulnerability_found")
+        ]
+        if len(vulnerable) == 1:
+            return vulnerable[0][1], vulnerable[0][0]
+        if len(vulnerable) > 1:
+            print("Multiple vulnerable scan results exist; specify the function name.")
+        return None, None
 
     async def _run_exploit(self) -> None:
         exploit = ExploitPhase(

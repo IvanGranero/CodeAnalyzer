@@ -73,6 +73,7 @@ class ScanProgress:
         self.completed = 0
         self.started = 0
         self.started_at = 0.0
+        self._phase = "triage"
         self._lock = asyncio.Lock()
         self.sink = sink or (ConsoleProgressSink() if event_sink is None else _SilentProgressSink())
         self.event_sink = event_sink
@@ -83,6 +84,7 @@ class ScanProgress:
             self.completed = 0
             self.started = 0
             self.started_at = time.monotonic()
+            self._phase = "triage"
             self._write(
                 f"Scan started: {total} targets",
                 kind=EventKind.PHASE_STARTED,
@@ -107,7 +109,7 @@ class ScanProgress:
 
     async def tool(self, tool_name: str) -> None:
         await self._write_locked(
-            f"[{self._status()}] triage | tool: {tool_name}",
+            f"[{self._status()}] {self._phase} | tool: {tool_name}",
             kind=EventKind.PHASE_UPDATED,
         )
 
@@ -153,6 +155,11 @@ class ScanProgress:
             self._write(message, **event_data)
 
     def _write(self, message: str, **event_data: object) -> None:
+        if message.startswith("["):
+            if "deep scan:" in message:
+                self._phase = "deep scan"
+            elif "triage:" in message or "triage complete:" in message:
+                self._phase = "triage"
         event = ProgressEvent(
             phase="scan",
             target=str(event_data.get("target", "")),

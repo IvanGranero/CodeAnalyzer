@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -175,14 +176,25 @@ class ScanReporter:
             logger.error(f"Failed to save SARIF report: {e}")
 
     def generate_individual_report(self, func_name: str, report: dict):
-        """Generates a dedicated Markdown report tracing the full Tri-Agent chain for a single vulnerability."""
+        """Generate Markdown and JSON reports for a single vulnerability."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(self.output_dir, f"VULN_{func_name}_{timestamp}.md")
+        safe_target = "".join(
+            character if character.isalnum() or character in ".-_" else "_"
+            for character in func_name
+        )
+        json_filename = os.path.join(
+            self.output_dir,
+            f"{safe_target}-{hashlib.sha256(func_name.encode('utf-8')).hexdigest()[:12]}.json",
+        )
         content = self.render_individual_report(func_name, report)
 
         try:
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(content)
+            with open(json_filename, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            logger.info("Individual JSON report saved to '%s'", json_filename)
         except Exception as e:
             logger.error(f"Failed to write individual report for {func_name}: {e}")
 

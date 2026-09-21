@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Mapping
 
 from neo4j import Query
 from tools.graph.db import GraphDB
@@ -115,7 +115,14 @@ EXAMPLES:
         prompt += "Return ONLY the raw Cypher query text, without markdown formatting or explanation."
         return prompt
 
-    def query_and_execute(self, user_query: str, max_retries: int = 2, allow_write: bool = False) -> Dict[str, Any]:
+    def query_and_execute(
+        self,
+        user_query: str,
+        max_retries: int = 2,
+        allow_write: bool = False,
+        parameters: Mapping[str, Any] | None = None,
+        require_function_scope: bool = False,
+    ) -> Dict[str, Any]:
         """
         Translates NL to Cypher, executes it, and retries failed or empty queries.
 
@@ -153,6 +160,22 @@ EXAMPLES:
             
             cypher_query = cypher_query.replace("```cypher", "").replace("```", "").strip()
 
+            if require_function_scope or (parameters and "previous_function_names" in parameters):
+                cypher_query = re.sub(
+                    r"\$?PREVIOUS_RESULT_SCOPE\b",
+                    "$previous_function_names",
+                    cypher_query,
+                )
+
+            if require_function_scope and "$previous_function_names" not in cypher_query:
+                last_error = (
+                    "The generated query did not preserve the mandatory previous-function "
+                    "scope. Add a Function.name IN $PREVIOUS_RESULT_SCOPE predicate."
+                )
+                attempt += 1
+                empty_result_retry = False
+                continue
+
             if not cypher_query:
                 last_error = "The generated Cypher query was empty."
                 attempt += 1
@@ -181,7 +204,8 @@ EXAMPLES:
             try:
                 with self.db.driver.session() as session:
                     result = session.run(
-                        Query(cypher_query, timeout=QUERY_TIMEOUT_SECONDS)
+                        Query(cypher_query, timeout=QUERY_TIMEOUT_SECONDS),
+                        **dict(parameters or {}),
                     ).fetch(MAX_RESULT_ROWS)
 
                 data = [record.data() for record in result]

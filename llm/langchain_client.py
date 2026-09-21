@@ -9,13 +9,12 @@ from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langchain_google_vertexai.model_garden import ChatAnthropicVertex
-from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model
-
-from llm.native_chat_model import NativeOpenAIChatModel
 
 logger = logging.getLogger(__name__)
 ToolDefinition = Mapping[str, Any]
@@ -74,6 +73,8 @@ def _message_payload(message: BaseMessage) -> dict[str, Any]:
         "content": _jsonable(message.content),
         **({"tool_calls": _jsonable(message.tool_calls)} if getattr(message, "tool_calls", None) else {}),
         **({"additional_kwargs": _jsonable(message.additional_kwargs)} if message.additional_kwargs else {}),
+        **({"response_metadata": _jsonable(message.response_metadata)} if getattr(message, "response_metadata", None) else {}),
+        **({"usage_metadata": _jsonable(message.usage_metadata)} if getattr(message, "usage_metadata", None) else {}),
     }
 
 
@@ -103,8 +104,6 @@ class LLMClient:
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
         self._current_index = 0
-        # Reasoning (CoT) from the most recent assistant turn, retained for audit.
-        self._last_reasoning: str | None = None
         logger.info("Initialized %s LangChain LLM client with %d keys.", model_name, len(self.api_keys))
 
     @staticmethod
@@ -134,22 +133,25 @@ class LLMClient:
             model_name = self.deployment or model_name
         base_url = deployment_base_url if self.deployment else self.base_url
         default_query = {"api-version": self.api_version} if is_azure and self.api_version else None
-        async_client = AsyncOpenAI(
+        model_kwargs: dict[str, Any] = {}
+        is_deepseek = "deepseek" in model_name.lower() or "deepseek" in self.model_name.lower()
+        if settings.get("response_format") == "json_object" and not is_deepseek:
+            if api_style == "responses":
+                model_kwargs["text"] = {"format": {"type": "json_object"}}
+            else:
+                model_kwargs["response_format"] = {"type": "json_object"}
+        return ChatOpenAI(
+            model=model_name,
             api_key=api_key,
             base_url=base_url,
             default_headers=self.default_headers or None,
             default_query=default_query,
             timeout=300.0,
             max_retries=0,
-        )
-        return NativeOpenAIChatModel(
-            model=model_name,
-            api_style=api_style,
             max_completion_tokens=settings.get("max_completion_tokens", settings.get("max_tokens")),
-            max_tool_calls=int(settings.get("max_tool_calls", 6)),
             reasoning_effort=settings.get("reasoning_effort"),
-            response_format={"type": "json_object"} if settings.get("response_format") == "json_object" else None,
-            async_client=async_client,
+            model_kwargs=model_kwargs,
+            use_responses_api=api_style == "responses",
         )
 
     @staticmethod
@@ -202,11 +204,21 @@ class LLMClient:
             return content
         if isinstance(content, list):
             return "".join(
-                str(block.get("text", ""))
+                str(block.get("text", block.get("content", block.get("reasoning", ""))))
                 for block in content
-                if isinstance(block, Mapping) and block.get("type") == "text"
+                if isinstance(block, Mapping)
+                and block.get("type") in {"text", "output_text"}
             )
         return ""
+
+    @classmethod
+    def _assistant_text(cls, message: Any) -> str:
+        """Extract final assistant text without treating hidden reasoning as the answer."""
+        if message is None:
+            return ""
+        if not isinstance(message, AIMessage):
+            return str(message)
+        return cls._text_content(message.content)
 
     async def generate_chat(
         self,
@@ -230,83 +242,169 @@ class LLMClient:
         ]
         usage_capture = _UsageCapture()
         tool_actions: list[Any] = []
+        response_message: BaseMessage | None = None
 
         if tools and tool_handler:
-            from langchain.agents import create_agent
-
             lc_tools = self._tools(tools, tool_handler)
-            agent = create_agent(
-                model,
-                tools=lc_tools,
-                system_prompt=system_prompt,
-            )
-            result = await agent.ainvoke(
-                {"messages": messages},
-                config={
-                    "callbacks": [usage_capture],
-                    "recursion_limit": int(settings.get("agent_recursion_limit", 16)),
-                },
-            )
-            result_messages = result.get("messages", [])
-            assistant_messages = [
-                message
-                for message in result_messages
-                if isinstance(message, AIMessage)
-            ]
-            final_message = assistant_messages[-1] if assistant_messages else None
-            # With reasoning models the last assistant message can be a
-            # tool-call-only turn (empty content) while the real final answer
-            # lives one turn earlier. Pick the last non-empty assistant answer.
-            text = next(
-                (
-                    self._text_content(message.content)
-                    for message in reversed(assistant_messages)
-                    if message.content
-                ),
-                "",
-            )
-            # Preserve the last assistant turn's reasoning (CoT) for audit.
-            last_reasoning = (
-                (final_message.additional_kwargs or {}).get("reasoning_content")
-                if final_message is not None
-                else None
-            )
-            if last_reasoning:
-                self._last_reasoning = last_reasoning
-            tool_actions = [
-                message
-                for message in result_messages
-                if getattr(message, "type", None) == "tool"
-            ]
+            if settings.get("single_tool_call"):
+                response = await model.bind_tools(lc_tools).ainvoke(
+                    messages,
+                    config={"callbacks": [usage_capture]},
+                )
+                response_message = response
+                text = self._assistant_text(response)
+                for tool_call in getattr(response, "tool_calls", []):
+                    tool_actions.append(tool_call)
+                    tool_handler(
+                        str(tool_call["name"]),
+                        tool_call.get("args", {}),
+                    )
+            elif isinstance(model, ChatOpenAI):
+                response, tool_actions = await self._run_openai_tool_loop(
+                    model,
+                    messages,
+                    lc_tools,
+                    tool_handler,
+                    usage_capture,
+                    int(settings.get("max_tool_calls", 6)),
+                )
+                response_message = response
+                text = self._assistant_text(response)
+            else:
+                from langchain.agents import create_agent
+
+                agent = create_agent(
+                    model,
+                    tools=lc_tools,
+                    system_prompt=system_prompt,
+                )
+                result = await agent.ainvoke(
+                    {"messages": messages},
+                    config={
+                        "callbacks": [usage_capture],
+                        "recursion_limit": int(settings.get("agent_recursion_limit", 16)),
+                    },
+                )
+                result_messages = result.get("messages", [])
+                final_message = next(
+                    (message for message in reversed(result_messages) if isinstance(message, AIMessage)),
+                    None,
+                )
+                response_message = final_message
+                text = self._assistant_text(final_message)
+                tool_actions = [
+                    message
+                    for message in result_messages
+                    if getattr(message, "type", None) == "tool"
+                ]
         else:
             runnable = model.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
             response = await runnable.ainvoke(messages, config={"callbacks": [usage_capture]})
-            text = self._text_content(response.content) if isinstance(response, AIMessage) else str(response)
+            response_message = response
+            text = self._assistant_text(response)
             usage_capture.usage = _usage_dict(response) or usage_capture.usage
 
         if (not isinstance(text, str) or not text.strip()) and tool_actions:
             # Some Responses API models finish after a function call and do not
-            # emit a prose assistant turn. Treat this as an explicit empty
-            # response: callers that require JSON will raise a contract error
-            # instead of receiving a silently-empty "{}" that masks the issue.
-            raise EmptyLLMResponseError(
-                f"empty_response: {self.model_name} returned no assistant content "
-                f"after {len(tool_actions)} tool call(s)"
-            )
+            # emit a prose assistant turn. The tool result is the useful output.
+            text = "{}"
         if not isinstance(text, str) or not text.strip():
+            self._audit_log(
+                messages,
+                "",
+                context_id,
+                [_jsonable(action) for action in tool_actions],
+                audit_metadata,
+                response_message=response_message,
+            )
             raise EmptyLLMResponseError(f"empty_response: {self.model_name} returned no assistant content")
 
         usage = usage_capture.usage
-        last_reasoning = getattr(self, "_last_reasoning", None)
         self._audit_log(
             messages,
             text,
             context_id,
             [_jsonable(action) for action in tool_actions],
             audit_metadata,
-            reasoning=last_reasoning,
+            response_message=response_message,
         )
         return text, usage
+
+    async def _run_openai_tool_loop(
+        self,
+        model: ChatOpenAI,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Any],
+        tool_handler: ToolHandler,
+        usage_capture: _UsageCapture,
+        max_tool_calls: int,
+    ) -> tuple[AIMessage, list[ToolMessage]]:
+        """Run OpenAI-compatible tools with strict schemas and a local bound."""
+        runnable = model.bind_tools(tools, strict=True)
+        conversation = list(messages)
+        tool_actions: list[ToolMessage] = []
+        calls_used = 0
+
+        while True:
+            response = await runnable.ainvoke(
+                conversation,
+                config={"callbacks": [usage_capture]},
+            )
+            if not isinstance(response, AIMessage) or not response.tool_calls:
+                return response, tool_actions
+            if calls_used + len(response.tool_calls) > max_tool_calls:
+                return await self._finalize_after_tool_limit(
+                    model,
+                    conversation,
+                    tool_actions,
+                    usage_capture,
+                    max_tool_calls,
+                )
+
+            conversation.append(response)
+            for tool_call in response.tool_calls:
+                output = tool_handler(
+                    str(tool_call["name"]),
+                    tool_call.get("args", {}),
+                )
+                tool_message = ToolMessage(
+                    content=output if isinstance(output, str) else json.dumps(output, ensure_ascii=False),
+                    tool_call_id=str(tool_call["id"]),
+                    name=str(tool_call["name"]),
+                )
+                conversation.append(tool_message)
+                tool_actions.append(tool_message)
+                calls_used += 1
+
+            if calls_used >= max_tool_calls:
+                return await self._finalize_after_tool_limit(
+                    model,
+                    conversation,
+                    tool_actions,
+                    usage_capture,
+                    max_tool_calls,
+                )
+
+    async def _finalize_after_tool_limit(
+        self,
+        model: ChatOpenAI,
+        conversation: list[BaseMessage],
+        tool_actions: list[ToolMessage],
+        usage_capture: _UsageCapture,
+        max_tool_calls: int,
+    ) -> tuple[AIMessage, list[ToolMessage]]:
+        """Request the final answer once the bounded evidence budget is spent."""
+        final_prompt = HumanMessage(
+            content=(
+                f"The bounded evidence budget of {max_tool_calls} tool calls is exhausted. "
+                "Do not call tools. Return the complete final JSON decision now using the evidence already supplied."
+            )
+        )
+        response = await model.ainvoke(
+            [*conversation, final_prompt],
+            config={"callbacks": [usage_capture]},
+        )
+        return response, tool_actions
 
     def _audit_log(
         self,
@@ -315,7 +413,7 @@ class LLMClient:
         context_id: str | None,
         tool_calls: Sequence[Any],
         audit_metadata: Mapping[str, Any] | None,
-        reasoning: str | None = None,
+        response_message: BaseMessage | None = None,
     ) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         context = context_id or "unknown_target"
@@ -333,8 +431,11 @@ class LLMClient:
             "=== RAW OUTPUT (LLM RESPONSE) ===\n"
             f"{response_content}\n\n"
         )
-        if reasoning:
-            log_content += f"=== REASONING (CHAIN-OF-THOUGHT) ===\n{reasoning}\n\n"
+        if response_message is not None:
+            log_content += (
+                "=== RAW RESPONSE MESSAGE (LANGCHAIN) ===\n"
+                f"{json.dumps(_message_payload(response_message), indent=2, ensure_ascii=False)}\n\n"
+            )
         if audit_metadata:
             log_content += f"=== INVOCATION METADATA ===\n{json.dumps(dict(audit_metadata), indent=2, ensure_ascii=False)}\n\n"
         if tool_calls:

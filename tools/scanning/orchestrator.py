@@ -286,7 +286,10 @@ class ScanOrchestrator:
         ]
         await self._progress(
             context.target_function_name,
-            f"deep scan: analyzing {len(operations)} candidates",
+            "deep scan: analyzing "
+            f"{len(operations)} candidates ("
+            f"{', '.join(str(candidate.get('vulnerability_class', 'unknown')) for candidate in candidates)}"
+            ")",
         )
         scheduler = getattr(self, "candidate_scheduler", None)
         if scheduler is None:
