@@ -194,8 +194,8 @@ def _chat_message(response: Any) -> AIMessage:
     choice = response.choices[0]
     message = choice.message
     tool_calls = []
+    import json
     for call in message.tool_calls or []:
-        import json
         try:
             arguments = json.loads(call.function.arguments or "{}")
         except json.JSONDecodeError:
@@ -206,20 +206,42 @@ def _chat_message(response: Any) -> AIMessage:
             "id": call.id,
             "type": "tool_call",
         })
+    # Some providers (e.g. DeepSeek-compatible endpoints) emit the legacy
+    # single `message.function_call` field instead of `message.tool_calls`.
+    # Normalize it to a tool_call so the agent loop does not silently exit.
+    legacy_call = getattr(message, "function_call", None)
+    if not tool_calls and legacy_call and getattr(legacy_call, "name", None):
+        try:
+            arguments = json.loads(legacy_call.arguments or "{}")
+        except json.JSONDecodeError:
+            arguments = {}
+        tool_calls.append({
+            "name": legacy_call.name,
+            "args": arguments,
+            "id": f"legacy-{legacy_call.name}",
+            "type": "tool_call",
+        })
     content = _message_content(message)
+    reasoning = _reasoning_content(message)
+    response_metadata = {
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "reasoning_content": reasoning,
+    }
     if not content and not tool_calls:
         logger.warning(
             "Native chat response contained no assistant text: finish_reason=%s refusal=%s "
-            "message_fields=%s usage=%s",
+            "reasoning_present=%s message_fields=%s usage=%s",
             getattr(choice, "finish_reason", None),
             bool(getattr(message, "refusal", None)),
+            bool(reasoning),
             sorted(_object_fields(message)),
             _usage_metadata(response),
         )
     return AIMessage(
         content=content,
         tool_calls=tool_calls,
-        response_metadata={"finish_reason": choice.finish_reason},
+        additional_kwargs={"reasoning_content": reasoning} if reasoning else {},
+        response_metadata=response_metadata,
         usage_metadata=_usage_metadata(response),
     )
 
@@ -251,6 +273,15 @@ def _responses_message(response: Any) -> AIMessage:
 
 
 def _message_content(message: Any) -> str:
+    """Return the assistant's final-answer content only.
+
+    DeepSeek-style reasoning models separate the chain-of-thought
+    (``reasoning_content``, an extra field) from the final answer
+    (``content``). The CoT must NOT be treated as the assistant's answer --
+    agent loops and JSON extraction rely on ``content`` being *exactly* the
+    final answer (or empty on tool-call-only turns). Reasoning is preserved
+    separately via ``_reasoning_content``.
+    """
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content
@@ -260,11 +291,17 @@ def _message_content(message: Any) -> str:
             for block in content
             if isinstance(block, dict) and block.get("type") in {"text", "output_text"}
         )
-    refusal = getattr(message, "refusal", None)
-    if refusal:
-        return str(refusal)
+    return ""
+
+
+def _reasoning_content(message: Any) -> str | None:
+    """Return the chain-of-thought text if the provider separated it out.
+
+    Access via ``getattr`` because some SDKs (openai) keep ``reasoning_content``
+    in ``model_extra`` rather than as a declared field.
+    """
     reasoning = getattr(message, "reasoning_content", None)
-    return str(reasoning) if reasoning else ""
+    return str(reasoning) if reasoning else None
 
 
 def _object_fields(value: Any) -> set[str]:

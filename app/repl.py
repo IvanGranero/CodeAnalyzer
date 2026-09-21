@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import readline
-import re
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.context import AppContext
+from app.errors import format_repl_error, log_error_quietly
 from app.phases.exploit_phase import ExploitPhase
 from app.progress import CallbackProgressSink, ScanProgress
 from llm.router import ModelTier
@@ -185,8 +185,8 @@ class ApplicationRepl:
                 except KeyboardInterrupt:
                     print("Interrupted.")
                 except Exception as exc:
-                    logger.exception("REPL command failed")
-                    print(f"error: {exc}")
+                    log_error_quietly(exc, "command")
+                    print(f"error: {format_repl_error(exc, 'command')}")
         finally:
             self._loop.run_until_complete(self._loop.shutdown_asyncgens())
             self._loop.close()
@@ -199,8 +199,8 @@ class ApplicationRepl:
                 if not self._natural_command(line):
                     print("Session exit requested.")
         except Exception as exc:
-            logger.exception("REPL command failed")
-            print(f"error: {exc}", file=output)
+            log_error_quietly(exc, "command")
+            print(f"error: {format_repl_error(exc, 'command')}", file=output)
         return output.getvalue().strip()
 
     def get_suggestions(self) -> str:
@@ -265,9 +265,9 @@ class ApplicationRepl:
         action = self._run(self._translate_command(text))
         if action is None:
             raise ValueError("The REPL router did not select an action tool")
-        self._execute_action(action)
         if self._last_router_output.strip():
             print(self._last_router_output.strip())
+        self._execute_action(action)            
         return action["name"] != "end_session"
 
     @staticmethod

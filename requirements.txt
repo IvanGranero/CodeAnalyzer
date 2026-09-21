@@ -1,3 +1,6 @@
+# REPL line editing (Windows emulation of the Unix-only readline module)
+pyreadline3>=3.5.0
+
 # Graph Database & Validation
 neo4j>=5.14.0
 networkx>=3.2.0

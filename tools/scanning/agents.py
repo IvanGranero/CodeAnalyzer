@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
+from app.errors import is_retryable
 from llm.runtime import AgentRuntime
 from tools.scanning.contracts import Finding, TriageResponse, VulnerabilityClass, parse_object
 
@@ -210,6 +211,17 @@ async def run_triage(
                 "Do not call tools, do not return ran_tools/tool_calls metadata, and return one valid JSON object matching every required triage field. "
                 "Do not omit vulnerability_candidates or investigation_directive when escalating."
             )
+        except Exception as exc:
+            if not is_retryable(exc):
+                raise
+            last_error = str(exc)
+            logger.warning(
+                "Triage attempt %d/%d failed for '%s' (transient provider error): %s",
+                attempt,
+                max_attempts,
+                target_func,
+                exc,
+            )
 
     return {
         "decision": "error",
@@ -303,6 +315,14 @@ class DeepScanAgent(ScanAgent):
                     "Return the complete final Finding JSON through the response text. "
                     "Do not call tools or return tool-call metadata. Use status='unknown' and needs_human_review=true "
                     "when graph evidence is insufficient."
+                )
+            except Exception as exc:
+                if not is_retryable(exc):
+                    raise
+                last_error = str(exc)
+                logger.warning(
+                    "Deep-scan attempt %d/%d failed for '%s' (transient provider error): %s",
+                    attempt, max_attempts, target_func, exc,
                 )
         vulnerability_type = candidate.get("vulnerability_class", "other")
         if vulnerability_type not in {member.value for member in VulnerabilityClass}:

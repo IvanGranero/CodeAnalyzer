@@ -103,6 +103,8 @@ class LLMClient:
         self.audit_log_dir = audit_log_dir
         os.makedirs(self.audit_log_dir, exist_ok=True)
         self._current_index = 0
+        # Reasoning (CoT) from the most recent assistant turn, retained for audit.
+        self._last_reasoning: str | None = None
         logger.info("Initialized %s LangChain LLM client with %d keys.", model_name, len(self.api_keys))
 
     @staticmethod
@@ -246,11 +248,31 @@ class LLMClient:
                 },
             )
             result_messages = result.get("messages", [])
-            final_message = next(
-                (message for message in reversed(result_messages) if isinstance(message, AIMessage)),
-                None,
+            assistant_messages = [
+                message
+                for message in result_messages
+                if isinstance(message, AIMessage)
+            ]
+            final_message = assistant_messages[-1] if assistant_messages else None
+            # With reasoning models the last assistant message can be a
+            # tool-call-only turn (empty content) while the real final answer
+            # lives one turn earlier. Pick the last non-empty assistant answer.
+            text = next(
+                (
+                    self._text_content(message.content)
+                    for message in reversed(assistant_messages)
+                    if message.content
+                ),
+                "",
             )
-            text = self._text_content(final_message.content) if final_message is not None else ""
+            # Preserve the last assistant turn's reasoning (CoT) for audit.
+            last_reasoning = (
+                (final_message.additional_kwargs or {}).get("reasoning_content")
+                if final_message is not None
+                else None
+            )
+            if last_reasoning:
+                self._last_reasoning = last_reasoning
             tool_actions = [
                 message
                 for message in result_messages
@@ -264,18 +286,25 @@ class LLMClient:
 
         if (not isinstance(text, str) or not text.strip()) and tool_actions:
             # Some Responses API models finish after a function call and do not
-            # emit a prose assistant turn. The tool result is the useful output.
-            text = "{}"
+            # emit a prose assistant turn. Treat this as an explicit empty
+            # response: callers that require JSON will raise a contract error
+            # instead of receiving a silently-empty "{}" that masks the issue.
+            raise EmptyLLMResponseError(
+                f"empty_response: {self.model_name} returned no assistant content "
+                f"after {len(tool_actions)} tool call(s)"
+            )
         if not isinstance(text, str) or not text.strip():
             raise EmptyLLMResponseError(f"empty_response: {self.model_name} returned no assistant content")
 
         usage = usage_capture.usage
+        last_reasoning = getattr(self, "_last_reasoning", None)
         self._audit_log(
             messages,
             text,
             context_id,
             [_jsonable(action) for action in tool_actions],
             audit_metadata,
+            reasoning=last_reasoning,
         )
         return text, usage
 
@@ -286,6 +315,7 @@ class LLMClient:
         context_id: str | None,
         tool_calls: Sequence[Any],
         audit_metadata: Mapping[str, Any] | None,
+        reasoning: str | None = None,
     ) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         context = context_id or "unknown_target"
@@ -303,6 +333,8 @@ class LLMClient:
             "=== RAW OUTPUT (LLM RESPONSE) ===\n"
             f"{response_content}\n\n"
         )
+        if reasoning:
+            log_content += f"=== REASONING (CHAIN-OF-THOUGHT) ===\n{reasoning}\n\n"
         if audit_metadata:
             log_content += f"=== INVOCATION METADATA ===\n{json.dumps(dict(audit_metadata), indent=2, ensure_ascii=False)}\n\n"
         if tool_calls:
