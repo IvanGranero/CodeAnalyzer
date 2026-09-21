@@ -67,6 +67,7 @@ class LLMService:
         usage_callback: UsageCallback | None = None,
         tools: Sequence[ToolDefinition] | None = None,
         tool_handler: ToolHandler | None = None,
+        preloaded_messages=None,
     ) -> str:
         """Render and execute one configured prompt task."""
         if self.pause_waiter is not None:
@@ -104,6 +105,7 @@ class LLMService:
             tools=tools,
             tool_handler=tool_handler,
             audit_metadata={"task_name": task_name, "task_context_id": context_id},
+            preloaded_messages=preloaded_messages,
         )
 
         if usage_dict:

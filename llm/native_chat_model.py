@@ -88,7 +88,10 @@ class NativeOpenAIChatModel(BaseChatModel):
         if self.max_completion_tokens is not None:
             kwargs["max_completion_tokens"] = self.max_completion_tokens
         if self.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = self.reasoning_effort
+            if self.api_style == "responses":
+                kwargs["reasoning"] = {"effort": self.reasoning_effort}
+            else:
+                kwargs["reasoning_effort"] = self.reasoning_effort
         if self.response_format is not None and not self.bound_tools and self.api_style == "chat_completions":
             kwargs["response_format"] = self.response_format
         if self.response_format is not None and not self.bound_tools and self.api_style == "responses":
@@ -124,9 +127,11 @@ class NativeOpenAIChatModel(BaseChatModel):
         if stop is not None:
             request["stop"] = stop
         if self.api_style == "responses":
+            request.pop("messages")
+            responses_input = _responses_input(messages)
             response = await self.async_client.responses.create(
                 model=request.pop("model"),
-                input=request.pop("messages"),
+                input=responses_input,
                 max_output_tokens=request.pop("max_completion_tokens", None),
                 **request,
             )
@@ -152,6 +157,37 @@ class NativeOpenAIChatModel(BaseChatModel):
 def _json_arguments(arguments: Any) -> str:
     import json
     return json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)
+
+
+def _responses_input(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+    """Translate LangChain tool turns to the OpenAI Responses input format."""
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            items.append({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id,
+                "output": str(message.content),
+            })
+            continue
+        if isinstance(message, AIMessage) and message.tool_calls:
+            if message.content:
+                items.append({
+                    "role": "assistant",
+                    "content": message.content,
+                })
+            for call in message.tool_calls:
+                items.append({
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": call["name"],
+                    "arguments": _json_arguments(call["args"]),
+                })
+            continue
+        payload = NativeOpenAIChatModel._message_payload(message)
+        payload.pop("tool_calls", None)
+        items.append(payload)
+    return items
 
 
 def _chat_message(response: Any) -> AIMessage:
@@ -204,8 +240,8 @@ def _responses_message(response: Any) -> AIMessage:
                 "id": item.call_id,
                 "type": "tool_call",
             })
-    if not content:
-        logger.warning(
+    if not content and not tool_calls:
+        logger.debug(
             "Native Responses API response contained no output text: status=%s output_items=%s usage=%s",
             getattr(response, "status", None),
             len(getattr(response, "output", []) or []),

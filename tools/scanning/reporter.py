@@ -3,6 +3,8 @@ import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 from tools.reporting.location import SourceLocationResolver
 from tools.reporting.finding_projection import stringify, supported_findings
 
@@ -176,14 +178,34 @@ class ScanReporter:
         """Generates a dedicated Markdown report tracing the full Tri-Agent chain for a single vulnerability."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(self.output_dir, f"VULN_{func_name}_{timestamp}.md")
+        content = self.render_individual_report(func_name, report)
+
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            logger.error(f"Failed to write individual report for {func_name}: {e}")
+
+    def render_individual_report(self, func_name: str, report: dict) -> str:
+        """Render the same Markdown used for an individual report file."""
         
         md = [f"# Vulnerability Report: `{func_name}`\n"]
         md.append(f"**Severity:** {report.get('severity', 'UNKNOWN').upper()} | **Confidence:** {report.get('confidence', 'UNKNOWN').upper()}\n")
         
         metadata = report.get("metadata", {})
-        md.append("### 📍 Location & Context")
-        md.append(f"- **File:** `{metadata.get('FilePath', 'Unknown')}`")
-        md.append(f"- **Byte Span:** `{metadata.get('ByteSpan', 'Unknown')}`")
+        location = self.locations.resolve(
+            metadata.get("FilePath"),
+            metadata.get("ByteSpan"),
+        )
+        absolute_path = str(Path(location.path).resolve())
+        file_url = Path(absolute_path).as_uri()
+        span_url = f"vscode://file{quote(absolute_path)}:{location.line}:1"
+        md.append("### Source Details")
+        md.append(f"- **File:** [{location.path}]({file_url})")
+        md.append(
+            f"- **Byte Span:** [{metadata.get('ByteSpan', 'Unknown')}]({span_url}) "
+            f"(line {location.line})"
+        )
         if metadata.get('DIDs'):
             md.append(f"- **Target DIDs:** `{', '.join(metadata.get('DIDs', []))}`")
         md.append("\n---\n")
@@ -240,14 +262,4 @@ class ScanReporter:
         
         
         
-        try:
-            content = "\n".join(md)
-        except Exception as e:
-            logger.error(f"Failed to render individual report for {func_name}: {e}")
-            return
-
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception as e:
-            logger.error(f"Failed to write individual report for {func_name}: {e}")
+        return "\n".join(md)

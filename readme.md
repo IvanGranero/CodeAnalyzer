@@ -189,6 +189,8 @@ python codeanalyzer.py ./path/to/AutoSAR_Project/ --repl
 :quit
 ```
 
+The REPL prints repository-aware startup suggestions, then uses the `repl_suggestions` task to propose the next useful command after each completed action. Graph questions are converted by the `nl2cypher` task into read-only Cypher and executed against Neo4j; generated write queries and multiple statements are rejected.
+
 ## 🏗️ Architecture Pipeline
 
 * **Phase 1: Architectural Discovery**
@@ -225,13 +227,12 @@ app/
     scan_phase.py           # Phase 3 (target prioritization + concurrent scan queue)
     exploit_phase.py        # Phase 4 (shared by the queue-driven path and --exploit-only)
     reporting_phase.py      # Final summary + report generation
-ingest/                    # tree-sitter AST parsing, ARXML/RTE-JSON config parsing, graph payload builder
-graph/                     # Neo4j driver, NL→Cypher, typed graph models
-  resolver/                 # One module per resolution pass (dcm_did, macro_aliases, uds_taint,
-                             # rte_data_flow, dangerous_sinks, concurrency, ...), composed via mixins
-                             # into a single GraphResolver class -- same public API, one file per pass
-scan/                      # Decomposed triage/deep-scan orchestration, analyzer tools, report generation
-exploit/                   # DoIP/UDS client, crafter/analyzer/strategist exploit loop, safety config
+tools/
+  ingestion/               # tree-sitter AST parsing, ARXML/RTE-JSON config parsing, graph payload builder
+  graph/                   # Neo4j driver, NL->Cypher, typed graph models
+    resolver/              # Resolution passes for DCM DID, macro aliases, UDS taint, RTE flows, and sinks
+  scanning/                # Decomposed triage/deep-scan orchestration, analyzer tools, report generation
+  exploitation/            # DoIP/UDS client, crafter/analyzer/strategist exploit loop, safety config
 llm/                       # LLM client (Responses + legacy Chat APIs), prompts.json, token tracker
 ```
 

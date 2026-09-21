@@ -26,5 +26,9 @@ class GraphService:
     def close(self) -> None:
         self.graph.close()
 
-    def ask(self, question: str) -> dict[str, Any]:
-        return self.query_service.ask(question)
+    def ask(
+        self,
+        question: str,
+        function_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.query_service.ask(question, function_names=function_names)

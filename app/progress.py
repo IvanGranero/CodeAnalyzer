@@ -45,6 +45,17 @@ class ConsoleProgressSink:
         self.writer(f"[{event.phase}] {event.target} | {event.message}")
 
 
+class CallbackProgressSink:
+    """Present structured progress through an embedding UI callback."""
+
+    def __init__(self, callback: Callable[[str], None]):
+        self.callback = callback
+
+    def emit(self, event: ProgressEvent) -> None:
+        target = f"{event.target} | " if event.target else ""
+        self.callback(f"[{event.phase}] {target}{event.message}")
+
+
 class _SilentProgressSink:
     """Discard console progress when a structured event sink owns presentation."""
 

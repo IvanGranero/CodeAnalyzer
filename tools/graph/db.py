@@ -17,11 +17,17 @@ class GraphDB:
             auth=(user, password),
             max_connection_pool_size=max_pool_size
         )
+        self._closed = False
 
     def close(self):
         """Ensure the driver connection is closed upon exit."""
-        if self.driver:
+        if self.driver is None or self._closed:
+            return
+        self._closed = True
+        try:
             self.driver.close()
+        except BufferError as exc:
+            logger.warning("Neo4j driver closed with an active buffer: %s", exc)
 
     def initialize_schema(self):
         """

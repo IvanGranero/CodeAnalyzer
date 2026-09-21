@@ -52,7 +52,7 @@ class ScanRequest:
 
 @dataclass
 class ScanResult:
-    """Stable result returned to CLI, TUI, or another frontend."""
+    """Stable result returned to the CLI or another frontend."""
 
     reports: dict[str, dict[str, Any]]
     cancelled: bool = False

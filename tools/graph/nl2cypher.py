@@ -2,17 +2,24 @@ import logging
 import re
 from typing import Dict, Any, List, Optional
 
+from neo4j import Query
 from tools.graph.db import GraphDB
 from tools.graph.models import EdgeType, NodeLabel
 
 logger = logging.getLogger(__name__)
 
+QUERY_TIMEOUT_SECONDS = 15
+MAX_RESULT_ROWS = 200
 
 
 
 
 
-_WRITE_CLAUSE_RE = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV)\b", re.IGNORECASE)
+_WRITE_CLAUSE_RE = re.compile(
+    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|FOREACH)\b"
+    r"|\bCALL\s*\{",
+    re.IGNORECASE,
+)
 
 class NL2CypherEngine:
     def __init__(self, db: GraphDB, llm_client: Any):
@@ -71,8 +78,10 @@ class NL2CypherEngine:
         enum-derived summary (always in sync with graph/models.py) if APOC is unavailable."""
         query = "CALL apoc.meta.schema() YIELD value RETURN value"
         try:
-            
-            result = self.db.retrieve(query)
+            with self.db.driver.session() as session:
+                result = session.run(
+                    Query(query, timeout=QUERY_TIMEOUT_SECONDS)
+                ).fetch(1)
             if result:
                 return str(result[0]['value'])
         except Exception as e:
@@ -83,10 +92,19 @@ class NL2CypherEngine:
         """Constructs the prompt with schema and examples."""
         prompt = f"""
 You are an expert Neo4j Cypher developer working on an AutoSAR Code Property Graph.
-Convert the user's natural language question into a valid Cypher query.
+Convert the user's natural language question into a valid, read-only Cypher query.
 
 DATABASE SCHEMA:
 {schema}
+
+QUERY RULES:
+- Available node labels include Function, GlobalVariable, UdsService, NetworkSignal, TypeDefinition, MacroDefinition, OsTask, OsIsr, and OsResource.
+- Available relationships include CALLS, HANDLES_UDS, READS_VAR, WRITES_VAR, RECEIVES_SIGNAL, SENDS_SIGNAL, IMPLEMENTS_TASK, USES_MACRO, OS_LOCK_ACTION, RTE_DATA_FLOW, and LOCATED_IN.
+- UDS identifiers are stored on UdsService.did or UdsService.rid as four-character uppercase hexadecimal strings without the 0x prefix.
+- For caller/callee or UDS questions, return the relevant nodes and relationships when possible, not only scalar names.
+- Every query must be bounded. Include a LIMIT clause for row-producing queries; never scan or return an unbounded collection.
+- Never invent a function named 'did' or 'dids' when the question contains a DID/RID identifier.
+- When the user question contains PREVIOUS_RESULT_SCOPE (mandatory), preserve that scope in the Cypher. Restrict every Function variable relevant to the answer with an exact name-membership predicate such as `f.name IN [...]`; never broaden the query beyond the listed names.
 
 EXAMPLES:
 """
@@ -99,12 +117,12 @@ EXAMPLES:
 
     def query_and_execute(self, user_query: str, max_retries: int = 2, allow_write: bool = False) -> Dict[str, Any]:
         """
-        Translates NL to Cypher, executes it, and includes a retry loop for syntax errors.
+        Translates NL to Cypher, executes it, and retries failed or empty queries.
 
         By default this only ever executes read queries: if the generated Cypher contains
-        a mutating clause (CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP/LOAD CSV) it is
-        rejected instead of run. Pass allow_write=True only for an explicit, reviewed
-        admin action -- never for an ordinary user-facing NL query.
+        a mutating clause (including CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP,
+        LOAD CSV, FOREACH, or write-capable subqueries) it is
+        rejected instead of run.
         """
         schema = self._get_live_schema()
         prompt = self._build_prompt(user_query, schema)
@@ -112,11 +130,22 @@ EXAMPLES:
         attempt = 0
         last_error = ""
         cypher_query = ""
+        empty_result_retry = False
 
         while attempt <= max_retries:
             if attempt > 0:
-                
-                correction_prompt = prompt + f"\n\nYour last query failed with this error:\n{last_error}\nPlease fix the syntax and try again."
+                if empty_result_retry:
+                    correction_prompt = prompt + (
+                        "\n\nYour last read-only query executed successfully but returned no records. "
+                        "Reformulate the query to test a plausible alternative interpretation of "
+                        "the user's question. Prefer case-insensitive matching with toLower() and "
+                        "CONTAINS when an exact name match may be too strict, or use a relevant "
+                        "alternate relationship/property supported by the schema. Keep the query "
+                        "bounded and read-only. Do not broaden unrelated filters or invent entities. "
+                        "Return the alternative Cypher query only."
+                    )
+                else:
+                    correction_prompt = prompt + f"\n\nYour last query failed with this error:\n{last_error}\nPlease fix the syntax and try again."
                 cypher_query = self.llm_client.generate(correction_prompt)
             else:
                 cypher_query = self.llm_client.generate(prompt)
@@ -124,11 +153,25 @@ EXAMPLES:
             
             cypher_query = cypher_query.replace("```cypher", "").replace("```", "").strip()
 
+            if not cypher_query:
+                last_error = "The generated Cypher query was empty."
+                attempt += 1
+                continue
+
+            if cypher_query.rstrip().endswith(";"):
+                cypher_query = cypher_query.rstrip()[:-1].rstrip()
+            if ";" in cypher_query:
+                return {
+                    "status": "rejected",
+                    "message": "Multiple Cypher statements are not allowed.",
+                    "cypher": cypher_query,
+                }
+
             if _WRITE_CLAUSE_RE.search(cypher_query) and not allow_write:
                 logger.warning(f"Rejected LLM-generated Cypher containing a write clause: {cypher_query}")
                 return {
                     "status": "rejected",
-                    "message": "Generated query contains a write clause (CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP). "
+                    "message": "Generated query contains a write clause or write-capable subquery. "
                                 "Re-run with allow_write=True only after explicit review.",
                     "cypher": cypher_query,
                 }
@@ -137,17 +180,26 @@ EXAMPLES:
 
             try:
                 with self.db.driver.session() as session:
-                    exec_fn = session.execute_write if allow_write else session.execute_read
-                    result = exec_fn(lambda tx: list(tx.run(cypher_query)))
+                    result = session.run(
+                        Query(cypher_query, timeout=QUERY_TIMEOUT_SECONDS)
+                    ).fetch(MAX_RESULT_ROWS)
+
+                data = [record.data() for record in result]
+                if not data and attempt < max_retries:
+                    last_error = "The query executed successfully but returned no records."
+                    empty_result_retry = True
+                    attempt += 1
+                    continue
 
                 return {
                     "status": "success",
                     "cypher": cypher_query,
-                    "data": [record.data() for record in result]
+                    "data": data,
                 }
             except Exception as e:
-                logger.error(f"Cypher execution failed: {e}")
+                logger.debug("Cypher execution attempt failed; retrying if available: %s", e)
                 last_error = str(e)
+                empty_result_retry = False
                 attempt += 1
 
         return {

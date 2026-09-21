@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from tools.graph.db import GraphDB
 from tools.graph.graph_projection import GraphProjection, project_records
@@ -29,148 +29,88 @@ class GraphQueryResult:
         }
 
 
-@dataclass(frozen=True)
-class QueryPlan:
-    cypher: str
-    parameters: dict[str, Any]
-    answer: Callable[[list[dict[str, Any]]], str]
-
-
 class GraphQueryService:
-    """Read-only natural-language graph exploration service."""
-
-    _FUNCTION = r"([A-Za-z_][A-Za-z0-9_]*)"
+    """Natural-language graph exploration backed by the read-only NL engine."""
 
     def __init__(self, db: GraphDB, nl_engine: Any = None, max_rows: int = 200) -> None:
         self.db = db
         self.nl_engine = nl_engine
         self.max_rows = max_rows
 
-    def ask(self, question: str) -> dict[str, Any]:
+    def ask(
+        self,
+        question: str,
+        function_names: list[str] | None = None,
+    ) -> dict[str, Any]:
         question = question.strip()
         if not question:
             return {"status": "error", "message": "Question cannot be empty."}
-        plan = self._plan(question)
-        if plan is None:
-            return self._ask_with_nl_engine(question)
-        try:
-            records = self._execute(plan.cypher, plan.parameters)
-            projection = project_records(records)
-            return GraphQueryResult(
-                question=question,
-                cypher=plan.cypher,
-                parameters=plan.parameters,
-                rows=records,
-                projection=projection,
-                answer=plan.answer(records),
-            ).to_dict()
-        except Exception as exc:
-            return {
-                "status": "error",
-                "question": question,
-                "cypher": plan.cypher,
-                "message": f"Graph query failed: {exc}",
-            }
-
-    def _execute(self, cypher: str, parameters: Mapping[str, Any]) -> list[dict[str, Any]]:
-        with self.db.driver.session() as session:
-            result = session.execute_read(
-                lambda tx: list(tx.run(cypher, **dict(parameters)))
-            )
-        return [record.data() for record in result]
-
-    def _ask_with_nl_engine(self, question: str) -> dict[str, Any]:
         if self.nl_engine is None:
             return {
                 "status": "error",
                 "question": question,
-                "message": "No deterministic query matched and no NL-to-Cypher engine is configured.",
+                "message": "No NL-to-Cypher engine is configured.",
             }
-        result = self.nl_engine.query_and_execute(question, allow_write=False)
+        original_question = question
+        if function_names:
+            question = question + (
+                "\n\nPREVIOUS_RESULT_SCOPE (mandatory): The user is asking about the immediately "
+                "previous result. Restrict the query to Function.name values in this "
+                "exact JSON list. Do not search functions outside this list, and do not "
+                "treat these names as a new unconstrained search:\n"
+                + json.dumps(function_names, ensure_ascii=False)
+            )
+        try:
+            result = self.nl_engine.query_and_execute(question, allow_write=False)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "question": original_question,
+                "message": f"Graph query failed: {exc}",
+            }
         if result.get("status") != "success":
-            return result
+            return {**result, "question": original_question}
         rows = result.get("data", [])[: self.max_rows]
-        projection = project_records(rows)
-        return {
-            **result,
-            "answer": self._generic_answer(rows),
-            "rows": rows,
-            "graph": projection.to_dict(),
-        }
-
-    def _plan(self, question: str) -> QueryPlan | None:
-        normalized = re.sub(r"\s+", " ", question.strip().lower())
-        if re.search(
-            r"(?:what|which) functions? (?:are )?(?:uds[- ]related|related to uds)"
-            r"|what is (?:uds[- ]related|related to uds)",
-            normalized,
-        ):
-            return QueryPlan(
-                cypher=(
-                    "MATCH (function:Function) "
-                    "WHERE coalesce(function.tainted_by_uds, false) = true "
-                    "OR size(coalesce(function.reachable_from_dids, [])) > 0 "
-                    "OR EXISTS { MATCH (function)-[:HANDLES_UDS]->() } "
-                    "RETURN function LIMIT $limit"
-                ),
-                parameters={"limit": self.max_rows},
-                answer=lambda rows: self._name_answer(
-                    rows,
-                    "function",
-                    "No UDS-related functions were found.",
-                    "UDS-related functions:",
-                ),
-            )
-        match = re.search(rf"(?:who|which functions) calls?\s+(?:function\s+)?['\"]?{self._FUNCTION}['\"]?", normalized)
-        if match:
-            name = match.group(1)
-            return QueryPlan(
-                cypher=(
-                    "MATCH (caller:Function)-[r:CALLS]->(target:Function {name: $function_name}) "
-                    "RETURN caller, r, target LIMIT $limit"
-                ),
-                parameters={"function_name": name, "limit": self.max_rows},
-                answer=lambda rows: self._name_answer(rows, "caller", f"No functions call {name}.", f"Functions calling {name}:"),
-            )
-
-        match = re.search(rf"(?:what does|which functions does) (?:function\s+)?['\"]?{self._FUNCTION}['\"]?\s+call", normalized)
-        if match:
-            name = match.group(1)
-            return QueryPlan(
-                cypher=(
-                    "MATCH (source:Function {name: $function_name})-[r:CALLS]->(callee:Function) "
-                    "RETURN source, r, callee LIMIT $limit"
-                ),
-                parameters={"function_name": name, "limit": self.max_rows},
-                answer=lambda rows: self._name_answer(rows, "callee", f"{name} does not call any indexed functions.", f"Functions called by {name}:"),
-            )
-
-        match = re.search(rf"(?:who|which functions) handles?\s+(?:uds\s+)?(?:did|rid)\s+['\"]?(0x)?([0-9a-f]{{4}})['\"]?", normalized)
-        if match:
-            identifier = match.group(2).upper()
-            return QueryPlan(
-                cypher=(
-                    "MATCH (function:Function)-[r:HANDLES_UDS]->(service:UdsService) "
-                    "WHERE toUpper(coalesce(service.did, service.rid, '')) = $identifier "
-                    "RETURN function, r, service LIMIT $limit"
-                ),
-                parameters={"identifier": identifier, "limit": self.max_rows},
-                answer=lambda rows: self._name_answer(rows, "function", f"No functions handle UDS identifier {identifier}.", f"Functions handling UDS identifier {identifier}:"),
-            )
-        return None
-
-    @staticmethod
-    def _name_answer(rows: list[dict[str, Any]], key: str, empty: str, prefix: str) -> str:
-        names = []
-        for row in rows:
-            value = row.get(key)
-            if value is not None and hasattr(value, "get") and value.get("name"):
-                names.append(str(value["name"]))
-        names = list(dict.fromkeys(names))
-        return empty if not names else f"{prefix} " + ", ".join(names) + "."
+        return GraphQueryResult(
+            question=original_question,
+            cypher=str(result.get("cypher", "")),
+            parameters={},
+            rows=rows,
+            projection=project_records(rows),
+            answer=self._generic_answer(rows),
+        ).to_dict()
 
     @staticmethod
     def _generic_answer(rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "The graph returned no matching records."
-        return f"The graph returned {len(rows)} matching record(s)."
+        rendered = []
+        for row in rows[:50]:
+            values = []
+            non_empty = [(key, value) for key, value in row.items() if value is not None]
+            for key, value in row.items():
+                entity_name = GraphQueryService._entity_name(value)
+                if entity_name is not None:
+                    value = entity_name
+                if value is None:
+                    continue
+                if len(non_empty) == 1 and len(str(key)) <= 2:
+                    values.append(str(value))
+                    continue
+                values.append(f"{key}={value}")
+            rendered.append(", ".join(values))
+        suffix = f" ... ({len(rows)} total)" if len(rows) > 50 else ""
+        return "Matching records: " + "; ".join(rendered) + suffix + "."
+
+    @staticmethod
+    def _entity_name(value: Any) -> str | None:
+        if isinstance(value, dict) and value.get("name"):
+            return str(value["name"])
+        if hasattr(value, "get"):
+            try:
+                name = value.get("name")
+            except (AttributeError, TypeError):
+                return None
+            if name:
+                return str(name)
+        return None

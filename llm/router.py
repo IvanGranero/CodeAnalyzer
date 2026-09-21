@@ -19,7 +19,7 @@ class TieredLLMService:
     _LITE_TASKS = frozenset({
         "discovery",
         "nl2cypher",
-        "repl_command",
+        "repl_action",
         "repl_suggestions",
     })
     _MEDIUM_TASKS = frozenset({
@@ -72,10 +72,12 @@ class TieredLLMService:
         usage_callback: UsageCallback | None = None,
         tools: Sequence[ToolDefinition] | None = None,
         tool_handler: ToolHandler | None = None,
+        preloaded_messages=None,
     ) -> str:
         tier = self._tier_for(task_name, kwargs, settings_override)
         return await self.services[tier].execute_task(
-            task_name, kwargs, context_id, settings_override, usage_callback, tools, tool_handler
+            task_name, kwargs, context_id, settings_override, usage_callback, tools, tool_handler,
+            preloaded_messages,
         )
 
     @property

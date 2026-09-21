@@ -115,6 +115,7 @@ class AgentRuntime:
         settings_override: Mapping[str, Any] | None = None,
         enable_tools: bool = True,
         tool_registry: Any = None,
+        preloaded_messages=None,
     ) -> str:
         registry = tool_registry if tool_registry is not None else self.tool_registry
 
@@ -130,6 +131,8 @@ class AgentRuntime:
             if use_tools:
                 request["tools"] = registry.definitions()
                 request["tool_handler"] = registry.call
+            if preloaded_messages is not None:
+                request["preloaded_messages"] = preloaded_messages
 
             return await self.llm.execute_task(
                 **request,

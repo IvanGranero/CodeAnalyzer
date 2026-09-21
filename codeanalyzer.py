@@ -44,6 +44,7 @@ def main() -> None:
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         if args.repl:
+            logging.getLogger().setLevel(logging.WARNING)
             from pathlib import Path
 
             from app.context import build_app_context, shutdown

@@ -9,7 +9,7 @@ from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langchain_google_vertexai.model_garden import ChatAnthropicVertex
 from openai import AsyncOpenAI
@@ -72,6 +72,7 @@ def _message_payload(message: BaseMessage) -> dict[str, Any]:
     return {
         "type": message.type,
         "content": _jsonable(message.content),
+        **({"tool_calls": _jsonable(message.tool_calls)} if getattr(message, "tool_calls", None) else {}),
         **({"additional_kwargs": _jsonable(message.additional_kwargs)} if message.additional_kwargs else {}),
     }
 
@@ -214,12 +215,17 @@ class LLMClient:
         tools: Sequence[ToolDefinition] | None = None,
         tool_handler: ToolHandler | None = None,
         audit_metadata: Mapping[str, Any] | None = None,
+        preloaded_messages: Sequence[BaseMessage] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         settings = model_settings or {}
         api_key = self.api_keys[self._current_index]
         self._current_index = (self._current_index + 1) % len(self.api_keys)
         model = self._build_model(api_key, settings)
-        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        messages = [
+            SystemMessage(content=system_prompt),
+            *(preloaded_messages or []),
+            HumanMessage(content=user_prompt),
+        ]
         usage_capture = _UsageCapture()
         tool_actions: list[Any] = []
 
@@ -256,6 +262,10 @@ class LLMClient:
             text = self._text_content(response.content) if isinstance(response, AIMessage) else str(response)
             usage_capture.usage = _usage_dict(response) or usage_capture.usage
 
+        if (not isinstance(text, str) or not text.strip()) and tool_actions:
+            # Some Responses API models finish after a function call and do not
+            # emit a prose assistant turn. The tool result is the useful output.
+            text = "{}"
         if not isinstance(text, str) or not text.strip():
             raise EmptyLLMResponseError(f"empty_response: {self.model_name} returned no assistant content")
 

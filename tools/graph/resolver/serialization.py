@@ -353,6 +353,9 @@ class SerializationMixin:
             provenance = {
                 "retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}",
                 "query": "MATCH (f:Function {name: $func_name}) ... neighborhood",
+                "query_parameters": {"func_name": func_name},
+                "tools_used": [],
+                "query_scope": "function_neighborhood",
                 "evidence": {
                     "node_count": len(nodes),
                     "edge_count": len(edges),
@@ -387,6 +390,17 @@ class SerializationMixin:
                 ],
                 "provenance": provenance,
                 "confidence": provenance["confidence"],
+                "retrieval_manifest": {
+                    "source": "GraphResolver.serialize_function_neighborhood",
+                    "tools_used": provenance["tools_used"],
+                    "queries_used": [{
+                        "name": "function_neighborhood",
+                        "query": provenance["query"],
+                        "parameters": provenance["query_parameters"],
+                        "scope": provenance["query_scope"],
+                    }],
+                    "duplicate_retrieval": "Do not repeat supplied graph fields unless a specific field is absent, unknown, contradictory, or needs a more precise path or source span.",
+                },
             }
 
             payload["protocol_contract"] = self._build_protocol_contract(
@@ -454,10 +468,24 @@ class SerializationMixin:
                 "provenance": {
                     "retrieval_pointer": retrieval_pointer or f"neo4j:function_neighborhood:{func_name}",
                     "query": "MATCH ...",
+                    "query_parameters": {"func_name": func_name},
+                    "tools_used": [],
+                    "query_scope": "function_neighborhood",
                     "evidence": {"node_count": 0, "edge_count": 0, "source_count": 0, "sink_count": 0, "sanitizer_count": 0},
                     "confidence": "low"
                 },
                 "confidence": "low",
+                "retrieval_manifest": {
+                    "source": "GraphResolver.serialize_function_neighborhood",
+                    "tools_used": [],
+                    "queries_used": [{
+                        "name": "function_neighborhood",
+                        "query": "MATCH ...",
+                        "parameters": {"func_name": func_name},
+                        "scope": "function_neighborhood",
+                    }],
+                    "duplicate_retrieval": "Do not repeat supplied graph fields unless a specific field is absent, unknown, contradictory, or needs a more precise path or source span.",
+                },
             }
             return json.dumps(fallback, separators=(",", ":"), ensure_ascii=False), f"Function {func_name} has no serializable graph neighborhood."
 

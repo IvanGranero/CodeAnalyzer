@@ -178,6 +178,39 @@ class ScanOrchestrator:
         graph_json, graph_summary = self.graph_resolver.serialize_function_neighborhood(
             target_function_name
         )
+        try:
+            graph_payload = json.loads(graph_json)
+            retrieval_manifest = graph_payload.setdefault("retrieval_manifest", {})
+            retrieval_manifest["tools_used"] = [
+                {
+                    "name": "get_function_metadata",
+                    "source": "AnalyzerTools.get_function_metadata",
+                    "parameters": {"function_name": target_function_name},
+                },
+                {
+                    "name": "source_location_lookup",
+                    "source": "ScanOrchestrator._get_target_source",
+                    "parameters": {"function_name": target_function_name},
+                },
+            ]
+            retrieval_manifest["queries_used"] = [
+                *retrieval_manifest.get("queries_used", []),
+                {
+                    "name": "function_metadata",
+                    "source": "AnalyzerTools.get_function_metadata",
+                    "parameters": {"func_name": target_function_name},
+                    "scope": "target_function_metadata",
+                },
+                {
+                    "name": "source_location_lookup",
+                    "source": "ScanOrchestrator._get_target_source",
+                    "parameters": {"func_name": target_function_name},
+                    "scope": "target_function_source_span",
+                },
+            ]
+            graph_json = json.dumps(graph_payload, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Could not attach retrieval manifest for %s: %s", target_function_name, exc)
         return ScanContext(
             target_function_name=target_function_name,
             metadata=metadata,

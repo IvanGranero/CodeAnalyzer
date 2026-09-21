@@ -34,7 +34,7 @@ class AppConfig(BaseSettings):
     lite_model_id: str
     lite_deployment: str = ""
     lite_base_url: str
-    lite_api_style: str = "chat_responses"
+    lite_api_style: str = "responses"
 
     medium_subscription_key: str
     medium_headers: str = ""
@@ -42,7 +42,7 @@ class AppConfig(BaseSettings):
     medium_model_id: str
     medium_deployment: str = ""
     medium_base_url: str
-    medium_api_style: str = "chat_responses"
+    medium_api_style: str = "responses"
 
     strong_subscription_key: str
     strong_headers: str = ""
@@ -50,7 +50,7 @@ class AppConfig(BaseSettings):
     strong_model_id: str
     strong_deployment: str = ""
     strong_base_url: str
-    strong_api_style: str = "chat_responses"
+    strong_api_style: str = "responses"
 
     lite_token_pricing: TokenPricing = Field(default_factory=TokenPricing)
     medium_token_pricing: TokenPricing = Field(default_factory=TokenPricing)

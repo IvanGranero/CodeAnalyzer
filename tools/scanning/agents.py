@@ -10,11 +10,11 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from langchain_core.messages import AIMessage, ToolMessage
 from llm.runtime import AgentRuntime
 from tools.scanning.contracts import Finding, TriageResponse, VulnerabilityClass, parse_object
 
 logger = logging.getLogger(__name__)
-
 
 class ScanAgent:
     def __init__(
@@ -39,6 +39,12 @@ class TriageAgent(ScanAgent):
         target_func: str = "",
         enable_tools: bool = True,
     ) -> dict[str, Any]:
+        preloaded_messages = _build_initial_tool_history(
+            graph_json,
+            graph_summary,
+            target_func,
+            source_code,
+        )
         response_text = await self._runtime.execute(
             task_name="triage_agent",
             context_id=target_func,
@@ -58,6 +64,7 @@ class TriageAgent(ScanAgent):
                 else None
             ),
             enable_tools=enable_tools,
+            preloaded_messages=preloaded_messages,
         )
         return parse_object(self._extract_json(response_text), TriageResponse).model_dump(mode="json")
 
@@ -81,6 +88,87 @@ class TriageAgent(ScanAgent):
             target_func,
             max_attempts,
         )
+
+
+def _build_initial_tool_history(
+    graph_json: str,
+    graph_summary: str,
+    target_func: str,
+    source_code: str,
+) -> list[Any]:
+    """Represent initial graph retrieval as completed tool calls in agent history."""
+    try:
+        payload = json.loads(graph_json) if graph_json else {}
+    except json.JSONDecodeError:
+        payload = {}
+    manifest = payload.get("retrieval_manifest", {})
+    covered_tools = [
+        ("get_function_metadata", {"function_name": target_func}, {
+            "status": "found",
+            "function": target_func,
+            "note": "Initial target metadata is included in GRAPH JSON.function and the scan metadata bundle.",
+        }),
+        ("get_graph_evidence", {"function_name": target_func, "verbosity": "medium"}, {
+            "status": "found",
+            "note": "Complete neighborhood result is included in GRAPH JSON.graph, sources, sinks, variables, concurrency, and provenance.",
+        }),
+        ("get_uds_contract", {"function_name": target_func}, {
+            "status": "found",
+            "protocol_contract": payload.get("protocol_contract", {}),
+        }),
+        ("get_callers_and_entry_points", {"function_name": target_func}, {
+            "status": "found",
+            "sources": payload.get("sources", {}),
+        }),
+        ("get_callees", {"function_name": target_func}, {
+            "status": "found",
+            "sinks": payload.get("sinks", []),
+            "note": "Callee nodes and edges are in GRAPH JSON.graph.",
+        }),
+        ("get_variable_access", {"function_name": target_func}, {
+            "status": "found",
+            "variable_access": payload.get("variable_access", []),
+        }),
+        ("get_concurrency_metadata", {"function_name": target_func}, {
+            "status": "found",
+            "concurrency": payload.get("concurrency", {}),
+        }),
+        ("get_resolution_metadata", {"function_name": target_func}, {
+            "status": "found",
+            "graph_flags": {
+                key: payload.get("function", {}).get(key)
+                for key in ("tainted_by_uds", "reachable_dids", "is_dead_code", "has_data_race_risk")
+            },
+        }),
+        ("get_rte_data_flows", {"function_name": target_func}, {
+            "status": "found",
+            "flows": payload.get("rte_data_flows", []),
+        }),
+        ("get_memory_sinks", {"function_name": target_func, "max_hops": 4}, {
+            "status": "found",
+            "paths": payload.get("sinks", []),
+        }),
+    ]
+    tool_calls = []
+    tool_messages = []
+    for index, (name, arguments, result) in enumerate(covered_tools, 1):
+        call_id = f"initial-{index}-{name}"
+        tool_calls.append({
+            "name": name,
+            "args": arguments,
+            "id": call_id,
+            "type": "tool_call",
+        })
+        tool_messages.append(ToolMessage(
+            content=json.dumps({
+                **result,
+                "retrieval_manifest": manifest,
+                "already_supplied_in_initial_bundle": True,
+            }, ensure_ascii=False),
+            tool_call_id=call_id,
+            name=name,
+        ))
+    return [AIMessage(content="", tool_calls=tool_calls), *tool_messages]
 
 async def run_triage(
     triage_agent: TriageAgent,
@@ -159,6 +247,12 @@ class DeepScanAgent(ScanAgent):
                 "reasoning_effort": "low",
                 "max_completion_tokens": max(6000, settings["max_completion_tokens"]),
             }
+        preloaded_messages = _build_initial_tool_history(
+            graph_json,
+            graph_summary,
+            target_func,
+            source_code,
+        )
         response_text = await self._runtime.execute(
             task_name="deep_scan_agent",
             context_id=f"{target_func}-{candidate.get('vulnerability_class', 'unknown')}",
@@ -173,6 +267,7 @@ class DeepScanAgent(ScanAgent):
             },
             settings_override=settings,
             enable_tools=enable_tools,
+            preloaded_messages=preloaded_messages,
         )
         return parse_object(self._extract_json(response_text), Finding).model_dump(mode="json")
 
