@@ -67,6 +67,7 @@ class GraphResolver(
             self._bind_runnables_to_tasks,
             self._resolve_os_concurrency,
             self._resolve_uds_taint,
+            self._resolve_dcm_security_requirements,
             
             
             self._flag_dead_code,

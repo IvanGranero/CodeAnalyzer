@@ -6,8 +6,6 @@ from tools.ingestion.builder import GraphPayloadBuilder
 
 logger = logging.getLogger(__name__)
 
-
-
 PRIMITIVE_TYPES = {
     'void', 'char', 'int', 'short', 'long', 'float', 'double',
     'uint8', 'uint16', 'uint32', 'uint64', 'sint8', 'sint16', 'sint32', 'sint64',
@@ -25,38 +23,37 @@ class ASTParser:
         
         self.autosar_func_re = re.compile(br'FUNC\s*\([^)]+\)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
         self.autosar_task_re = re.compile(br'(?:TASK|ISR)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)')
-        
-        
-        
-        
         self.macro_alias_target_re = re.compile(r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
         self.accessor_macro_body_re = re.compile(r'^\s*\((?:[\s&*(]*)[A-Za-z_]')
-        
-        
-        
-        
-        
-        
-        
-        
-        
         self.dcm_did_table_entry_re = re.compile(
             br'\(\(Dcm_DidMgrOpFuncType\)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\)'
             br'[^{}]*?0x([0-9A-Fa-f]+)u\}\s*/\*\s*DID:\s*0x([0-9A-Fa-f]+)\s*\*/'
+        )
+        self.dcm_table_re = re.compile(
+            br'CONST\s*\(\s*[^,]+,\s*[^)]+\)\s+'
+            br'(?P<name>Dcm_Cfg(?:StatePreconditions|StateSessionInfo|StateSecurityInfo'
+            br'|RidMgrRidInfo|DidMgrDidOpInfo))\s*\[[^]]*\]\s*=\s*'
+            br'(?P<body>\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})',
+            re.DOTALL,
+        )
+        self.dcm_precondition_row_re = re.compile(
+            br'\{\s*\{\s*0x([0-9A-Fa-f]+)u\s*,\s*0x([0-9A-Fa-f]+)u\s*\}\s*\}'
+        )
+        self.dcm_session_row_re = re.compile(
+            br'\{\s*\{[^}]*\}\s*,[^,]*,\s*0x([0-9A-Fa-f]+)u\s*\}'
+        )
+        self.dcm_security_row_re = re.compile(br'\{\s*0x([0-9A-Fa-f]+)u\s*\}')
+        # DID/RID op rows: index fields (opBaseIdx / execCondRef / RoutineInfoByte) are
+        # DECIMAL literals ("22u", "10u"), bitmask fields (Operations/CallTypes) are HEX
+        # ("0x03u"). Capture each group with the literal token so _values can apply the
+        # right base per field.
+        self.dcm_did_op_row_re = re.compile(
+            br'\{\s*(\d+)u\s*,\s*(\d+)u\s*,\s*0x([0-9A-Fa-f]+)u\s*\}\s*'
+            br'/\*\s*DID:\s*0x([0-9A-Fa-f]+)\s*\*/'
+        )
+        self.dcm_rid_row_re = re.compile(
+            br'\{\s*(\d+)u\s*,\s*(\d+)u\s*,\s*0x([0-9A-Fa-f]+)u\s*,\s*(\d+)u\s*\}\s*'
+            br'/\*\s*RID:\s*0x([0-9A-Fa-f]+)\s*\*/'
         )
 
     def parse_file(
@@ -90,15 +87,12 @@ class ASTParser:
 
         if file_size <= 10 * 1024 * 1024 and not is_config_file:
             try:
-                
-                
                 def source_reader(byte_offset, _point):
                     self._check_cancel(cancel_event)
                     return source_code[byte_offset:byte_offset + 64 * 1024]
 
                 tree = self.parser.parse(source_reader)
 
-                
                 if not is_vendor_code or parse_vendor_internals:
                     for child in tree.root_node.children:
                         self._check_cancel(cancel_event)
@@ -128,7 +122,6 @@ class ASTParser:
                     if m_val and m_val != m_name and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', m_val):
                         self.builder.add_macro_alias(m_name, m_val)
 
-                
                 func_nodes = self._find_nodes_of_type(tree.root_node, 'function_definition')
                 for func_node in func_nodes:
                     self._check_cancel(cancel_event)
@@ -138,7 +131,6 @@ class ASTParser:
                         func_id = self.builder.add_function_node(func_name, uri, byte_span, is_vendor_code)
                         found_function_names.add(func_name)
                         
-                        
                         if not is_vendor_code or parse_vendor_internals:
                             self._process_function_internals(func_node, source_code, func_id, func_name, file_global_ids)
             except Exception as e:
@@ -147,6 +139,7 @@ class ASTParser:
         self._check_cancel(cancel_event)
         self._regex_autosar_fallback(raw_code, uri, found_function_names, is_vendor_code, cancel_event)
         self._extract_dcm_did_table_entries(raw_code, cancel_event)
+        self._extract_dcm_security_requirements(raw_code, cancel_event)
 
     def _check_cancel(self, cancel_event=None):
         cancel_event = cancel_event or self._cancel_event
@@ -162,6 +155,120 @@ class ASTParser:
                 did_hex.decode('utf8', errors='ignore'),
                 func_class_hex.decode('utf8', errors='ignore'),
             )
+
+    def _extract_dcm_security_requirements(self, raw_code: bytes, cancel_event=None):
+        """Decode Dcm security/session access requirements from generated precondition tables.
+
+        Generic by design: the generated config file names change between ECUs and
+        vendors, but the Dcm_Cfg* table names and their row/comment layouts are stable,
+        so this parses whichever file actually carries the tables. No-op for ordinary
+        source files (the table regex finds nothing).
+        """
+        tables: dict[str, bytes] = {}
+        for match in self.dcm_table_re.finditer(raw_code):
+            name = match.group('name').decode('ascii', errors='ignore')
+            tables.setdefault(name, []).append(match.group('body'))
+
+        if not tables:
+            return
+
+        def _values(name: str) -> list:
+            # Each table's captures have known field bases:
+            #   * StatePreconditions / StateSessionInfo / StateSecurityInfo -> all hex
+            #   * DidMgrDidOpInfo -> (execCondRef:dec, opTypeBaseIdx:dec, callTypes:hex, did:hex)
+            #   * RidMgrRidInfo   -> (opBaseIdx:dec, execCondRef:dec, operations:hex, info:dec, rid:hex)
+            base_spec = {
+                'Dcm_CfgStatePreconditions': (16, 16),
+                'Dcm_CfgStateSessionInfo': (16,),
+                'Dcm_CfgStateSecurityInfo': (16,),
+                'Dcm_CfgDidMgrDidOpInfo': (10, 10, 16, 16),
+                'Dcm_CfgRidMgrRidInfo': (10, 10, 16, 10, 16),
+            }
+            spec = base_spec[name]
+            rows = []
+            for body in tables.get(name, []):
+                for match in self._dcm_row_matcher(name).finditer(body):
+                    self._check_cancel(cancel_event)
+                    groups = match.groups()
+                    rows.append(
+                        [int(group, spec[index]) for index, group in enumerate(groups)]
+                    )
+            return rows
+
+        preconditions = _values('Dcm_CfgStatePreconditions')
+        session_values = [row[0] for row in _values('Dcm_CfgStateSessionInfo')]
+        security_values = [row[0] for row in _values('Dcm_CfgStateSecurityInfo')]
+
+        def _resolve(ref: int) -> tuple[int, int]:
+            if 0 <= ref < len(preconditions):
+                session_mask, security_mask = preconditions[ref]
+                return session_mask, security_mask
+            return 0, 0
+
+        def _sessions(mask: int) -> list:
+            resolved = []
+            for bit, subfunction in enumerate(session_values):
+                if mask & (1 << bit):
+                    resolved.append({"session_subfunction": subfunction, "session_hex": f"0x{subfunction:02X}"})
+            return resolved
+
+        def _security_levels(mask: int) -> list:
+            resolved = []
+            for bit, value in enumerate(security_values):
+                if not (mask & (1 << bit)) or value is None:
+                    continue
+                seed_subfunction = 2 * value - 1
+                resolved.append({
+                    "level_value": value,
+                    "seed_subfunction": seed_subfunction,
+                    "key_subfunction": seed_subfunction + 1,
+                    "level_name": f"Level_{seed_subfunction:X}",
+                })
+            return resolved
+
+        emitted = 0
+        for entry in _values('Dcm_CfgDidMgrDidOpInfo'):
+            exec_cond_ref, _op_type_base, _call_types, did_hex = entry
+            session_mask, security_mask = _resolve(exec_cond_ref)
+            if not (session_mask or security_mask):
+                continue
+            self.builder.add_dcm_requirement(
+                f"{did_hex:04X}",
+                "did",
+                session_bitmask=session_mask,
+                security_bitmask=security_mask,
+                sessions=_sessions(session_mask),
+                security_levels=_security_levels(security_mask),
+            )
+            emitted += 1
+
+        for entry in _values('Dcm_CfgRidMgrRidInfo'):
+            _op_base, exec_cond_ref, operations, _info_byte, rid_hex = entry
+            session_mask, security_mask = _resolve(exec_cond_ref)
+            if not (session_mask or security_mask):
+                continue
+            self.builder.add_dcm_requirement(
+                f"{rid_hex:04X}",
+                "rid",
+                session_bitmask=session_mask,
+                security_bitmask=security_mask,
+                sessions=_sessions(session_mask),
+                security_levels=_security_levels(security_mask),
+                operations=operations,
+            )
+            emitted += 1
+
+        if emitted:
+            logger.info("Decoded Dcm security/session requirements for %d DID/RID entries.", emitted)
+
+    def _dcm_row_matcher(self, name: str):
+        return {
+            'Dcm_CfgStatePreconditions': self.dcm_precondition_row_re,
+            'Dcm_CfgStateSessionInfo': self.dcm_session_row_re,
+            'Dcm_CfgStateSecurityInfo': self.dcm_security_row_re,
+            'Dcm_CfgDidMgrDidOpInfo': self.dcm_did_op_row_re,
+            'Dcm_CfgRidMgrRidInfo': self.dcm_rid_row_re,
+        }.get(name)
 
     def _clean_autosar_macros(self, code: bytes) -> bytes:
         text = code.decode('utf-8', errors='ignore')
@@ -185,8 +292,6 @@ class ASTParser:
                 parts = func_name.split("_DID_") if "_DID_" in func_name else func_name.split("_RID_")
                 if len(parts) > 1:
                     raw_identifier = parts[1].split("_", 1)[0]
-                    
-                    
                     
                     did_hex = raw_identifier[-4:]
                     operation = (
@@ -214,10 +319,6 @@ class ASTParser:
         
         file_global_ids = file_global_ids or {}
 
-        
-        
-        
-        
         call_target_spans = set()
 
         for call_node in self._find_nodes_of_type(func_node, 'call_expression'):
@@ -240,9 +341,6 @@ class ASTParser:
                     pointer_expr = source_code[func_target.start_byte:func_target.end_byte].decode('utf8', errors='ignore')
                     self.builder.add_call_edge(caller_id, pointer_expr, arguments=args, is_pointer=True)
 
-        
-        
-        
         local_vars = set()
         for param_node in self._find_nodes_of_type(func_node, 'parameter_declaration'):
             self._check_cancel()
@@ -275,8 +373,6 @@ class ASTParser:
             if var_name and var_name != func_name and var_name not in local_vars:
                 is_write = var_name in written_vars
                 
-                
-                
                 target_id = file_global_ids.get(var_name)
                 self.builder.add_var_access_edge(caller_id, var_name, is_write, target_id=target_id)
 
@@ -307,12 +403,6 @@ class ASTParser:
         return None
 
     def _process_macro_alias(self, preproc_function_def_node, source_code: bytes):
-        """
-        Handles a function-like macro `#define SHORT(...) LONG(...)`. tree-sitter-c
-        doesn't parse the replacement body into a sub-AST -- it's an opaque
-        `preproc_arg` text blob -- so the target is extracted with a regex looking for
-        a leading identifier immediately followed by '('.
-        """
         name_node = preproc_function_def_node.child_by_field_name('name')
         if not name_node:
             return
@@ -325,18 +415,6 @@ class ASTParser:
 
         match = self.macro_alias_target_re.match(replacement_text)
         if not match:
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
             if short_name.startswith('Rte_') and self.accessor_macro_body_re.match(replacement_text):
                 self.builder.mark_late_bound_accessor(short_name)
             return
@@ -345,13 +423,6 @@ class ASTParser:
             self.builder.add_macro_alias(short_name, long_name)
 
     def _extract_all_declared_identifiers(self, node, source_code: bytes) -> list:
-        """
-        Returns every identifier declared by a (possibly comma-separated) `declaration`
-        node, e.g. all of a/b/c in `uint32 a, b, c;` or p/q in `uint8 *p, *q;`.
-        _extract_first_identifier only ever returns the first hit from a depth-first
-        walk, so every variable after the first in a multi-declarator statement was
-        previously dropped from the graph entirely.
-        """
         names = []
         declarator_types = ('identifier', 'init_declarator', 'pointer_declarator', 'array_declarator')
         found_any = False
@@ -362,8 +433,6 @@ class ASTParser:
                 if name:
                     names.append(name)
         if not found_any:
-            
-            
             single = self._extract_first_identifier(node, source_code)
             if single:
                 names.append(single)
@@ -385,4 +454,3 @@ class ASTParser:
             for child in reversed(current.children):
                 stack.append(child)
         return None
-

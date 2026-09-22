@@ -56,7 +56,13 @@ class SerializationMixin:
             subfunction: uds.protocol_subfunction,
             protocol_contract_json: coalesce(uds.protocol_contract_json, uds.protocol_contract),
             source: coalesce(uds.source, uds.protocol_source, 'heuristic'),
-            func_class_hex: uds.func_class_hex
+            func_class_hex: uds.func_class_hex,
+            required_session_subfunctions: uds.required_session_subfunctions,
+            required_seed_subfunctions: uds.required_seed_subfunctions,
+            required_key_subfunctions: uds.required_key_subfunctions,
+            dcm_session_bitmask: uds.dcm_session_bitmask,
+            dcm_security_bitmask: uds.dcm_security_bitmask,
+            dcm_requirements_source: uds.dcm_requirements_source
         }) AS uds_triggers
         OPTIONAL MATCH (f)-[:RECEIVES_SIGNAL]->(net:NetworkSignal)
         WITH f, task, isrs, locks_held, types, macros, callers, uds_triggers, collect(DISTINCT {id: elementId(net), type: labels(net)[0], name: net.name}) AS network_triggers
@@ -554,13 +560,47 @@ class SerializationMixin:
             },
             key=str,
         )
+
+        # Concrete Dcm precondition facts (decoded from generated config tables) when
+        # present; otherwise keep the explicit "unknown" contract so downstream agents
+        # never mistake absence of Dcm data for "no access control".
+        session_values: list[dict] = []
+        security_levels: list[dict] = []
+        for source in uds_sources:
+            sessions = source.get("required_session_subfunctions") or []
+            seeds = source.get("required_seed_subfunctions") or []
+            keys = source.get("required_key_subfunctions") or []
+            if sessions and not session_values:
+                session_values = [
+                    {"session_subfunction": int(session), "session_hex": f"0x{int(session):02X}"}
+                    for session in sessions
+                ]
+            if seeds and not security_levels:
+                for index, seed in enumerate(seeds):
+                    security_levels.append({
+                        "seed_subfunction": int(seed),
+                        "key_subfunction": int(keys[index]) if index < len(keys) else int(seed) + 1,
+                        "level_name": f"Level_{int(seed):X}",
+                    })
+        session_requirements = {
+            "status": "available" if session_values else "unknown",
+            "values": session_values,
+            "missing_fact": None if session_values else "required diagnostic session",
+            "enforcement": "dcm_config_table" if session_values else "preflight",
+        }
+        security_requirements = {
+            "status": "available" if security_levels else "unknown",
+            "values": security_levels,
+            "missing_fact": None if security_levels else "required security level",
+            "enforcement": "dcm_config_table" if security_levels else "preflight",
+        }
         return {
             "status": "available" if contracts and not missing_facts else "partial",
             "target_function": func_name,
             "contracts": contracts,
             "missing_facts": missing_facts,
-            "session_requirements": {"status": "unknown", "values": [], "missing_fact": "required diagnostic session", "enforcement": "preflight"},
-            "security_requirements": {"status": "unknown", "values": [], "missing_fact": "required security level", "enforcement": "preflight"},
+            "session_requirements": session_requirements,
+            "security_requirements": security_requirements,
             "response_oracle": {
                 "positive_response": "service byte + 0x40",
                 "negative_response": "0x7F service byte nrc",

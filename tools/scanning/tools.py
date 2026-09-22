@@ -89,7 +89,16 @@ class AnalyzerTools:
         query = """
         MATCH (f:Function {name: $func_name})
         OPTIONAL MATCH (f)-[:HANDLES_UDS]->(uds:UdsService)
-        WITH f, collect(DISTINCT {did: uds.did, func_class_hex: uds.func_class_hex, source: coalesce(uds.source, 'heuristic')}) AS did_details
+        WITH f, collect(DISTINCT {
+            did: uds.did,
+            func_class_hex: uds.func_class_hex,
+            source: coalesce(uds.source, 'heuristic'),
+            required_seed_subfunctions: uds.required_seed_subfunctions,
+            required_key_subfunctions: uds.required_key_subfunctions,
+            required_session_subfunctions: uds.required_session_subfunctions,
+            dcm_security_bitmask: uds.dcm_security_bitmask,
+            dcm_requirements_source: uds.dcm_requirements_source
+        }) AS did_details
         RETURN f.storage_uri AS FilePath,
                f.byte_span AS ByteSpan,
                coalesce(f.tainted_by_uds, false) AS TaintedByUDS,

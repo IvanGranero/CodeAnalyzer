@@ -40,6 +40,7 @@ class NodeLabel(str, Enum):
     
     
     DCM_DID_TABLE_ENTRY = "DcmDidTableEntry"
+    DCM_SECURITY_REQUIREMENT = "DcmSecurityRequirement"
 
 class GraphNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -75,9 +76,21 @@ class IngestBatch(BaseModel):
         properties = result.get("properties")
         if isinstance(properties, dict):
             result["properties"] = {
-                key: json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-                if isinstance(value, dict)
-                else value
+                key: _neo4j_property_value(value)
                 for key, value in properties.items()
             }
         return result
+
+
+def _neo4j_property_value(value: Any) -> Any:
+    """Coerce a graph property into a Neo4j-acceptable primitive.
+
+    Neo4j node/relationship properties accept only primitives and primitive arrays,
+    so nested dicts and arrays-of-maps are retained as compact JSON strings. Plain
+    primitive arrays (e.g. list of strings/ints) pass through unchanged.
+    """
+    if isinstance(value, dict):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return value

@@ -1,9 +1,6 @@
-"""Source-file discovery for C/C++ ingestion."""
-
 from pathlib import Path
 
 SOURCE_SUFFIXES = frozenset({".c", ".cpp", ".h", ".hpp"})
-
 
 def discover_source_files(root: str | Path) -> list[Path]:
     root = Path(root).resolve()
@@ -14,7 +11,6 @@ def discover_source_files(root: str | Path) -> list[Path]:
         ),
         key=lambda path: path.relative_to(root).as_posix().casefold(),
     )
-
 
 def is_vendor_file(path: Path, vendor_folders: set[str], root: str | Path | None = None) -> bool:
     """Return whether a source file is below a configured vendor directory.

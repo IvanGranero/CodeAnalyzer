@@ -163,7 +163,7 @@ class ScanApplication:
                 discovery_config = json.load(stream)
         exploit_phase = ExploitPhase(
             self.context.llm,
-            cache_dir=self.report_dir,
+            cache_dir=self.cache_dir,
             event_sink=self.event_sink,
             graph_manager=self.context.graph,
             vendor_folders=discovery_config.get("vendor_folders", []),

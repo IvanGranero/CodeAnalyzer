@@ -27,11 +27,6 @@ class ARXMLParser:
             logger.error(f"Failed to parse ARXML file {filepath}: {e}")
 
     def _extract_os_configuration(self, root: ET.Element, uri: str):
-        """
-        AUTOSAR OS configurations are stored in ECUC-CONTAINER-VALUE blocks.
-        We look for specific DEFINITION-REFs that indicate Tasks, ISRs, and Resources.
-        """
-        
         for container in root.findall('.//ECUC-CONTAINER-VALUE'):
             def_ref_node = container.find('DEFINITION-REF')
             if def_ref_node is None or not def_ref_node.text:
@@ -44,7 +39,6 @@ class ARXMLParser:
                 
             short_name = short_name_node.text
 
-            
             if def_ref.endswith('/OsTask'):
                 priority = self._get_parameter_value(container, 'OsTaskPriority') or "0"
                 activation = self._get_parameter_value(container, 'OsTaskActivation') or "1"
@@ -55,7 +49,6 @@ class ARXMLParser:
                     properties={"priority": int(priority), "max_activations": int(activation)}
                 )
 
-            
             elif def_ref.endswith('/OsIsr'):
                 category = self._get_parameter_value(container, 'OsIsrCategory') or "2"
                 self.builder.add_os_entity(
@@ -65,7 +58,6 @@ class ARXMLParser:
                     properties={"isr_category": category}
                 )
 
-            
             elif def_ref.endswith('/OsResource'):
                 res_property = self._get_parameter_value(container, 'OsResourceProperty') or "STANDARD"
                 self.builder.add_os_entity(

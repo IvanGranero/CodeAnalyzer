@@ -125,15 +125,6 @@ class GraphPayloadBuilder:
         ))
 
     def add_dcm_did_table_entry(self, function_name: str, did_hex: str, func_class_hex: str = ""):
-        """
-        Records one (function, DID) pair scraped directly from a generated Dcm DID
-        dispatch table (e.g. Dcm_CfgDidMgrSignalOpClassInfo[] in Dcm_Lcfg.c/Dcm_PBcfg.c).
-        This is the module's own authoritative, generator-produced source of truth for
-        which function handles which DID -- independent of whatever naming convention
-        the callback function happens to use. graph/resolver.py's
-        _resolve_dcm_did_table_entries later resolves function_name to the real
-        Function node and creates the HANDLES_UDS edge from it.
-        """
         entry_id = self.generate_node_id(NodeLabel.DCM_DID_TABLE_ENTRY, f"{function_name}::{did_hex}")
         self._nodes[entry_id] = GraphNode(
             id=entry_id,
@@ -141,26 +132,48 @@ class GraphPayloadBuilder:
             properties={"function_name": function_name, "did_hex": did_hex, "func_class_hex": func_class_hex}
         )
 
+    def add_dcm_requirement(
+        self,
+        identifier_hex: str,
+        kind: str,
+        *,
+        session_bitmask: int = 0,
+        security_bitmask: int = 0,
+        sessions: list | None = None,
+        security_levels: list | None = None,
+        operations: int | None = None,
+    ):
+        identifier = str(identifier_hex).upper().replace("0X", "")
+        entry_id = self.generate_node_id(
+            NodeLabel.DCM_SECURITY_REQUIREMENT,
+            f"{kind}::{identifier}",
+        )
+        sessions = sessions or []
+        security_levels = security_levels or []
+        self._nodes[entry_id] = GraphNode(
+            id=entry_id,
+            labels=[NodeLabel.DCM_SECURITY_REQUIREMENT],
+            properties={
+                "identifier_hex": identifier,
+                "kind": kind,
+                "session_bitmask": int(session_bitmask or 0),
+                "security_bitmask": int(security_bitmask or 0),
+                # Neo4j-native primitive arrays (zero JSON decode needed downstream).
+                "required_session_subfunctions": [
+                    int(session.get("session_subfunction", 0)) for session in sessions if session.get("session_subfunction") is not None
+                ],
+                "required_seed_subfunctions": [
+                    int(level.get("seed_subfunction", 0)) for level in security_levels if level.get("seed_subfunction") is not None
+                ],
+                "required_key_subfunctions": [
+                    int(level.get("key_subfunction", 0)) for level in security_levels if level.get("key_subfunction") is not None
+                ],
+                **({"operations": int(operations)} if operations is not None else {}),
+            },
+        )
+        return entry_id
+
     def add_macro_alias(self, short_name: str, long_name: str):
-        """
-        Records a function-like preprocessor macro that is a pure pass-through alias
-        for another function (the extremely common Vector MICROSAR RTE pattern
-        `#define Rte_IrvRead_SHORT(...) Rte_IrvRead_LONG(...)` used for essentially all
-        Rte_Read_/Rte_Write_/Rte_Call_/Rte_IrvRead_/Rte_IrvWrite_ port accessors).
-
-        Call sites always use the SHORT name textually, but the actual Function node
-        (from the FUNC declaration/definition) is only ever registered under the LONG
-        name -- so without this, every such call resolves to a dead-end stub instead of
-        the real function, and the real function looks like it's never called at all.
-
-        Writes directly to the deterministic id "stub::<short_name>" -- the exact same
-        id graph/manager.py's fuzzy CALLS-edge resolution falls back to for an
-        unresolved call target. This makes the mapping order-independent: it doesn't
-        matter whether the macro's defining header or a caller's .c file is parsed
-        first, because Neo4j MERGE-by-id converges onto the same node either way.
-        graph/resolver.py's _resolve_macro_call_aliases then redirects any CALLS edge
-        landing on that stub onto the real target and removes the stub.
-        """
         alias_stub_id = f"stub::{short_name}"
         self._nodes[alias_stub_id] = GraphNode(
             id=alias_stub_id,
@@ -169,27 +182,6 @@ class GraphPayloadBuilder:
         )
 
     def mark_late_bound_accessor(self, short_name: str):
-        """
-        Records that `short_name` is a late-bound AUTOSAR RTE accessor macro (e.g.
-        Rte_Pim_*/Rte_CData_*) whose replacement body is a pointer/address-of
-        expression, not a call to another function -- confirmed against real Vector
-        MICROSAR headers:
-            #define Rte_Pim_..._17() (&((*RtePim_..._17())[0]))
-            #define Rte_CData_RomData_VIN() (&(Rte_..._RomData_VIN[0]))
-        Call sites using this name are NOT unresolved/missing calls; they are
-        placeholders that bind to real memory/config at build time (the source tree
-        is parsed as-is, never built) and must never be reported as dead ends.
-
-        Written to the same deterministic "stub::<name>" id that an unresolved CALLS
-        edge falls back to (see graph/manager.py's fuzzy-edge ingestion) via a plain
-        property SET -- so this is order-independent exactly like add_macro_alias:
-        it doesn't matter whether the accessor's defining header or a caller's .c
-        file is parsed/flushed first. If the fuzzy-CALLS ingestion's MERGE happens to
-        run first and creates the node as a :Stub, this property is still applied on
-        top of it; consumers should check `is_late_bound_accessor`, not the absence
-        of the :Stub label, to tell late-bound accessors apart from genuinely
-        unresolved targets.
-        """
         stub_id = f"stub::{short_name}"
         self._nodes[stub_id] = GraphNode(
             id=stub_id,

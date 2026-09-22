@@ -1,11 +1,15 @@
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
+
+from app.errors import is_retryable
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -220,6 +224,37 @@ class LLMClient:
             return str(message)
         return cls._text_content(message.content)
 
+    async def _ainvoke_with_retries(
+        self,
+        runnable: Any,
+        inputs: Any,
+        config: Mapping[str, Any] | None = None,
+        *,
+        attempts: int = 3,
+        base_delay: float = 1.0,
+    ) -> Any:
+        config = dict(config or {})
+        delay = base_delay
+        for attempt in range(1, attempts + 1):
+            try:
+                return await runnable.ainvoke(inputs, config=config)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt >= attempts or not is_retryable(exc):
+                    raise
+                jittered = delay * (1 + random.random())
+                logger.warning(
+                    "Transient provider error on attempt %d/%d (%s); retrying in %.1fs: %s",
+                    attempt,
+                    attempts,
+                    type(exc).__name__,
+                    jittered,
+                    exc,
+                )
+                await asyncio.sleep(jittered)
+                delay *= 2
+
     async def generate_chat(
         self,
         system_prompt: str,
@@ -247,7 +282,8 @@ class LLMClient:
         if tools and tool_handler:
             lc_tools = self._tools(tools, tool_handler)
             if settings.get("single_tool_call"):
-                response = await model.bind_tools(lc_tools).ainvoke(
+                response = await self._ainvoke_with_retries(
+                    model.bind_tools(lc_tools),
                     messages,
                     config={"callbacks": [usage_capture]},
                 )
@@ -298,8 +334,11 @@ class LLMClient:
                     if getattr(message, "type", None) == "tool"
                 ]
         else:
-            runnable = model.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
-            response = await runnable.ainvoke(messages, config={"callbacks": [usage_capture]})
+            response = await self._ainvoke_with_retries(
+                model,
+                messages,
+                config={"callbacks": [usage_capture]},
+            )
             response_message = response
             text = self._assistant_text(response)
             usage_capture.usage = _usage_dict(response) or usage_capture.usage
@@ -346,7 +385,8 @@ class LLMClient:
         calls_used = 0
 
         while True:
-            response = await runnable.ainvoke(
+            response = await self._ainvoke_with_retries(
+                runnable,
                 conversation,
                 config={"callbacks": [usage_capture]},
             )
@@ -400,7 +440,8 @@ class LLMClient:
                 "Do not call tools. Return the complete final JSON decision now using the evidence already supplied."
             )
         )
-        response = await model.ainvoke(
+        response = await self._ainvoke_with_retries(
+            model,
             [*conversation, final_prompt],
             config={"callbacks": [usage_capture]},
         )

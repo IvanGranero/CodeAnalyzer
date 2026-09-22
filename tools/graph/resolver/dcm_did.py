@@ -58,3 +58,41 @@ class DcmDidMixin:
         except Exception as e:
             logger.error(f"Failed to resolve Dcm DID dispatch table entries: {e}")
             raise
+
+    def _resolve_dcm_security_requirements(self):
+        """Merge decoded Dcm security/session requirements onto UdsService nodes.
+
+        The ingestion parser stores the resolved requirements as :DcmSecurityRequirement
+        nodes keyed by (kind, identifier_hex). This pass attaches those facts to the
+        matching :UdsService (matched by did/rid) so graph serialization can surface
+        concrete session_requirements / security_requirements instead of 'unknown'.
+        """
+        logger.info("Resolving Dcm security/session requirements...")
+        query = """
+        MATCH (req:DcmSecurityRequirement)
+        OPTIONAL MATCH (u:UdsService)
+        WHERE (
+            (req.kind = "rid" AND (u.rid = req.identifier_hex OR u.did = req.identifier_hex))
+            OR (req.kind = "did" AND u.did = req.identifier_hex)
+        )
+        WITH req, u
+        WHERE u IS NOT NULL
+        SET u.required_session_subfunctions = req.required_session_subfunctions,
+            u.required_seed_subfunctions = req.required_seed_subfunctions,
+            u.required_key_subfunctions = req.required_key_subfunctions,
+            u.dcm_session_bitmask = req.session_bitmask,
+            u.dcm_security_bitmask = req.security_bitmask,
+            u.dcm_requirements_source = "dcm_config_table",
+            u.rid = CASE WHEN req.kind = "rid" AND u.rid IS NULL THEN req.identifier_hex ELSE u.rid END
+        RETURN count(DISTINCT u) AS linked
+        """
+        try:
+            with self.db.driver.session() as session:
+                result = session.run(query).single()
+                count = result["linked"] if result else 0
+                logger.info(
+                    f"Attached Dcm security/session requirements to {count} UdsService nodes."
+                )
+        except Exception as e:
+            logger.error(f"Failed to resolve Dcm security requirements: {e}")
+            raise

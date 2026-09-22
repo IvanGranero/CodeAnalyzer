@@ -7,10 +7,6 @@ from tools.graph.models import GraphEdge, EdgeType, NodeLabel, GraphNode
 logger = logging.getLogger(__name__)
 
 class RteJsonParser:
-    """
-    Parses Vector / DaVinci RTE Analyzer configurations (e.g., RteAnalyzerConfiguration.json).
-    Extracts ground-truth Runnable-to-Task mappings, Exclusive Areas, and Sender-Receiver data flows.
-    """
     def __init__(self, builder: GraphPayloadBuilder):
         self.builder = builder
 
@@ -38,8 +34,6 @@ class RteJsonParser:
             )
 
     def _extract_tasks_and_runnables(self, data: Dict[str, Any], uri: str) -> None:
-        """Maps Runnable entities to their hosting OsTasks with exact execution order/timing."""
-        
         tasks = (
             data.get("Tasks")
             or data.get("tasks")
@@ -75,14 +69,12 @@ class RteJsonParser:
                 }
             )
 
-            
             runnables = task.get("MappedRunnables") or task.get("Runnables") or task.get("runnables") or []
             for r in runnables:
                 r_symbol = r.get("Symbol") or r.get("symbol") or r.get("Name") or r.get("name")
                 if not r_symbol:
                     continue
 
-                
                 self.builder._edges.append(GraphEdge(
                     source_id=f"stub::{r_symbol}",
                     target_name=task_name,
@@ -93,8 +85,6 @@ class RteJsonParser:
                     }
                 ))
 
-            
-            
             if not runnables and task.get("TaskName"):
                 self.builder._edges.append(GraphEdge(
                     source_id=f"stub::{task_name}",
@@ -103,7 +93,6 @@ class RteJsonParser:
                     properties={"binding_source": "rte_task_list"},
                 ))
 
-        
         runnable_list = data.get("Runnables") or data.get("runnables") or []
         for r in runnable_list:
             symbol = r.get("Symbol") or r.get("symbol") or r.get("Name")
@@ -138,7 +127,6 @@ class RteJsonParser:
                 }
             )
 
-            
             accessing_runnables = ea.get("AccessingRunnables") or ea.get("Runnables") or []
             for r in accessing_runnables:
                 r_symbol = r if isinstance(r, str) else (r.get("Symbol") or r.get("name"))
