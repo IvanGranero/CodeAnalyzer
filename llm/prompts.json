@@ -4,7 +4,7 @@
     "description": "Infers architecture and returns deterministic search criteria for AutoSAR/Build configuration files.",
     "model_settings": {
       "reasoning_effort": null,
-      "max_completion_tokens": 4096,
+      "max_completion_tokens": 8192,
       "response_format": "json_object"
     },
     "system": [
