@@ -67,6 +67,8 @@ class DiscoveryPhase:
                 f"Tiered discovery: Tier 1 scanning files ({count}) {path}"
             ),
         )
+        directory_inventory = RepoDiscoverer.build_directory_inventory(manifest)
+        tier1_artifacts["directory_inventory"] = directory_inventory
         self._write_progress(
             "Tiered discovery: Tier 1 LLM analysis "
             f"({len(tier1_artifacts['top_paths_sample'])} paths, "
@@ -94,9 +96,13 @@ class DiscoveryPhase:
             "discovery_focused",
             {
                 "artifacts": json.dumps(tier2_artifacts, sort_keys=True),
+                "directory_inventory": json.dumps(directory_inventory, sort_keys=True),
                 "previous_guesses": json.dumps(coarse, sort_keys=True),
             },
             "discovery-focused",
+        )
+        vendor_folder_candidates = self._list_values(
+            focused.get("vendor_folders"), coarse.get("vendor_folders")
         )
         application_folders = self._list_values(focused.get("app_folders"))
         if not application_folders:
@@ -104,22 +110,57 @@ class DiscoveryPhase:
         if not application_folders:
             application_folders = focused_folders
         inferred_roots = self._discover_application_roots(
-            target_directory, manifest, coarse.get("vendor_folders", [])
+            target_directory, manifest, vendor_folder_candidates
         )
-        coarse_roots = self._list_values(coarse.get("app_folders")) or inferred_roots
+        model_roots = self._list_values(
+            focused.get("application_roots"), focused.get("application_root_guesses"),
+            coarse.get("application_roots"), coarse.get("application_root_guesses"),
+        )
+        if not model_roots:
+            model_roots = self._list_values(coarse.get("app_folders"))
+        conventional_roots = [
+            root for root in inferred_roots
+            if root.casefold() in {"app", "application", "src", "source", "swc", "swcs"}
+        ]
+        root_guesses = self._merge_folder_values(
+            model_roots,
+            conventional_roots if model_roots else inferred_roots,
+        )
+        coarse_roots = self._filter_application_roots(
+            root_guesses, vendor_folder_candidates, target_directory
+        )
         application_folders = self._merge_folder_values(
             application_folders,
             coarse_roots if not self._has_conventional_application_root(coarse_roots) else self._discover_application_folders(
                 target_directory,
                 coarse_roots,
-                coarse.get("vendor_folders", []),
+                vendor_folder_candidates,
             ),
         )
         application_folders = self._filter_application_folders(
             application_folders,
-            self._list_values(coarse.get("vendor_folders")),
+            vendor_folder_candidates,
             target_directory,
             coarse_roots,
+        )
+        domain_roots = coarse_roots
+        if self._has_conventional_application_root(domain_roots):
+            structural_domains = self._discover_application_domains(
+                target_directory,
+                domain_roots,
+                vendor_folder_candidates,
+            )
+        else:
+            structural_domains = self._merge_folder_values(
+                [folder.replace("\\", "/").split("/", 1)[0] for folder in domain_roots]
+            )
+        model_domains = self._list_values(
+            focused.get("application_domains"), focused.get("app_domain_guesses"), focused.get("app_domains"),
+            coarse.get("application_domains"), coarse.get("app_domain_guesses"), coarse.get("app_domains"),
+        )
+        application_domain_candidates = self._merge_folder_values(
+            structural_domains,
+            self._validate_application_domains(model_domains, target_directory, domain_roots, vendor_folder_candidates),
         )
         self._write_progress(
             "Tiered discovery: Tier 3 scanning application folders "
@@ -140,7 +181,14 @@ class DiscoveryPhase:
             "discovery_confirm",
             {
                 "artifacts": json.dumps(tier3_artifacts, sort_keys=True),
-                "previous_guesses": json.dumps({**coarse, **focused}, sort_keys=True),
+                "previous_guesses": json.dumps(
+                    {
+                        **coarse,
+                        **focused,
+                        "application_domain_candidates": application_domain_candidates,
+                    },
+                    sort_keys=True,
+                ),
             },
             "discovery-confirm",
         )
@@ -186,17 +234,26 @@ class DiscoveryPhase:
             config_json.get("skip_folders"), config_json.get("vendor_folders"), config_json.get("vendors"),
         )
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
-        config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
         inferred_roots = self._discover_application_roots(
             target_directory, manifest, config_json["vendor_folders"]
         )
-        config_json["application_roots"] = self._list_values(
-            config_json.get("application_folders"), config_json.get("application_roots"),
+        model_roots = self._list_values(
+            config_json.get("application_roots"), config_json.get("application_root_guesses"),
         )
-        config_json["application_roots"] = self._merge_folder_values(
-            config_json["application_roots"], inferred_roots
+        if not model_roots:
+            model_roots = self._list_values(config_json.get("application_folders"))
+        conventional_roots = [
+            root for root in inferred_roots
+            if root.casefold() in {"app", "application", "src", "source", "swc", "swcs"}
+        ]
+        root_guesses = self._merge_folder_values(
+            model_roots,
+            conventional_roots if model_roots else inferred_roots,
         )
-        config_json.setdefault("application_root_guesses", config_json.get("application_roots", []))
+        config_json["application_roots"] = self._filter_application_roots(
+            root_guesses, config_json["vendor_folders"], target_directory
+        )
+        config_json["application_root_guesses"] = config_json["application_roots"]
         config_json["app_folders"] = self._filter_application_folders(
             config_json.get("app_folders"), config_json.get("vendor_folders", []), target_directory,
             config_json.get("application_roots", ["app"]),
@@ -211,8 +268,24 @@ class DiscoveryPhase:
             config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory,
             config_json.get("application_roots", ["app"]),
         )
-        config_json["app_domain_guesses"] = self._derive_app_domains(config_json)
+        model_domains = self._list_values(
+            config_json.get("application_domains"),
+            config_json.get("app_domain_guesses"),
+            config_json.get("app_domains"),
+        )
+        derived_domains = self._derive_app_domains(
+            {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+        )
         domain_roots = config_json.get("application_roots", [])
+        config_json["app_domain_guesses"] = self._merge_folder_values(
+            self._validate_application_domains(
+                model_domains,
+                target_directory,
+                domain_roots,
+                config_json["vendor_folders"],
+            ),
+            derived_domains,
+        )
         if not self._has_conventional_application_root(domain_roots):
             config_json["app_domain_guesses"] = self._merge_folder_values(
                 config_json["app_domain_guesses"], domain_roots
@@ -382,9 +455,40 @@ class DiscoveryPhase:
                 roots.append(path)
         return sorted(set(roots), key=str.casefold)
 
+    @classmethod
+    def _filter_application_roots(cls, roots, vendor_folders, target_directory: str) -> list[str]:
+        """Keep only real in-repository roots outside known vendor/generated paths."""
+        repository_root = os.path.realpath(target_directory)
+        vendors = {item.casefold() for item in cls._list_values(vendor_folders)}
+        vendors.update({"vendor", "third_party", "third-party", "mcal", "bsw", "microsar", "rta-os", "cdd"})
+        resolved = []
+        seen = set()
+        for root in cls._list_values(roots):
+            normalized = root.replace("\\", "/")
+            parts = normalized.split("/")
+            if not normalized or any(part.startswith((".", "_")) for part in parts):
+                continue
+            if any(part.casefold() in vendors for part in parts):
+                continue
+            candidate = os.path.realpath(os.path.join(repository_root, normalized.replace("/", os.sep)))
+            try:
+                inside_repository = os.path.commonpath((repository_root, candidate)) == repository_root
+            except ValueError:
+                inside_repository = False
+            key = normalized.casefold()
+            if (
+                inside_repository
+                and candidate != repository_root
+                and os.path.isdir(candidate)
+                and key not in seen
+            ):
+                resolved.append(normalized)
+                seen.add(key)
+        return resolved
+
     @staticmethod
     def _has_conventional_application_root(roots) -> bool:
-        return bool({item.casefold() for item in DiscoveryPhase._list_values(roots)} & {
+        return bool({item.replace("\\", "/").rstrip("/").split("/")[-1].casefold() for item in DiscoveryPhase._list_values(roots)} & {
             "app", "application", "src", "source", "swc", "swcs"
         })
 
@@ -426,6 +530,27 @@ class DiscoveryPhase:
             if len(parts) >= 2 and parts[-1].casefold() not in {item.casefold() for item in domains}:
                 domains.append(parts[-1])
         return domains
+
+    @classmethod
+    def _validate_application_domains(
+        cls, candidates, target_directory: str, roots, vendor_folders
+    ) -> list[str]:
+        """Accept LLM domain names only when they match real scoped directories."""
+        roots = cls._filter_application_roots(roots, vendor_folders, target_directory)
+        if cls._has_conventional_application_root(roots):
+            actual_domains = cls._discover_application_domains(
+                target_directory, roots, vendor_folders
+            )
+        else:
+            actual_domains = [root.replace("\\", "/").rstrip("/").split("/")[-1] for root in roots]
+        actual_by_name = {domain.casefold(): domain for domain in actual_domains}
+        validated = []
+        for candidate in cls._list_values(candidates):
+            name = candidate.replace("\\", "/").rstrip("/").split("/")[-1]
+            match = actual_by_name.get(name.casefold())
+            if match is not None:
+                validated.append(match)
+        return cls._merge_folder_values(validated)
 
     @classmethod
     def _filter_application_folders(
@@ -561,18 +686,25 @@ class DiscoveryPhase:
             if not (folder.lower() in seen or seen.add(folder.lower()))
         ]
         config_json["likely_vendor_folders"] = config_json["vendor_folders"]
-        app_roots = config_json.get("application_root_guesses", config_json.get("application_roots", []))
-        model_app_roots = config_json.get("application_root_candidates", app_roots)
-        app_roots = DiscoveryPhase._list_values(model_app_roots)
+        app_roots = DiscoveryPhase._list_values(
+            config_json.get("application_roots"),
+            config_json.get("application_root_guesses"),
+            config_json.get("application_root_candidates"),
+        )
+        inferred_roots = DiscoveryPhase._discover_application_roots(
+            target_directory, manifest, vendor_folders
+        )
+        conventional_roots = [
+            root for root in inferred_roots
+            if root.casefold() in {"app", "application", "src", "source", "swc", "swcs"}
+        ]
         app_roots = DiscoveryPhase._merge_folder_values(
             app_roots,
-            DiscoveryPhase._discover_application_roots(target_directory, manifest, vendor_folders),
+            conventional_roots if app_roots else inferred_roots,
         )
-        config_json["application_roots"] = [
-            folder for folder in app_roots
-            if folder.lower() in target_names
-            and folder.lower() not in {vendor.lower() for vendor in config_json["vendor_folders"]}
-        ]
+        config_json["application_roots"] = DiscoveryPhase._filter_application_roots(
+            app_roots, config_json["vendor_folders"], target_directory
+        )
         if not config_json["application_roots"] and "app" in target_names:
             config_json["application_roots"] = ["app"]
         config_json["application_root_guesses"] = config_json["application_roots"]
@@ -591,11 +723,27 @@ class DiscoveryPhase:
             config_json["application_roots"],
         )
         config_json["modules"] = DiscoveryPhase._filter_module_names(config_json.get("modules", []))
-        if DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]):
-            config_json["app_domain_guesses"] = DiscoveryPhase._derive_app_domains(config_json)
-        else:
-            config_json["app_domain_guesses"] = DiscoveryPhase._list_values(
-                config_json["application_roots"]
+        model_domains = DiscoveryPhase._list_values(
+            config_json.get("application_domains"),
+            config_json.get("app_domain_guesses"),
+            config_json.get("app_domains"),
+        )
+        derived_domains = DiscoveryPhase._derive_app_domains(
+            {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+        )
+        config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
+            DiscoveryPhase._validate_application_domains(
+                model_domains,
+                target_directory,
+                config_json["application_roots"],
+                config_json["vendor_folders"],
+            ),
+            derived_domains,
+        )
+        if not DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]):
+            config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
+                config_json["app_domain_guesses"],
+                [root.replace("\\", "/").rstrip("/").split("/")[-1] for root in config_json["application_roots"]],
             )
         config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
             config_json["app_domain_guesses"],

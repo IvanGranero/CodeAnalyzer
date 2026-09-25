@@ -137,6 +137,63 @@ class RepoDiscoverer:
             "directories": directories,
         }
 
+    @staticmethod
+    def build_directory_inventory(
+        manifest: dict, top_level_limit: int = 200, child_limit: int = 300
+    ) -> dict:
+        """Summarize folder names and contents without sending the full manifest to the LLM."""
+        directories = manifest.get("directories", []) if isinstance(manifest, dict) else []
+        top_level = [
+            directory for directory in directories
+            if isinstance(directory, dict) and directory.get("depth") == 1
+        ]
+        children = [
+            directory for directory in directories
+            if isinstance(directory, dict) and directory.get("depth") == 2
+        ]
+
+        def rank(directory: dict) -> tuple[int, int, str]:
+            return (
+                -int(directory.get("source_file_count", 0) or 0),
+                -int(directory.get("file_count", 0) or 0),
+                str(directory.get("path", "")).casefold(),
+            )
+
+        def compact(directory: dict) -> dict:
+            extensions = directory.get("extensions", {})
+            if isinstance(extensions, dict):
+                extensions = [
+                    extension
+                    for extension, _ in sorted(
+                        extensions.items(), key=lambda item: (-item[1], item[0])
+                    )[:4]
+                ]
+            else:
+                extensions = []
+            sample_files = directory.get("sample_files", [])
+            return {
+                "path": directory.get("path", ""),
+                "file_count": int(directory.get("file_count", 0) or 0),
+                "source_file_count": int(directory.get("source_file_count", 0) or 0),
+                "extensions": extensions,
+                "sample_files": [Path(path).name for path in sample_files[:3]],
+                "generator_markers": directory.get("generator_markers", [])[:3],
+            }
+
+        selected_roots = sorted(top_level, key=rank)[:top_level_limit]
+        selected_roots.sort(key=lambda item: str(item.get("path", "")).casefold())
+        selected_children = sorted(children, key=rank)[:child_limit]
+        selected_children.sort(key=lambda item: str(item.get("path", "")).casefold())
+        return {
+            "root": manifest.get("root", "") if isinstance(manifest, dict) else "",
+            "top_level_count": len(top_level),
+            "top_level_omitted": max(0, len(top_level) - len(selected_roots)),
+            "top_level_directories": [compact(directory) for directory in selected_roots],
+            "second_level_count": len(children),
+            "second_level_omitted": max(0, len(children) - len(selected_children)),
+            "second_level_directories": [compact(directory) for directory in selected_children],
+        }
+
     @classmethod
     def build_tier1_artifacts(cls, target_dir: str, progress_callback=None) -> dict:
         """Return small, high-signal metadata for the coarse discovery loop."""
