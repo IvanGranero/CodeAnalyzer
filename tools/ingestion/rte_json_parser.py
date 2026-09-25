@@ -21,11 +21,24 @@ class RteJsonParser:
             return
 
         uri = f"file://{filepath}"
+        if not isinstance(data, dict):
+            self.last_result = {"status": "unsupported_json_shape", "flow_count": 0}
+            logger.warning(
+                "Skipping RTE JSON config %s: expected an object root, found %s",
+                filepath,
+                type(data).__name__,
+            )
+            return
         logger.info(f"Extracting RTE Ground Truth from {filepath}...")
 
-        self._extract_tasks_and_runnables(data, uri)
-        self._extract_exclusive_areas(data, uri)
-        flow_count = self._extract_sender_receiver_flows(data, uri)
+        try:
+            self._extract_tasks_and_runnables(data, uri)
+            self._extract_exclusive_areas(data, uri)
+            flow_count = self._extract_sender_receiver_flows(data, uri)
+        except (AttributeError, TypeError, ValueError) as exc:
+            self.last_result = {"status": "schema_mismatch", "flow_count": 0}
+            logger.warning("Skipping unsupported RTE JSON schema %s: %s", filepath, exc)
+            return
         self.last_result = {
             "status": "parsed_with_flows" if flow_count else "parsed_empty_flows",
             "flow_count": flow_count,

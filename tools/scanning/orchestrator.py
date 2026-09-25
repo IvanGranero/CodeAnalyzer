@@ -1,7 +1,7 @@
 import json
 import logging
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from tools.scanning.tools import AnalyzerTools
@@ -27,12 +27,13 @@ class ScanContext:
     source_code: str
     graph_json: str
     graph_summary: str
+    discovery_context: dict[str, Any] = field(default_factory=dict)
 
 
 class ScanOrchestrator:
     _MAX_TRIAGE_ATTEMPTS = 3
 
-    def __init__(self, llm, graph_manager: GraphManager, platform_info: str = "Unknown Platform", vendor_folders: list[str] | None = None, application_roots: list[str] | None = None, trace_repository=None):
+    def __init__(self, llm, graph_manager: GraphManager, platform_info: str = "Unknown Platform", vendor_folders: list[str] | None = None, application_roots: list[str] | None = None, trace_repository=None, discovery_context: dict[str, Any] | None = None):
         self.graph_resolver = graph_manager.resolver
         self.tools_engine = AnalyzerTools(graph_manager)
         self.tool_registry = ReadOnlyToolRegistry(self.tools_engine)
@@ -41,6 +42,7 @@ class ScanOrchestrator:
         self.vendor_folders = [str(folder).strip().strip('/\\').lower() for folder in (vendor_folders or []) if str(folder).strip()]
         self.application_roots = [str(folder).strip().strip('/\\').lower() for folder in (application_roots or []) if str(folder).strip()]
         self.trace_repository = trace_repository
+        self.discovery_context = discovery_context or {}
         self.candidate_scheduler = CandidateScheduler()
         self.triage_agent = TriageAgent(self.runtime, self._extract_json_object)
         self.deep_scan_agent = DeepScanAgent(self.runtime, self._extract_json_object)
@@ -80,7 +82,7 @@ class ScanOrchestrator:
                 logger.warning("Ignoring malformed triage candidate: %r", value)
         return candidates
 
-    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> dict[str, Any]:
+    async def _triage_target(self, graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "", discovery_context: dict[str, Any] | None = None) -> dict[str, Any]:
         return await run_triage(
             self.triage_agent,
             graph_json,
@@ -90,13 +92,14 @@ class ScanOrchestrator:
             follow_up_context,
             target_func,
             self._MAX_TRIAGE_ATTEMPTS,
+            discovery_context=discovery_context,
         )
 
     _SEVERITY_RANK = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
     def _reconcile_single_finding(self, finding: dict[str, Any], graph_json: str) -> dict[str, Any]:
         return reconcile_finding(finding, graph_json)
 
-    async def _deep_scan_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "") -> dict[str, Any]:
+    async def _deep_scan_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str = "", target_func: str = "", discovery_context: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Single-tasked deep scan: proves/disproves exactly ONE Triage-decomposed
         candidate per call (prompt decomposition), at a reasoning_effort/token budget
@@ -115,6 +118,7 @@ class ScanOrchestrator:
                 follow_up_context,
                 target_func,
                 max_attempts=2,
+                discovery_context=discovery_context,
             )
             finding = self._reconcile_single_finding(finding, graph_json)
             self._trace(target_func or candidate.get("function_name", "unknown"), f"deep-scan-{candidate.get('vulnerability_class', 'unknown')}", {"candidate": candidate, "finding": finding})
@@ -133,10 +137,11 @@ class ScanOrchestrator:
             self._trace(target_func or candidate.get("function_name", "unknown"), f"deep-scan-{candidate.get('vulnerability_class', 'unknown')}-error", {"candidate": candidate, "finding": finding})
             return finding
 
-    async def _run_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str, target_func: str) -> dict[str, Any]:
+    async def _run_candidate(self, candidate: dict[str, Any], graph_json: str, graph_summary: str, source_code: str, directive: str, follow_up_context: str, target_func: str, discovery_context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Run one focused deep scan using evidence collected by triage."""
         return await self._deep_scan_candidate(
-            candidate, graph_json, graph_summary, source_code, directive, follow_up_context, target_func
+            candidate, graph_json, graph_summary, source_code, directive, follow_up_context, target_func,
+            discovery_context,
         )
 
     def _get_target_source(self, func_name: str) -> str:
@@ -217,6 +222,7 @@ class ScanOrchestrator:
             source_code=source_code,
             graph_json=graph_json,
             graph_summary=graph_summary,
+            discovery_context=self.discovery_context,
         )
 
     async def _run_triage_phase(
@@ -236,6 +242,7 @@ class ScanOrchestrator:
             context.source_code,
             directive,
             target_func=target,
+            discovery_context=context.discovery_context,
         )
         self._trace(target, "triage", triage)
         if triage.get("decision") != "escalate":
@@ -281,6 +288,7 @@ class ScanOrchestrator:
                 directive,
                 "",
                 context.target_function_name,
+                context.discovery_context,
             )
             for candidate in candidates
         ]
@@ -372,6 +380,7 @@ class ScanOrchestrator:
             graph_summary=context.graph_summary,
             candidates=candidates,
             graph_json=context.graph_json,
+            discovery_context=context.discovery_context,
         )
         return report
 
@@ -462,6 +471,7 @@ class ScanOrchestrator:
         graph_summary: str = "",
         candidates: list[dict[str, Any]] | None = None,
         graph_json: str = "",
+        discovery_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the durable handoff used by later exploit-only runs."""
         candidates = candidates or []
@@ -507,6 +517,7 @@ class ScanOrchestrator:
             "concurrency": graph_payload.get("concurrency", {}),
             "deep_scan_findings": findings,
             "protocol_contract": graph_payload.get("protocol_contract", {}),
+            "discovery_context": discovery_context or {},
             "graph_flags": {
                 key: (graph_payload.get("function") or {}).get(key)
                 for key in (

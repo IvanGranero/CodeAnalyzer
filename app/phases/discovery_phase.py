@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 class DiscoveryPhase:
     """Phase 1: infer platform architecture and locate config files from the directory tree."""
 
+    CACHE_SCHEMA_VERSION = 1
+    CACHE_FIELDS = (
+        "mcu_guess", "silicon_vendor", "autosar_stack_vendor", "autosar_stack_product",
+        "ecu_role", "device_guess", "stack_vendor", "stack_vendor_guess",
+        "modules", "config_structures", "diagnostics", "hsm", "comms", "swc", "rte",
+        "vendor_folders", "likely_vendor_folders", "application_roots",
+        "application_root_guesses", "app_domains", "app_domain_guesses",
+        "confidence", "confidence_scores",
+    )
+
     def __init__(self, llm_service: LLMService, cache_dir: str):
         self.llm = llm_service
         self.cache_file = os.path.join(cache_dir, "discovery_config.json")
@@ -21,18 +31,42 @@ class DiscoveryPhase:
     def used_cache(self, skip_ingest: bool) -> bool:
         return skip_ingest and os.path.exists(self.cache_file)
 
+    @classmethod
+    def _cache_payload(cls, config_json: dict) -> dict:
+        """Keep only fields needed to scope scans and seed downstream agents."""
+        payload = {
+            key: config_json[key]
+            for key in cls.CACHE_FIELDS
+            if key in config_json
+        }
+        manifest = config_json.get("repository_manifest")
+        payload["repository_name"] = manifest.get("root", "") if isinstance(manifest, dict) else config_json.get("repository_name", "")
+        payload["configuration_file_count"] = len(config_json.get("config_files") or [])
+        payload["application_folder_count"] = len(config_json.get("app_folders") or [])
+        payload["cache_schema_version"] = cls.CACHE_SCHEMA_VERSION
+        return payload
+
     async def run(self, target_directory: str, skip_ingest: bool) -> dict:
         if self.used_cache(skip_ingest):
             logger.info("--- PHASE 1: Skipped (using cached discovery config) ---")
-            with open(self.cache_file, 'r') as f:
+            with open(self.cache_file, 'r', encoding="utf-8") as f:
                 config_json = json.load(f)
-            return self._normalize_scope(config_json, target_directory)
+            config_json = self._normalize_scope(config_json, target_directory)
+            if config_json.get("cache_schema_version") != self.CACHE_SCHEMA_VERSION:
+                with open(self.cache_file, "w", encoding="utf-8") as f:
+                    json.dump(self._cache_payload(config_json), f)
+            return config_json
 
         logger.info("--- PHASE 1: Starting tiered architectural discovery ---")
         self._write_progress("Tiered discovery: building repository manifest")
         manifest = RepoDiscoverer.build_repo_manifest(target_directory)
         self._write_progress("Tiered discovery: Tier 1 scanning files")
-        tier1_artifacts = RepoDiscoverer.build_tier1_artifacts(target_directory)
+        tier1_artifacts = RepoDiscoverer.build_tier1_artifacts(
+            target_directory,
+            progress_callback=lambda count, path: self._write_progress(
+                f"Tiered discovery: Tier 1 scanning files ({count}) {path}"
+            ),
+        )
         self._write_progress(
             "Tiered discovery: Tier 1 LLM analysis "
             f"({len(tier1_artifacts['top_paths_sample'])} paths, "
@@ -69,17 +103,35 @@ class DiscoveryPhase:
             application_folders = self._list_values(focused.get("application_folders"))
         if not application_folders:
             application_folders = focused_folders
+        inferred_roots = self._discover_application_roots(
+            target_directory, manifest, coarse.get("vendor_folders", [])
+        )
+        coarse_roots = self._list_values(coarse.get("app_folders")) or inferred_roots
+        application_folders = self._merge_folder_values(
+            application_folders,
+            coarse_roots if not self._has_conventional_application_root(coarse_roots) else self._discover_application_folders(
+                target_directory,
+                coarse_roots,
+                coarse.get("vendor_folders", []),
+            ),
+        )
         application_folders = self._filter_application_folders(
             application_folders,
             self._list_values(coarse.get("vendor_folders")),
             target_directory,
-            self._list_values(coarse.get("app_folders")) or ["app"],
+            coarse_roots,
         )
         self._write_progress(
             "Tiered discovery: Tier 3 scanning application folders "
             f"({len(application_folders)} folders)"
         )
-        tier3_artifacts = RepoDiscoverer.build_tier3_artifacts(target_directory, application_folders)
+        tier3_artifacts = RepoDiscoverer.build_tier3_artifacts(
+            target_directory,
+            application_folders,
+            progress_callback=lambda folder: self._write_progress(
+                f"Tiered discovery: Tier 3 scanning application folder {folder}"
+            ),
+        )
         self._write_progress(
             "Tiered discovery: Tier 3 LLM confirmation "
             f"({len(tier3_artifacts['hits'])} hits, {len(tier3_artifacts['snippets'])} snippets)"
@@ -135,19 +187,42 @@ class DiscoveryPhase:
         )
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
         config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
+        inferred_roots = self._discover_application_roots(
+            target_directory, manifest, config_json["vendor_folders"]
+        )
         config_json["application_roots"] = self._list_values(
             config_json.get("application_folders"), config_json.get("application_roots"),
+        )
+        config_json["application_roots"] = self._merge_folder_values(
+            config_json["application_roots"], inferred_roots
         )
         config_json.setdefault("application_root_guesses", config_json.get("application_roots", []))
         config_json["app_folders"] = self._filter_application_folders(
             config_json.get("app_folders"), config_json.get("vendor_folders", []), target_directory,
             config_json.get("application_roots", ["app"]),
         )
+        config_json["app_folders"] = self._merge_folder_values(
+            config_json["app_folders"],
+            self._discover_application_folders(
+                target_directory, config_json.get("application_roots", ["app"]), config_json["vendor_folders"]
+            ),
+        )
         config_json["application_folders"] = self._filter_application_folders(
             config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory,
             config_json.get("application_roots", ["app"]),
         )
         config_json["app_domain_guesses"] = self._derive_app_domains(config_json)
+        domain_roots = config_json.get("application_roots", [])
+        if not self._has_conventional_application_root(domain_roots):
+            config_json["app_domain_guesses"] = self._merge_folder_values(
+                config_json["app_domain_guesses"], domain_roots
+            )
+        config_json["app_domain_guesses"] = self._merge_folder_values(
+            config_json["app_domain_guesses"],
+            self._discover_application_domains(target_directory, config_json["application_roots"], config_json["vendor_folders"])
+            if self._has_conventional_application_root(config_json["application_roots"])
+            else [],
+        )
         config_candidates = config_json.get("configs")
         config_extensions = config_candidates.get("extensions", []) if isinstance(config_candidates, dict) else config_candidates
         config_json["config_file_extensions"] = self._merge_discovery_rules(
@@ -179,22 +254,31 @@ class DiscoveryPhase:
         config_json["app_domains"] = config_json["app_domain_guesses"]
         config_json["stack_vendor"] = config_json["stack_vendor_guess"]
 
-        with open(self.cache_file, 'w') as f:
-            json.dump(config_json, f)
+        with open(self.cache_file, "w", encoding="utf-8") as f:
+            json.dump(self._cache_payload(config_json), f)
 
         found_configs = config_json.get('config_files', [])
         self._finish_progress()
         logger.info(
-            "Discovery confirmed: MCU=%s | device=%s | vendor=%s | modules=%s | "
-            "application=%s | vendor_skip=%s | config_extensions=%s | configs=%d",
+            "Discovery confirmed: MCU=%s | silicon=%s | device=%s | stack_vendor=%s | "
+            "stack_product=%s | modules=%s | structures=%s | application_roots=%s | "
+            "domains=%s | vendor_skip=%s | config_extensions=%s | configs=%d | "
+            "mcu_candidates=%d | app_folders=%d | confidence=%s",
             config_json.get("mcu_guess", "Unknown MCU"),
+            config_json.get("silicon_vendor", "Unknown"),
             config_json.get("ecu_role", "Unknown"),
             config_json.get("autosar_stack_vendor", "Unknown"),
+            config_json.get("autosar_stack_product", "Unknown"),
             self._format_values(config_json.get("modules")),
+            self._format_values(config_json.get("config_structures")),
             self._format_values(config_json.get("application_roots")),
+            self._format_values(config_json.get("app_domain_guesses")),
             self._format_values(config_json.get("vendor_folders")),
             self._format_values(config_json.get("config_file_extensions")),
             len(found_configs),
+            len(config_json.get("mcu_candidates", [])),
+            len(config_json.get("app_folders", [])),
+            config_json.get("confidence", config_json.get("confidence_scores", "unknown")),
         )
         if found_configs:
             logger.info(f"Discovery found {len(found_configs)} system configuration files.")
@@ -202,6 +286,7 @@ class DiscoveryPhase:
 
     async def _execute_json(self, task_name: str, kwargs: dict, context_id: str) -> dict:
         self._write_progress(f"Tiered discovery: waiting for {task_name} response")
+        self._finish_progress()
         response = await self.llm.execute_task(
             task_name=task_name,
             kwargs=kwargs,
@@ -278,6 +363,69 @@ class DiscoveryPhase:
             value for value in DiscoveryPhase._list_values(values)
             if value.casefold() not in excluded
         ]
+
+    @classmethod
+    def _discover_application_roots(cls, target_directory: str, manifest: dict, vendor_folders) -> list[str]:
+        """Infer source-bearing application roots when the model returns none."""
+        known_names = {"app", "application", "src", "source", "swc", "swcs"}
+        vendor_names = {item.casefold() for item in cls._list_values(vendor_folders)}
+        vendor_names.update({"vendor", "bsw", "mcal", "microsar", "rta-os", "cdd", "gendata"})
+        directories = manifest.get("directories", []) if isinstance(manifest, dict) else []
+        roots = []
+        for directory in directories:
+            if not isinstance(directory, dict) or directory.get("depth") != 1:
+                continue
+            path = str(directory.get("path", "")).strip().strip("/\\")
+            if not path or path.startswith((".", "_")) or path.casefold() in vendor_names:
+                continue
+            if path.casefold() in known_names or int(directory.get("source_file_count", 0) or 0) > 0:
+                roots.append(path)
+        return sorted(set(roots), key=str.casefold)
+
+    @staticmethod
+    def _has_conventional_application_root(roots) -> bool:
+        return bool({item.casefold() for item in DiscoveryPhase._list_values(roots)} & {
+            "app", "application", "src", "source", "swc", "swcs"
+        })
+
+    @staticmethod
+    def _merge_folder_values(*values) -> list[str]:
+        merged = []
+        seen = set()
+        for value in values:
+            for folder in DiscoveryPhase._list_values(value):
+                key = folder.casefold()
+                if key not in seen:
+                    merged.append(folder)
+                    seen.add(key)
+        return merged
+
+    @classmethod
+    def _discover_application_folders(
+        cls, target_directory: str, roots, vendor_folders
+    ) -> list[str]:
+        """Return real application subdirectories for focused scanning."""
+        result = []
+        for root in cls._list_values(roots):
+            root_path = os.path.join(target_directory, root.replace("/", os.sep))
+            if not os.path.isdir(root_path):
+                continue
+            for entry in sorted(os.scandir(root_path), key=lambda item: item.name.casefold()):
+                if not entry.is_dir() or entry.name.startswith("_"):
+                    continue
+                relative = f"{root.rstrip('/\\')}/{entry.name}"
+                result.append(relative)
+        return cls._filter_application_folders(result, vendor_folders, target_directory, roots)
+
+    @classmethod
+    def _discover_application_domains(cls, target_directory: str, roots, vendor_folders) -> list[str]:
+        """Return selectable domain names from immediate application subdirectories."""
+        domains = []
+        for folder in cls._discover_application_folders(target_directory, roots, vendor_folders):
+            parts = folder.replace("\\", "/").split("/")
+            if len(parts) >= 2 and parts[-1].casefold() not in {item.casefold() for item in domains}:
+                domains.append(parts[-1])
+        return domains
 
     @classmethod
     def _filter_application_folders(
@@ -416,6 +564,10 @@ class DiscoveryPhase:
         app_roots = config_json.get("application_root_guesses", config_json.get("application_roots", []))
         model_app_roots = config_json.get("application_root_candidates", app_roots)
         app_roots = DiscoveryPhase._list_values(model_app_roots)
+        app_roots = DiscoveryPhase._merge_folder_values(
+            app_roots,
+            DiscoveryPhase._discover_application_roots(target_directory, manifest, vendor_folders),
+        )
         config_json["application_roots"] = [
             folder for folder in app_roots
             if folder.lower() in target_names
@@ -428,12 +580,30 @@ class DiscoveryPhase:
             config_json.get("app_folders", []), config_json["vendor_folders"], target_directory,
             config_json["application_roots"],
         )
+        config_json["app_folders"] = DiscoveryPhase._merge_folder_values(
+            config_json["app_folders"],
+            DiscoveryPhase._discover_application_folders(
+                target_directory, config_json["application_roots"], config_json["vendor_folders"]
+            ) if DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]) else [],
+        )
         config_json["application_folders"] = DiscoveryPhase._filter_application_folders(
             config_json.get("application_folders", []), config_json["vendor_folders"], target_directory,
             config_json["application_roots"],
         )
         config_json["modules"] = DiscoveryPhase._filter_module_names(config_json.get("modules", []))
-        config_json["app_domain_guesses"] = DiscoveryPhase._derive_app_domains(config_json)
+        if DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]):
+            config_json["app_domain_guesses"] = DiscoveryPhase._derive_app_domains(config_json)
+        else:
+            config_json["app_domain_guesses"] = DiscoveryPhase._list_values(
+                config_json["application_roots"]
+            )
+        config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
+            config_json["app_domain_guesses"],
+            DiscoveryPhase._discover_application_domains(
+                target_directory, config_json["application_roots"], config_json["vendor_folders"]
+            ) if DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]) else [],
+        )
+        config_json["app_domains"] = config_json["app_domain_guesses"]
         vendor_parse_mode = str(config_json.get("vendor_parse_mode", "full")).strip().lower()
         if vendor_parse_mode not in {"full", "structure", "application_only"}:
             vendor_parse_mode = "full"

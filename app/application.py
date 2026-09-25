@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app.context import AppContext
+from app.context import AppContext, build_discovery_context
 from app.events import AppEvent, EventKind, EventSink
 from app.phases.discovery_phase import DiscoveryPhase
 from app.phases.domain_selection import select_domain
@@ -191,6 +191,7 @@ class ScanApplication:
             str(request.source_directory),
             skip_ingest=request.skip_ingest,
         )
+        discovery_context = build_discovery_context(config_json)
         if used_cache:
             logger.info("--- PHASE 2: Skipped (using cached graph) ---")
         else:
@@ -236,15 +237,29 @@ class ScanApplication:
             vendor_folders=config_json.get("vendor_folders", []),
             application_roots=config_json.get("application_roots", []),
             trace_repository=AgentTraceRepository(self.cache_dir),
+            discovery_context=discovery_context,
         )
         scan_service = ScanService(orchestrator)
         selected_domain = await self._resolve_interaction(
             self.domain_selector(
-                config_json.get("app_domains", []),
+                config_json.get("app_domains")
+                or config_json.get("app_domain_guesses")
+                or config_json.get("application_roots", []),
                 request.scan_all,
                 request.target_file,
             )
         )
+        if (
+            selected_domain is None
+            and not request.scan_all
+            and not request.target_file
+            and not config_json.get("app_domains")
+            and not config_json.get("app_domain_guesses")
+            and not config_json.get("application_roots")
+        ):
+            logger.warning(
+                "Discovery returned no selectable application domains; target prioritization will use global scope."
+            )
         scan_limit = resolve_scan_limit(
             request.limit,
             request.scan_all,

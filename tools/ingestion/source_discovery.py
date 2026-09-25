@@ -1,6 +1,6 @@
 from pathlib import Path
 
-SOURCE_SUFFIXES = frozenset({".c", ".cpp", ".h", ".hpp"})
+SOURCE_SUFFIXES = frozenset({".c", ".cpp", ".h", ".hpp", ".c.ref", ".ref"})
 
 def discover_source_files(root: str | Path) -> list[Path]:
     root = Path(root).resolve()

@@ -30,7 +30,6 @@ class IngestionService:
             "domains": config.get("app_domain_guesses", config.get("app_domains", [])),
             "mcu_candidates": config.get("mcu_candidates", []),
         }
-        graph.ingest_discovery_context(discovery_context)
         graph.resolver.set_discovery_context(discovery_context)
         report = IngestionPipeline(target_directory, graph).run(
             vendor_folders=config.get("vendor_folders", []),

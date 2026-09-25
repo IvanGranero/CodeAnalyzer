@@ -39,6 +39,7 @@ class TriageAgent(ScanAgent):
         follow_up_context: str = "",
         target_func: str = "",
         enable_tools: bool = True,
+        discovery_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         preloaded_messages = _build_initial_tool_history(
             graph_json,
@@ -56,6 +57,7 @@ class TriageAgent(ScanAgent):
                 "source_code": source_code,
                 "directive": directive,
                 "follow_up_context": follow_up_context,
+                "discovery_context": json.dumps(discovery_context or {}, ensure_ascii=False, sort_keys=True),
             },
             settings_override=(
                 {
@@ -78,6 +80,7 @@ class TriageAgent(ScanAgent):
         follow_up_context: str = "",
         target_func: str = "",
         max_attempts: int = 3,
+        discovery_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await run_triage(
             self,
@@ -88,6 +91,7 @@ class TriageAgent(ScanAgent):
             follow_up_context,
             target_func,
             max_attempts,
+            discovery_context=discovery_context,
         )
 
 
@@ -180,6 +184,7 @@ async def run_triage(
     follow_up_context: str = "",
     target_func: str = "",
     max_attempts: int = 3,
+    discovery_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a triage agent with bounded contract-validation retries."""
     last_error = "unknown triage failure"
@@ -194,6 +199,7 @@ async def run_triage(
                 follow_up_context,
                 target_func,
                 enable_tools=attempt == 1,
+                discovery_context=discovery_context,
             )
         except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = str(exc)
@@ -246,6 +252,7 @@ class DeepScanAgent(ScanAgent):
         follow_up_context: str = "",
         target_func: str = "",
         enable_tools: bool = True,
+        discovery_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         effort = candidate.get("effort_estimate", "medium")
         settings = {
@@ -276,6 +283,7 @@ class DeepScanAgent(ScanAgent):
                 "candidate": json.dumps(candidate, ensure_ascii=False),
                 "target_function": target_func,
                 "follow_up_context": follow_up_context,
+                "discovery_context": json.dumps(discovery_context or {}, ensure_ascii=False, sort_keys=True),
             },
             settings_override=settings,
             enable_tools=enable_tools,
@@ -293,6 +301,7 @@ class DeepScanAgent(ScanAgent):
         follow_up_context: str = "",
         target_func: str = "",
         max_attempts: int = 2,
+        discovery_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retry only contract failures, preserving the same evidence scope."""
         last_error = "unknown deep-scan failure"
@@ -302,6 +311,7 @@ class DeepScanAgent(ScanAgent):
                     candidate, graph_json, graph_summary, source_code,
                     directive, follow_up_context, target_func,
                     enable_tools=attempt == 1,
+                    discovery_context=discovery_context,
                 )
             except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 last_error = str(exc)

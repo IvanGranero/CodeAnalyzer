@@ -8,6 +8,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class RepoDiscoverer:
+    TEXT_SCAN_SUFFIXES = frozenset({
+        ".c", ".cc", ".cpp", ".h", ".hh", ".hpp", ".arxml", ".xml", ".json",
+        ".oil", ".cdd", ".cfg", ".ini", ".ld", ".mk", ".mak", ".gpj", ".rtaos",
+        ".mem", ".sct", ".yaml", ".yml", ".txt", ".inc", ".s",
+    })
     SUPPORTED_CONFIG_EXTENSIONS = frozenset({".arxml", ".xml", ".json"})
     DEFAULT_CONFIG_EXTENSIONS = (
         ".arxml", ".oil", ".cdd", ".rte.json", ".rte", ".xml", ".json",
@@ -133,7 +138,7 @@ class RepoDiscoverer:
         }
 
     @classmethod
-    def build_tier1_artifacts(cls, target_dir: str) -> dict:
+    def build_tier1_artifacts(cls, target_dir: str, progress_callback=None) -> dict:
         """Return small, high-signal metadata for the coarse discovery loop."""
         root = Path(target_dir).resolve()
         extension_histogram = Counter()
@@ -142,7 +147,11 @@ class RepoDiscoverer:
         hardware_hits = []
         hardware_paths = []
         directory_counts = Counter()
+        scanned_files = 0
         for path in cls._iter_files(root):
+            scanned_files += 1
+            if progress_callback is not None and (scanned_files == 1 or scanned_files % 250 == 0):
+                progress_callback(scanned_files, path.relative_to(root).as_posix())
             suffix = path.suffix.casefold() or "[no_extension]"
             extension_histogram[suffix] += 1
             relative = path.relative_to(root).as_posix()
@@ -153,13 +162,13 @@ class RepoDiscoverer:
                 if cls.TIER1_PATTERN.search(line):
                     matched = True
                     entry = f'{relative}:{line_number}:{line.strip()[:240]}'
-                    if len(line_hits) < 20:
+                    if len(line_hits) < 12:
                         line_hits.append(entry)
                 if cls.MCU_PATTERN.search(f"{relative} {line}"):
                     entry = f'{relative}:{line_number}:{line.strip()[:240]}'
-                    if len(hardware_hits) < 20:
+                    if len(hardware_hits) < 12:
                         hardware_hits.append(entry)
-                    if relative not in hardware_paths and len(hardware_paths) < 20:
+                    if relative not in hardware_paths and len(hardware_paths) < 12:
                         hardware_paths.append(relative)
             if matched and len(path_hits) < 50:
                 path_hits.append(relative)
@@ -167,7 +176,7 @@ class RepoDiscoverer:
                 hardware_paths.append(relative)
         return {
             "ext_histogram": dict(sorted(extension_histogram.items())),
-            "top_paths_sample": sorted(path_hits, key=str.casefold)[:50],
+            "top_paths_sample": sorted(path_hits, key=str.casefold)[:30],
             "top_keyword_hits": line_hits,
             "hardware_evidence": {
                 "mcu_hits": hardware_hits,
@@ -187,9 +196,11 @@ class RepoDiscoverer:
         return cls._build_focused_artifacts(target_dir, folders, cls.TIER2_PATTERN, 40, 10)
 
     @classmethod
-    def build_tier3_artifacts(cls, target_dir: str, folders: list[str]) -> dict:
+    def build_tier3_artifacts(cls, target_dir: str, folders: list[str], progress_callback=None) -> dict:
         """Scan only model-selected application folders for confirmatory evidence."""
-        return cls._build_focused_artifacts(target_dir, folders, cls.TIER3_PATTERN, 20, 5)
+        return cls._build_focused_artifacts(
+            target_dir, folders, cls.TIER3_PATTERN, 20, 5, progress_callback
+        )
 
     @staticmethod
     def _iter_files(root: Path, folders: list[str] | None = None):
@@ -210,6 +221,8 @@ class RepoDiscoverer:
 
     @staticmethod
     def _read_lines(path: Path):
+        if path.suffix.casefold() not in RepoDiscoverer.TEXT_SCAN_SUFFIXES:
+            return
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as stream:
                 characters_read = 0
@@ -224,31 +237,13 @@ class RepoDiscoverer:
     @classmethod
     def _build_focused_artifacts(
         cls, target_dir: str, folders: list[str], pattern: re.Pattern, max_hits: int, max_snippets: int,
+        progress_callback=None,
     ) -> dict:
         root = Path(target_dir).resolve()
         hits = []
         snippets = []
         matched_terms = []
         config_terms = []
-        for path in cls._iter_files(root, folders if isinstance(folders, list) else []):
-            relative = path.relative_to(root).as_posix()
-            file_hits = []
-            for line_number, line in cls._read_lines(path):
-                if pattern.search(line):
-                    entry = f'{relative}:{line_number}:{line.strip()[:240]}'
-                    file_hits.append(entry)
-                    for match in pattern.finditer(line):
-                        groups = match.groups()
-                        term = groups[0] if groups else ""
-                        structure = groups[1] if len(groups) > 1 else ""
-                        if term and term.casefold() not in {item.casefold() for item in matched_terms}:
-                            matched_terms.append(term)
-                        if structure and structure.casefold() not in {item.casefold() for item in config_terms}:
-                            config_terms.append(structure)
-                    if len(hits) < max_hits:
-                        hits.append(entry)
-            if file_hits and len(snippets) < max_snippets:
-                snippets.append({"file": relative, "text": " ".join(file_hits[:3])[:600]})
         normalized_folders = []
         for folder in folders if isinstance(folders, list) else []:
             if isinstance(folder, dict):
@@ -256,6 +251,39 @@ class RepoDiscoverer:
             folder = str(folder).strip().strip("/\\")
             if folder and folder not in normalized_folders:
                 normalized_folders.append(folder)
+        scanned_files = set()
+        for folder in sorted(normalized_folders, key=str.casefold):
+            folder_path = (root / folder.replace("\\", os.sep)).resolve()
+            if folder_path == root or root not in folder_path.parents or not folder_path.is_dir():
+                continue
+            if progress_callback is not None:
+                progress_callback(folder)
+            paths = sorted(
+                (path for path in folder_path.rglob("*") if path.is_file()),
+                key=lambda path: path.relative_to(root).as_posix().casefold(),
+            )
+            for path in paths:
+                if path in scanned_files:
+                    continue
+                scanned_files.add(path)
+                relative = path.relative_to(root).as_posix()
+                file_hits = []
+                for line_number, line in cls._read_lines(path):
+                    if pattern.search(line):
+                        entry = f'{relative}:{line_number}:{line.strip()[:240]}'
+                        file_hits.append(entry)
+                        for match in pattern.finditer(line):
+                            groups = match.groups()
+                            term = groups[0] if groups else ""
+                            structure = groups[1] if len(groups) > 1 else ""
+                            if term and term.casefold() not in {item.casefold() for item in matched_terms}:
+                                matched_terms.append(term)
+                            if structure and structure.casefold() not in {item.casefold() for item in config_terms}:
+                                config_terms.append(structure)
+                        if len(hits) < max_hits:
+                            hits.append(entry)
+                if file_hits and len(snippets) < max_snippets:
+                    snippets.append({"file": relative, "text": " ".join(file_hits[:3])[:600]})
         return {
             "hits": hits,
             "snippets": snippets,

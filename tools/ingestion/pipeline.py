@@ -143,6 +143,19 @@ class IngestionPipeline:
                 report["vendor_files"] += 1
             else:
                 report["application_files"] += 1
+                domains = report["parser_coverage"]["discovery_domains"]
+                roots = report["discovery_context"].get("application_roots", [])
+                relative_parts = Path(filepath).relative_to(Path(self.target_dir)).parts
+                if domains and relative_parts:
+                    for domain in domains:
+                        domain_path = str(domain).strip().strip('/\\')
+                        if "/" not in domain_path and roots:
+                            domain_path = f"{str(roots[0]).strip().strip('/\\')}/{domain_path}"
+                        domain_parts = Path(domain_path).parts
+                        if tuple(relative_parts[:len(domain_parts)]) == domain_parts:
+                            coverage = report["parser_coverage"]["domain_coverage"]
+                            coverage[domain] = coverage.get(domain, 0) + 1
+                            break
             parse_vendor_internals = vendor_parse_mode == "full"
             
             indicator = "📦" if is_vendor_code else "🚀"

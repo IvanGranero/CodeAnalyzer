@@ -196,6 +196,7 @@ class EvidenceBundle(BaseModel):
     """Stable, single-source evidence handoff for deep scan and exploitation."""
 
     schema_version: str = "1.0"
+    discovery_context: Dict[str, Any] = Field(default_factory=dict)
     retrieval_pointer: Optional[str] = None
     scan_metadata: Dict[str, Any] = Field(default_factory=dict)
     graph_json: str = ""

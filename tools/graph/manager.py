@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional
 from tools.graph.db import GraphDB
 from tools.graph.resolver import GraphResolver
 from tools.graph.nl2cypher import NL2CypherEngine
-from tools.graph.models import GraphNode, GraphEdge, IngestBatch, _neo4j_property_value
+from tools.graph.models import GraphNode, GraphEdge, IngestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -12,12 +12,6 @@ class GraphManager:
     def __init__(self, uri: str, user: str, password: str, llm_client: Any = None):
         logger.info("Initializing GraphManager...")
         self.db = GraphDB(uri, user, password)
-        
-        
-        
-        
-        
-        
         self.nl_engine = NL2CypherEngine(self.db, llm_client) if llm_client else None
         self.db.initialize_schema()
         self.resolver = GraphResolver(self.db)
@@ -31,24 +25,6 @@ class GraphManager:
             self._ingest_nodes(node_dicts)
         if edge_dicts:
             self._ingest_edges(edge_dicts)
-
-    def ingest_discovery_context(self, context: dict[str, Any]) -> None:
-        """Persist repository-level discovery evidence for graph queries and passes."""
-        properties = {
-            key: _neo4j_property_value(value)
-            for key, value in dict(context or {}).items()
-        }
-        properties["metadata_type"] = "repository_discovery"
-        query = """
-        UNWIND $batch AS record
-        MERGE (n:GraphNode:RepositoryMetadata {id: record.id})
-        SET n += record.properties
-        """
-        self.db.ingest_batched(
-            query,
-            [{"id": "repository:discovery", "properties": properties}],
-            batch_size=1,
-        )
 
     def _ingest_nodes(self, node_dicts: List[Dict[str, Any]]):
         grouped_nodes = {}
@@ -68,11 +44,6 @@ class GraphManager:
             """
             self.db.ingest_batched(query, batch)
 
-    
-    
-    
-    
-    
     _FUZZY_TARGET_LABEL = {
         "CALLS": "Function",
         "READS_VAR": "GlobalVariable",
@@ -111,16 +82,6 @@ class GraphManager:
                 self.db.ingest_batched(query_exact, exact_batch)
 
             if fuzzy_batch:
-                
-                
-                
-                
-                
-                
-                
-                
-                
-                
                 target_label = self._FUZZY_TARGET_LABEL.get(rel_type, "GraphNode")
                 query_fuzzy = f"""
                 UNWIND $batch AS record
