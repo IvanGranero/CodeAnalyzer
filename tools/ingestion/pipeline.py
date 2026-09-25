@@ -68,11 +68,15 @@ class IngestionPipeline:
         self._active_report = report
         report["parser_coverage"] = {
             "by_extension": {},
+            "by_parser": {},
+            "by_status": {},
             "unsupported_extensions": [],
             "discovery_modules": list((discovery_context or {}).get("modules", [])),
             "discovery_config_structures": list(
                 (discovery_context or {}).get("config_structures", [])
             ),
+            "discovery_domains": list((discovery_context or {}).get("domains", [])),
+            "domain_coverage": {},
         }
         
         
@@ -99,6 +103,13 @@ class IngestionPipeline:
                         extension = config_path.suffix.lower()
                         coverage = report["parser_coverage"]["by_extension"]
                         coverage[extension] = coverage.get(extension, 0) + 1
+                        parser_kind = self.config_dispatcher.classify(config_path)
+                        by_parser = report["parser_coverage"]["by_parser"]
+                        by_parser[parser_kind] = by_parser.get(parser_kind, 0) + 1
+                        parse_result = self.config_dispatcher.result(config_path)
+                        status = parse_result.get("status", "parsed")
+                        by_status = report["parser_coverage"]["by_status"]
+                        by_status[status] = by_status.get(status, 0) + 1
                         self._check_and_flush()
                     else:
                         report["config_files_unsupported"].append(config_file)

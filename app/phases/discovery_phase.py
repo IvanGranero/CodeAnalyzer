@@ -73,6 +73,7 @@ class DiscoveryPhase:
             application_folders,
             self._list_values(coarse.get("vendor_folders")),
             target_directory,
+            self._list_values(coarse.get("app_folders")) or ["app"],
         )
         self._write_progress(
             "Tiered discovery: Tier 3 scanning application folders "
@@ -96,8 +97,9 @@ class DiscoveryPhase:
             config_json[field] = self._merge_evidence_lists(
                 coarse.get(field), focused.get(field), confirmed.get(field)
             )
+        config_json["modules"] = self._filter_module_names(config_json["modules"])
         if not config_json["modules"]:
-            config_json["modules"] = tier2_artifacts.get("matched_terms", [])
+            config_json["modules"] = self._filter_module_names(tier2_artifacts.get("matched_terms", []))
         if not config_json["config_structures"]:
             config_json["config_structures"] = tier2_artifacts.get("config_terms", [])
         config_json["mcu"] = next(
@@ -111,8 +113,21 @@ class DiscoveryPhase:
         config_json["mcu_guess"] = self._first_named_value(
             config_json.get("mcu"), config_json.get("mcu_guess"), default="Unknown MCU"
         )
+        config_json["silicon_vendor"] = self._first_named_value(
+            config_json.get("silicon_vendor"), config_json.get("vendors"), default="Unknown"
+        )
+        config_json["autosar_stack_vendor"] = self._first_named_value(
+            config_json.get("autosar_stack_vendor"), default="Unknown"
+        )
+        config_json["autosar_stack_product"] = self._first_named_value(
+            config_json.get("autosar_stack_product"), default="Unknown"
+        )
+        config_json["ecu_role"] = self._first_named_value(
+            config_json.get("ecu_role"), default="Unknown"
+        )
+        config_json["device_guess"] = config_json["ecu_role"]
         config_json["stack_vendor_guess"] = self._first_named_value(
-            config_json.get("vendors"), config_json.get("stack_vendor_guess"),
+            config_json.get("autosar_stack_vendor"), config_json.get("stack_vendor_guess"),
             config_json.get("stack_vendor"), default="Unknown vendor"
         )
         config_json["vendor_folders"] = self._list_values(
@@ -121,15 +136,16 @@ class DiscoveryPhase:
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
         config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
         config_json["application_roots"] = self._list_values(
-            config_json.get("app_folders"), config_json.get("application_folders"),
-            config_json.get("application_roots"),
+            config_json.get("application_folders"), config_json.get("application_roots"),
         )
         config_json.setdefault("application_root_guesses", config_json.get("application_roots", []))
         config_json["app_folders"] = self._filter_application_folders(
-            config_json.get("app_folders"), config_json.get("vendor_folders", []), target_directory
+            config_json.get("app_folders"), config_json.get("vendor_folders", []), target_directory,
+            config_json.get("application_roots", ["app"]),
         )
         config_json["application_folders"] = self._filter_application_folders(
-            config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory
+            config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory,
+            config_json.get("application_roots", ["app"]),
         )
         config_json["app_domain_guesses"] = self._derive_app_domains(config_json)
         config_candidates = config_json.get("configs")
@@ -172,8 +188,8 @@ class DiscoveryPhase:
             "Discovery confirmed: MCU=%s | device=%s | vendor=%s | modules=%s | "
             "application=%s | vendor_skip=%s | config_extensions=%s | configs=%d",
             config_json.get("mcu_guess", "Unknown MCU"),
-            config_json.get("device_guess", "Unknown device"),
-            config_json.get("stack_vendor", "Unknown vendor"),
+            config_json.get("ecu_role", "Unknown"),
+            config_json.get("autosar_stack_vendor", "Unknown"),
             self._format_values(config_json.get("modules")),
             self._format_values(config_json.get("application_roots")),
             self._format_values(config_json.get("vendor_folders")),
@@ -252,19 +268,44 @@ class DiscoveryPhase:
                     seen.add(name_key)
         return merged
 
+    @staticmethod
+    def _filter_module_names(values) -> list[str]:
+        excluded = {
+            "app", "application", "microsar", "rta-os", "mcal", "cdd",
+            "bsw", "vendor", "gendata", "output", "selftest", "avb",
+        }
+        return [
+            value for value in DiscoveryPhase._list_values(values)
+            if value.casefold() not in excluded
+        ]
+
     @classmethod
-    def _filter_application_folders(cls, folders, vendor_folders, target_directory: str | None = None) -> list[str]:
+    def _filter_application_folders(
+        cls,
+        folders,
+        vendor_folders,
+        target_directory: str | None = None,
+        application_roots: list[str] | None = None,
+    ) -> list[str]:
         candidates = cls._list_values(folders)
         vendors = {item.casefold() for item in cls._list_values(vendor_folders)}
         vendors.update({"vendor", "third_party", "third-party", "mcal", "bsw", "microsar", "rta-os", "cdd"})
-        return [
-            folder for folder in candidates
-            if folder.casefold().split("/", 1)[0] not in vendors
-            and (
-                target_directory is None
-                or os.path.isdir(os.path.join(target_directory, folder.replace("/", os.sep)))
-            )
-        ]
+        roots = cls._list_values(application_roots) or ["app"]
+        resolved = []
+        for folder in candidates:
+            if folder.casefold().split("/", 1)[0] in vendors:
+                continue
+            candidate_paths = [folder]
+            if "/" not in folder and folder.casefold() not in {root.casefold() for root in roots}:
+                candidate_paths = [f"{root.rstrip('/\\')}/{folder}" for root in roots]
+            for candidate in candidate_paths:
+                if target_directory is None or os.path.isdir(
+                    os.path.join(target_directory, candidate.replace("/", os.sep))
+                ):
+                    if candidate.casefold() not in {item.casefold() for item in resolved}:
+                        resolved.append(candidate)
+                    break
+        return resolved
 
     @staticmethod
     def _first_named_value(*values, default: str = "") -> str:
@@ -311,6 +352,11 @@ class DiscoveryPhase:
                 if folder.casefold().startswith(prefix.casefold()):
                     domain = folder[len(prefix):].split("/", 1)[0]
                     break
+            if domain.casefold() in {root.casefold() for root in roots} and any(
+                candidate.casefold().startswith(domain.casefold().rstrip("/\\") + "/")
+                for candidate in cls._list_values(folders)
+            ):
+                continue
             if domain and domain.casefold() not in {item.casefold() for item in domains}:
                 domains.append(domain)
         return domains
@@ -378,6 +424,15 @@ class DiscoveryPhase:
         if not config_json["application_roots"] and "app" in target_names:
             config_json["application_roots"] = ["app"]
         config_json["application_root_guesses"] = config_json["application_roots"]
+        config_json["app_folders"] = DiscoveryPhase._filter_application_folders(
+            config_json.get("app_folders", []), config_json["vendor_folders"], target_directory,
+            config_json["application_roots"],
+        )
+        config_json["application_folders"] = DiscoveryPhase._filter_application_folders(
+            config_json.get("application_folders", []), config_json["vendor_folders"], target_directory,
+            config_json["application_roots"],
+        )
+        config_json["modules"] = DiscoveryPhase._filter_module_names(config_json.get("modules", []))
         config_json["app_domain_guesses"] = DiscoveryPhase._derive_app_domains(config_json)
         vendor_parse_mode = str(config_json.get("vendor_parse_mode", "full")).strip().lower()
         if vendor_parse_mode not in {"full", "structure", "application_only"}:

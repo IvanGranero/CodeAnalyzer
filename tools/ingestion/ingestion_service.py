@@ -20,10 +20,14 @@ class IngestionService:
         discovery_context = {
             "mcu": config.get("mcu_guess"),
             "device": config.get("device_guess"),
-            "vendor": config.get("stack_vendor_guess"),
+            "ecu_role": config.get("ecu_role"),
+            "silicon_vendor": config.get("silicon_vendor"),
+            "vendor": config.get("autosar_stack_vendor", config.get("stack_vendor_guess")),
+            "stack_product": config.get("autosar_stack_product"),
             "modules": config.get("modules", []),
             "config_structures": config.get("config_structures", []),
             "application_roots": config.get("application_roots", []),
+            "domains": config.get("app_domain_guesses", config.get("app_domains", [])),
             "mcu_candidates": config.get("mcu_candidates", []),
         }
         graph.ingest_discovery_context(discovery_context)

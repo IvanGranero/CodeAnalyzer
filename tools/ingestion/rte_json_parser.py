@@ -9,8 +9,10 @@ logger = logging.getLogger(__name__)
 class RteJsonParser:
     def __init__(self, builder: GraphPayloadBuilder):
         self.builder = builder
+        self.last_result = {"status": "not_run", "flow_count": 0}
 
     def parse(self, filepath: str) -> None:
+        self.last_result = {"status": "read_failed", "flow_count": 0}
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 data = json.load(f)
@@ -24,6 +26,10 @@ class RteJsonParser:
         self._extract_tasks_and_runnables(data, uri)
         self._extract_exclusive_areas(data, uri)
         flow_count = self._extract_sender_receiver_flows(data, uri)
+        self.last_result = {
+            "status": "parsed_with_flows" if flow_count else "parsed_empty_flows",
+            "flow_count": flow_count,
+        }
         if flow_count:
             logger.info(f"Successfully processed RTE ground truth from {filepath}; extracted {flow_count} sender/receiver flows")
         else:

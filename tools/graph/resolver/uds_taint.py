@@ -86,11 +86,12 @@ class UdsTaintMixin:
         logger.info("Propagating Taint Downstream...")
         taint_query = """
         MATCH path = (u:UdsService)<-[:HANDLES_UDS]-(entry:Function)-[:CALLS*0..10]->(downstream:Function)
-        WITH DISTINCT downstream, u.did AS source_did
+        WITH downstream, u.did AS source_did, min(length(path)) AS taint_depth
         SET downstream.tainted_by_uds = true
-        WITH downstream, collect(DISTINCT source_did) AS uds_sources
-        SET downstream.reachable_from_dids = uds_sources
-        RETURN count(downstream) AS tainted_count
+        SET downstream.reachable_from_dids = coalesce(downstream.reachable_from_dids, []) + source_did,
+            downstream.uds_taint_depth = coalesce(downstream.uds_taint_depth, taint_depth),
+            downstream.uds_taint_source = CASE WHEN taint_depth = 0 THEN 'direct_entry' ELSE 'call_graph' END
+        RETURN count(DISTINCT downstream) AS tainted_count
         """
         try:
             with self.db.driver.session() as session:
@@ -110,9 +111,17 @@ class UdsTaintMixin:
         
         
         
-        query = """
+        vendor_folders = [str(folder).strip().strip('/\\').lower() for folder in self.discovery_context.get("vendor_folders", [])]
+        application_roots = [str(folder).strip().strip('/\\').lower() for folder in self.discovery_context.get("application_roots", [])]
+        scope_predicate = "true"
+        if vendor_folders:
+            scope_predicate += " AND NOT any(folder IN $vendor_folders WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
+        if application_roots:
+            scope_predicate += " AND any(folder IN $application_roots WHERE toLower(f.storage_uri) CONTAINS '/' + folder + '/')"
+        query = f"""
         MATCH (f:Function)
         WITH f, (
+            {scope_predicate} AND
             NOT ()-[:CALLS]->(f)
             AND NOT (f)-[:HANDLES_UDS]->()
             AND NOT (f)-[:RECEIVES_SIGNAL]->()
@@ -124,7 +133,11 @@ class UdsTaintMixin:
         """
         try:
             with self.db.driver.session() as session:
-                result = session.run(query).single()
+                result = session.run(
+                    query,
+                    vendor_folders=vendor_folders,
+                    application_roots=application_roots,
+                ).single()
                 count = result["dead_count"] if result else 0
                 logger.warning(f"Flagged {count} isolated functions as Dead Code.")
         except Exception as e:
