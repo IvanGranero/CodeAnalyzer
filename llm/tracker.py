@@ -130,7 +130,7 @@ class TokenTracker:
         """Map prompt task names to the report's workflow phases."""
         if not task_name:
             return None
-        if task_name in {"discovery", "triage_agent"}:
+        if task_name in {"discovery_coarse", "discovery_focused", "discovery_confirm", "triage_agent"}:
             return "triage"
         if task_name.startswith("exploit_"):
             return "exploit"

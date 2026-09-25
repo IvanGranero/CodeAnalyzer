@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional
 from tools.graph.db import GraphDB
 from tools.graph.resolver import GraphResolver
 from tools.graph.nl2cypher import NL2CypherEngine
-from tools.graph.models import GraphNode, GraphEdge, IngestBatch
+from tools.graph.models import GraphNode, GraphEdge, IngestBatch, _neo4j_property_value
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,24 @@ class GraphManager:
             self._ingest_nodes(node_dicts)
         if edge_dicts:
             self._ingest_edges(edge_dicts)
+
+    def ingest_discovery_context(self, context: dict[str, Any]) -> None:
+        """Persist repository-level discovery evidence for graph queries and passes."""
+        properties = {
+            key: _neo4j_property_value(value)
+            for key, value in dict(context or {}).items()
+        }
+        properties["metadata_type"] = "repository_discovery"
+        query = """
+        UNWIND $batch AS record
+        MERGE (n:GraphNode:RepositoryMetadata {id: record.id})
+        SET n += record.properties
+        """
+        self.db.ingest_batched(
+            query,
+            [{"id": "repository:discovery", "properties": properties}],
+            batch_size=1,
+        )
 
     def _ingest_nodes(self, node_dicts: List[Dict[str, Any]]):
         grouped_nodes = {}

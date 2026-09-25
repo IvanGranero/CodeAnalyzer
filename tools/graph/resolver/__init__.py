@@ -41,6 +41,18 @@ class GraphResolver(
 
     def __init__(self, db: Any):
         self.db = db
+        self.discovery_context: dict[str, Any] = {}
+
+    def set_discovery_context(self, context: dict[str, Any] | None) -> None:
+        """Make bounded discovery evidence available to resolver passes."""
+        self.discovery_context = dict(context or {})
+        logger.info(
+            "Resolver discovery context: MCU=%s vendor=%s modules=%d structures=%d",
+            self.discovery_context.get("mcu", "unknown"),
+            self.discovery_context.get("vendor", "unknown"),
+            len(self.discovery_context.get("modules", [])),
+            len(self.discovery_context.get("config_structures", [])),
+        )
 
     def run_all_passes(self):
         """

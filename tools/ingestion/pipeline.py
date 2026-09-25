@@ -35,6 +35,7 @@ class IngestionPipeline:
         vendor_folders: list = None,
         config_files: list = None,
         vendor_parse_mode: str = "full",
+        discovery_context: dict[str, Any] | None = None,
         cancel_event: Event | None = None,
     ) -> dict[str, Any]:
         if vendor_folders is None:
@@ -62,8 +63,17 @@ class IngestionPipeline:
             "application_files": 0,
             "parser_edges_emitted": 0,
             "vendor_parse_mode": vendor_parse_mode,
+            "discovery_context": discovery_context or {},
         }
         self._active_report = report
+        report["parser_coverage"] = {
+            "by_extension": {},
+            "unsupported_extensions": [],
+            "discovery_modules": list((discovery_context or {}).get("modules", [])),
+            "discovery_config_structures": list(
+                (discovery_context or {}).get("config_structures", [])
+            ),
+        }
         
         
         if config_files:
@@ -86,9 +96,15 @@ class IngestionPipeline:
                     config_path = Path(full_path)
                     if self.config_dispatcher.parse(config_path):
                         report["config_files_parsed"] += 1
+                        extension = config_path.suffix.lower()
+                        coverage = report["parser_coverage"]["by_extension"]
+                        coverage[extension] = coverage.get(extension, 0) + 1
                         self._check_and_flush()
                     else:
                         report["config_files_unsupported"].append(config_file)
+                        extension = config_path.suffix.lower()
+                        if extension not in report["parser_coverage"]["unsupported_extensions"]:
+                            report["parser_coverage"]["unsupported_extensions"].append(extension)
                         logger.warning("No parser registered for config file: %s", config_file)
                 else:
                     logger.warning(f"Config file not found on disk: {full_path}")

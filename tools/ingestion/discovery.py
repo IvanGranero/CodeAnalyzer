@@ -16,6 +16,36 @@ class RepoDiscoverer:
     DEFAULT_CONFIG_PATTERNS = (
         "*.arxml", "*.oil", "CMakeLists.txt", "Makefile", "*.ld",
     )
+    TIER1_PATTERN = re.compile(
+        r"arxml|Ecuc|ContainerDef|Rte_|Swc|CanIf|CanTp|Com|PduR|Dcm|Dem|Det|"
+        r"BswM|EcuM|NvM|FiM|Wdgm|Os|Hsm|Diag|stm32|nxp|s32k|rh850|tricore|"
+        r"renesas|infineon",
+        re.IGNORECASE,
+    )
+    TIER2_PATTERN = re.compile(
+        r"\b(CanIf|CanDrv|CanTp|Com|PduR|Dcm|Dem|Det|NvM|FiM|Wdgm|Os|BswM|"
+        r"EcuM|Rte|Xcp|SoAd|TcpIp|IpduM|LinIf|EthIf)\b|"
+        r"\b(EcucContainerDef|EcucPartition|EcucForeignReference|ContainerDef|"
+        r"LinkerSymbolDef|PublishedInformation|postBuildVariantsUsed)\b|"
+        r"(?:\.ld|\.map|\.elf|\.hex|LinkerSymbol)|"
+        r"\b(stm32f[0-9]+|stm32|s32k|s32z|rh850|tricore|tms570|pic32|"
+        r"cortex[-_ ]?m[0-9]+)\b",
+        re.IGNORECASE,
+    )
+    TIER3_PATTERN = re.compile(
+        r"\b[A-Z][A-Za-z0-9]+_(?:Init|Runnable|MainFunction|Periodic|10msTask|20msTask)\b|"
+        r"Rte_(?:Type|Cfg|Swc|Application|Call|Read|Write)|"
+        r"(?:Diag_Init|Dcm_Init|Dem_Init|Hsm_Init|Hsm_Process|Crypto_)|"
+        r"(?:CanIf_Init|CanTp_Init|Com_Init|PduR_Init|SoAd_Init|TcpIp_Init)|"
+        r"\b(?:FLASH|RAM|SECTIONS|MEMORY|REGION|ENTRY|PROVIDE)\b",
+        re.IGNORECASE,
+    )
+    MCU_PATTERN = re.compile(
+        r"\b(stm32[fgh][0-9a-z]+|s32k[0-9a-z]*|s32z[0-9a-z]*|rh850[a-z0-9_-]*|"
+        r"tricore|aurix|tc[0-9]+[a-z0-9_-]*|tms570[a-z0-9_-]*|pic32[a-z0-9_-]*|"
+        r"cortex[-_ ]?m[0-9]+|renesas|infineon|nxp)\b",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def build_repo_manifest(cls, target_dir: str) -> dict:
@@ -100,6 +130,138 @@ class RepoDiscoverer:
             "directory_components": components,
             "deterministic_vendor_folders": deterministic_vendor_folders,
             "directories": directories,
+        }
+
+    @classmethod
+    def build_tier1_artifacts(cls, target_dir: str) -> dict:
+        """Return small, high-signal metadata for the coarse discovery loop."""
+        root = Path(target_dir).resolve()
+        extension_histogram = Counter()
+        path_hits = []
+        line_hits = []
+        hardware_hits = []
+        hardware_paths = []
+        directory_counts = Counter()
+        for path in cls._iter_files(root):
+            suffix = path.suffix.casefold() or "[no_extension]"
+            extension_histogram[suffix] += 1
+            relative = path.relative_to(root).as_posix()
+            directory = relative.rsplit("/", 1)[0] if "/" in relative else "."
+            directory_counts[directory.split("/", 1)[0]] += 1
+            matched = False
+            for line_number, line in cls._read_lines(path):
+                if cls.TIER1_PATTERN.search(line):
+                    matched = True
+                    entry = f'{relative}:{line_number}:{line.strip()[:240]}'
+                    if len(line_hits) < 20:
+                        line_hits.append(entry)
+                if cls.MCU_PATTERN.search(f"{relative} {line}"):
+                    entry = f'{relative}:{line_number}:{line.strip()[:240]}'
+                    if len(hardware_hits) < 20:
+                        hardware_hits.append(entry)
+                    if relative not in hardware_paths and len(hardware_paths) < 20:
+                        hardware_paths.append(relative)
+            if matched and len(path_hits) < 50:
+                path_hits.append(relative)
+            if cls.MCU_PATTERN.search(relative) and relative not in hardware_paths and len(hardware_paths) < 20:
+                hardware_paths.append(relative)
+        return {
+            "ext_histogram": dict(sorted(extension_histogram.items())),
+            "top_paths_sample": sorted(path_hits, key=str.casefold)[:50],
+            "top_keyword_hits": line_hits,
+            "hardware_evidence": {
+                "mcu_hits": hardware_hits,
+                "matching_paths": sorted(hardware_paths, key=str.casefold),
+            },
+            "top_dirs": [
+                {"path": path, "file_count": count}
+                for path, count in sorted(
+                    directory_counts.items(), key=lambda item: (-item[1], item[0].casefold())
+                )[:10]
+            ],
+        }
+
+    @classmethod
+    def build_tier2_artifacts(cls, target_dir: str, folders: list[str]) -> dict:
+        """Scan only model-selected folders for module and structure evidence."""
+        return cls._build_focused_artifacts(target_dir, folders, cls.TIER2_PATTERN, 40, 10)
+
+    @classmethod
+    def build_tier3_artifacts(cls, target_dir: str, folders: list[str]) -> dict:
+        """Scan only model-selected application folders for confirmatory evidence."""
+        return cls._build_focused_artifacts(target_dir, folders, cls.TIER3_PATTERN, 20, 5)
+
+    @staticmethod
+    def _iter_files(root: Path, folders: list[str] | None = None):
+        allowed = None if folders is None else []
+        if folders is not None:
+            for folder in folders:
+                if isinstance(folder, dict):
+                    folder = folder.get("path", folder.get("name", ""))
+                candidate = (root / str(folder).strip().strip("/\\")).resolve()
+                if candidate == root or root in candidate.parents:
+                    allowed.append(candidate)
+        for path in sorted(
+            (item for item in root.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(root).as_posix().casefold(),
+        ):
+            if allowed is None or any(path == folder or folder in path.parents for folder in allowed):
+                yield path
+
+    @staticmethod
+    def _read_lines(path: Path):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as stream:
+                characters_read = 0
+                for line_number, line in enumerate(stream, 1):
+                    characters_read += len(line)
+                    if characters_read > 1_000_000:
+                        break
+                    yield line_number, line
+        except (OSError, UnicodeError):
+            return
+
+    @classmethod
+    def _build_focused_artifacts(
+        cls, target_dir: str, folders: list[str], pattern: re.Pattern, max_hits: int, max_snippets: int,
+    ) -> dict:
+        root = Path(target_dir).resolve()
+        hits = []
+        snippets = []
+        matched_terms = []
+        config_terms = []
+        for path in cls._iter_files(root, folders if isinstance(folders, list) else []):
+            relative = path.relative_to(root).as_posix()
+            file_hits = []
+            for line_number, line in cls._read_lines(path):
+                if pattern.search(line):
+                    entry = f'{relative}:{line_number}:{line.strip()[:240]}'
+                    file_hits.append(entry)
+                    for match in pattern.finditer(line):
+                        groups = match.groups()
+                        term = groups[0] if groups else ""
+                        structure = groups[1] if len(groups) > 1 else ""
+                        if term and term.casefold() not in {item.casefold() for item in matched_terms}:
+                            matched_terms.append(term)
+                        if structure and structure.casefold() not in {item.casefold() for item in config_terms}:
+                            config_terms.append(structure)
+                    if len(hits) < max_hits:
+                        hits.append(entry)
+            if file_hits and len(snippets) < max_snippets:
+                snippets.append({"file": relative, "text": " ".join(file_hits[:3])[:600]})
+        normalized_folders = []
+        for folder in folders if isinstance(folders, list) else []:
+            if isinstance(folder, dict):
+                folder = folder.get("path", folder.get("name", ""))
+            folder = str(folder).strip().strip("/\\")
+            if folder and folder not in normalized_folders:
+                normalized_folders.append(folder)
+        return {
+            "hits": hits,
+            "snippets": snippets,
+            "matched_terms": sorted(matched_terms, key=str.casefold),
+            "config_terms": sorted(config_terms, key=str.casefold),
+            "folders": sorted(normalized_folders, key=str.casefold),
         }
 
     @staticmethod

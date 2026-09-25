@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import hashlib
+import sys
 
 from tools.ingestion.discovery import RepoDiscoverer
 from llm.service import LLMService
@@ -27,35 +28,121 @@ class DiscoveryPhase:
                 config_json = json.load(f)
             return self._normalize_scope(config_json, target_directory)
 
-        logger.info("--- PHASE 1: Starting Architectural Discovery ---")
+        logger.info("--- PHASE 1: Starting tiered architectural discovery ---")
+        self._write_progress("Tiered discovery: building repository manifest")
         manifest = RepoDiscoverer.build_repo_manifest(target_directory)
-        manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-        llm_response = await self.llm.execute_task(
-            task_name="discovery",
-            kwargs={"directory_tree": manifest_json},
-            context_id="discovery",
+        self._write_progress("Tiered discovery: Tier 1 scanning files")
+        tier1_artifacts = RepoDiscoverer.build_tier1_artifacts(target_directory)
+        self._write_progress(
+            "Tiered discovery: Tier 1 LLM analysis "
+            f"({len(tier1_artifacts['top_paths_sample'])} paths, "
+            f"{len(tier1_artifacts['top_keyword_hits'])} hits)"
         )
-        try:
-            config_json = extract_json_object(llm_response)
-        except ValueError as exc:
-            logger.error(
-                "Discovery LLM did not return a JSON object (response length=%d): %s",
-                len(llm_response),
-                exc,
+        coarse = await self._execute_json(
+            "discovery_coarse",
+            {"artifacts": json.dumps(tier1_artifacts, sort_keys=True)},
+            "discovery-coarse",
+        )
+        focused_folders = self._list_values(
+            coarse.get("interesting_folders"), coarse.get("next_dirs"),
+            coarse.get("app_folders"), coarse.get("vendor_folders"),
+        )
+        self._write_progress(
+            "Tiered discovery: Tier 2 scanning selected folders "
+            f"({len(focused_folders)} folders)"
+        )
+        tier2_artifacts = RepoDiscoverer.build_tier2_artifacts(target_directory, focused_folders)
+        self._write_progress(
+            "Tiered discovery: Tier 2 LLM analysis "
+            f"({len(tier2_artifacts['hits'])} hits, {len(tier2_artifacts['snippets'])} snippets)"
+        )
+        focused = await self._execute_json(
+            "discovery_focused",
+            {
+                "artifacts": json.dumps(tier2_artifacts, sort_keys=True),
+                "previous_guesses": json.dumps(coarse, sort_keys=True),
+            },
+            "discovery-focused",
+        )
+        application_folders = self._list_values(focused.get("app_folders"))
+        if not application_folders:
+            application_folders = self._list_values(focused.get("application_folders"))
+        if not application_folders:
+            application_folders = focused_folders
+        application_folders = self._filter_application_folders(
+            application_folders,
+            self._list_values(coarse.get("vendor_folders")),
+            target_directory,
+        )
+        self._write_progress(
+            "Tiered discovery: Tier 3 scanning application folders "
+            f"({len(application_folders)} folders)"
+        )
+        tier3_artifacts = RepoDiscoverer.build_tier3_artifacts(target_directory, application_folders)
+        self._write_progress(
+            "Tiered discovery: Tier 3 LLM confirmation "
+            f"({len(tier3_artifacts['hits'])} hits, {len(tier3_artifacts['snippets'])} snippets)"
+        )
+        confirmed = await self._execute_json(
+            "discovery_confirm",
+            {
+                "artifacts": json.dumps(tier3_artifacts, sort_keys=True),
+                "previous_guesses": json.dumps({**coarse, **focused}, sort_keys=True),
+            },
+            "discovery-confirm",
+        )
+        config_json = {**coarse, **focused, **confirmed}
+        for field in ("modules", "config_structures", "diagnostics", "hsm", "comms", "swc"):
+            config_json[field] = self._merge_evidence_lists(
+                coarse.get(field), focused.get(field), confirmed.get(field)
             )
-            raise ValueError("Discovery LLM did not return valid JSON") from exc
+        if not config_json["modules"]:
+            config_json["modules"] = tier2_artifacts.get("matched_terms", [])
+        if not config_json["config_structures"]:
+            config_json["config_structures"] = tier2_artifacts.get("config_terms", [])
+        config_json["mcu"] = next(
+            (value for result in (confirmed, focused, coarse)
+             for value in (result.get("mcu"), result.get("mcu_candidates"))
+             if self._first_named_value(value)),
+            config_json.get("mcu"),
+        )
+        manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
 
-        config_json.setdefault("mcu_guess", "Unknown MCU")
-        config_json.setdefault("stack_vendor_guess", config_json.get("stack_vendor", "Unknown vendor"))
+        config_json["mcu_guess"] = self._first_named_value(
+            config_json.get("mcu"), config_json.get("mcu_guess"), default="Unknown MCU"
+        )
+        config_json["stack_vendor_guess"] = self._first_named_value(
+            config_json.get("vendors"), config_json.get("stack_vendor_guess"),
+            config_json.get("stack_vendor"), default="Unknown vendor"
+        )
+        config_json["vendor_folders"] = self._list_values(
+            config_json.get("skip_folders"), config_json.get("vendor_folders"), config_json.get("vendors"),
+        )
         config_json.setdefault("likely_vendor_folders", config_json.get("vendor_folders", []))
         config_json.setdefault("app_domain_guesses", config_json.get("app_domains", []))
+        config_json["application_roots"] = self._list_values(
+            config_json.get("app_folders"), config_json.get("application_folders"),
+            config_json.get("application_roots"),
+        )
         config_json.setdefault("application_root_guesses", config_json.get("application_roots", []))
+        config_json["app_folders"] = self._filter_application_folders(
+            config_json.get("app_folders"), config_json.get("vendor_folders", []), target_directory
+        )
+        config_json["application_folders"] = self._filter_application_folders(
+            config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory
+        )
+        config_json["app_domain_guesses"] = self._derive_app_domains(config_json)
+        config_candidates = config_json.get("configs")
+        config_extensions = config_candidates.get("extensions", []) if isinstance(config_candidates, dict) else config_candidates
         config_json["config_file_extensions"] = self._merge_discovery_rules(
-            config_json.get("config_file_extensions"),
+            config_json.get("config_file_extensions") or config_extensions,
             RepoDiscoverer.DEFAULT_CONFIG_EXTENSIONS,
         )
+        config_patterns = config_json.get("config_filename_patterns")
+        if isinstance(config_candidates, dict):
+            config_patterns = config_candidates.get("patterns", config_patterns)
         config_json["config_filename_patterns"] = self._merge_discovery_rules(
-            config_json.get("config_filename_patterns"),
+            config_patterns,
             RepoDiscoverer.DEFAULT_CONFIG_PATTERNS,
         )
         discovered_config_files = RepoDiscoverer.search_config_files(
@@ -80,9 +167,153 @@ class DiscoveryPhase:
             json.dump(config_json, f)
 
         found_configs = config_json.get('config_files', [])
+        self._finish_progress()
+        logger.info(
+            "Discovery confirmed: MCU=%s | device=%s | vendor=%s | modules=%s | "
+            "application=%s | vendor_skip=%s | config_extensions=%s | configs=%d",
+            config_json.get("mcu_guess", "Unknown MCU"),
+            config_json.get("device_guess", "Unknown device"),
+            config_json.get("stack_vendor", "Unknown vendor"),
+            self._format_values(config_json.get("modules")),
+            self._format_values(config_json.get("application_roots")),
+            self._format_values(config_json.get("vendor_folders")),
+            self._format_values(config_json.get("config_file_extensions")),
+            len(found_configs),
+        )
         if found_configs:
             logger.info(f"Discovery found {len(found_configs)} system configuration files.")
         return config_json
+
+    async def _execute_json(self, task_name: str, kwargs: dict, context_id: str) -> dict:
+        self._write_progress(f"Tiered discovery: waiting for {task_name} response")
+        response = await self.llm.execute_task(
+            task_name=task_name,
+            kwargs=kwargs,
+            context_id=context_id,
+        )
+        try:
+            return extract_json_object(response)
+        except ValueError as exc:
+            logger.error("Discovery task %s did not return valid JSON", task_name)
+            raise ValueError(f"Discovery task {task_name} did not return valid JSON") from exc
+
+    @staticmethod
+    def _write_progress(message: str) -> None:
+        """Keep long discovery work visible without adding one log line per update."""
+        sys.stdout.write(f"\r{message}...                                  ")
+        sys.stdout.flush()
+
+    @staticmethod
+    def _finish_progress() -> None:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    @staticmethod
+    def _format_values(value, limit: int = 8) -> str:
+        if isinstance(value, dict):
+            value = value.get("items", value.get("names", []))
+        if not isinstance(value, list):
+            return str(value or "unknown")
+        values = [DiscoveryPhase._first_named_value(item) for item in value]
+        values = [item for item in values if item]
+        if len(values) > limit:
+            return ", ".join(values[:limit]) + f", +{len(values) - limit} more"
+        return ", ".join(values) or "none"
+
+    @staticmethod
+    def _list_values(*values) -> list[str]:
+        result = []
+        seen = set()
+        for value in values:
+            items = value if isinstance(value, list) else []
+            for item in items:
+                if isinstance(item, dict):
+                    item = item.get("path", item.get("name", item.get("domain", "")))
+                text = str(item).strip().strip('/\\')
+                if text and text.casefold() not in seen:
+                    result.append(text)
+                    seen.add(text.casefold())
+        return result
+
+    @staticmethod
+    def _merge_evidence_lists(*values) -> list:
+        merged = []
+        seen = set()
+        for value in values:
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else str(item)
+                name = item.get("name", item.get("path", "")) if isinstance(item, dict) else item
+                name_key = str(name).casefold()
+                if key not in seen and name_key not in seen:
+                    merged.append(item)
+                    seen.add(key)
+                    seen.add(name_key)
+        return merged
+
+    @classmethod
+    def _filter_application_folders(cls, folders, vendor_folders, target_directory: str | None = None) -> list[str]:
+        candidates = cls._list_values(folders)
+        vendors = {item.casefold() for item in cls._list_values(vendor_folders)}
+        vendors.update({"vendor", "third_party", "third-party", "mcal", "bsw", "microsar", "rta-os", "cdd"})
+        return [
+            folder for folder in candidates
+            if folder.casefold().split("/", 1)[0] not in vendors
+            and (
+                target_directory is None
+                or os.path.isdir(os.path.join(target_directory, folder.replace("/", os.sep)))
+            )
+        ]
+
+    @staticmethod
+    def _first_named_value(*values, default: str = "") -> str:
+        for value in values:
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict):
+                    item = item.get("name", item.get("path", item.get("value", "")))
+                text = str(item).strip()
+                if text and text.casefold() not in {
+                    "unknown", "unknown mcu", "unknown vendor", "none", "null",
+                }:
+                    return text
+        return default
+
+    @classmethod
+    def _derive_app_domains(cls, config_json: dict) -> list[str]:
+        """Build selectable domains when tiered output omits an explicit list."""
+        explicit = cls._list_values(
+            config_json.get("app_domain_guesses"), config_json.get("app_domains"),
+        )
+        if explicit:
+            return explicit
+        roots = cls._list_values(config_json.get("application_roots"))
+        folders = cls._list_values(
+            config_json.get("app_folders"), config_json.get("application_folders"),
+        )
+        dir_map = config_json.get("dir_map", [])
+        if isinstance(dir_map, list):
+            folders.extend(
+                entry.get("path", entry.get("name", ""))
+                for entry in dir_map
+                if isinstance(entry, dict)
+                and str(entry.get("category", "")).casefold() in {"app", "application"}
+            )
+        domains = []
+        for folder in cls._list_values(folders):
+            domain = folder
+            for root in roots:
+                prefix = root.rstrip("/\\") + "/"
+                if folder.casefold() == root.casefold():
+                    domain = folder
+                    break
+                if folder.casefold().startswith(prefix.casefold()):
+                    domain = folder[len(prefix):].split("/", 1)[0]
+                    break
+            if domain and domain.casefold() not in {item.casefold() for item in domains}:
+                domains.append(domain)
+        return domains
 
     @staticmethod
     def _normalize_scope(config_json: dict, target_directory: str, manifest: dict | None = None) -> dict:
@@ -94,8 +325,10 @@ class DiscoveryPhase:
             vendor_folders = model_vendor_folders
         if not isinstance(vendor_folders, list):
             vendor_folders = []
-        normalized = [str(folder).strip().strip('/\\') for folder in vendor_folders if str(folder).strip()]
-        stack_vendor = str(config_json.get("stack_vendor_guess", config_json.get("stack_vendor", ""))).strip()
+        normalized = DiscoveryPhase._list_values(vendor_folders)
+        stack_vendor = DiscoveryPhase._first_named_value(
+            config_json.get("stack_vendor_guess"), config_json.get("stack_vendor"),
+        )
         target_names = set()
         if os.path.isdir(target_directory):
             target_names = {
@@ -136,24 +369,16 @@ class DiscoveryPhase:
         config_json["likely_vendor_folders"] = config_json["vendor_folders"]
         app_roots = config_json.get("application_root_guesses", config_json.get("application_roots", []))
         model_app_roots = config_json.get("application_root_candidates", app_roots)
-        if isinstance(model_app_roots, list):
-            app_roots = model_app_roots
-        if not isinstance(app_roots, list):
-            app_roots = []
+        app_roots = DiscoveryPhase._list_values(model_app_roots)
         config_json["application_roots"] = [
-            str(folder).strip().strip('/\\')
-            for folder in app_roots
-            if (
-                str(folder).strip()
-                and str(folder).strip().strip('/\\').lower() in target_names
-                and str(folder).strip().strip('/\\').lower() not in {
-                    vendor.lower() for vendor in config_json["vendor_folders"]
-                }
-            )
+            folder for folder in app_roots
+            if folder.lower() in target_names
+            and folder.lower() not in {vendor.lower() for vendor in config_json["vendor_folders"]}
         ]
         if not config_json["application_roots"] and "app" in target_names:
             config_json["application_roots"] = ["app"]
         config_json["application_root_guesses"] = config_json["application_roots"]
+        config_json["app_domain_guesses"] = DiscoveryPhase._derive_app_domains(config_json)
         vendor_parse_mode = str(config_json.get("vendor_parse_mode", "full")).strip().lower()
         if vendor_parse_mode not in {"full", "structure", "application_only"}:
             vendor_parse_mode = "full"
