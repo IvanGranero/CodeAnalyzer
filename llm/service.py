@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from llm.langchain_client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
+from llm.client import LLMClient, ToolDefinition, ToolHandler, UsageCallback
 from llm.tracker import TokenTracker
 from config import TokenPricing
 

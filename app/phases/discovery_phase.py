@@ -57,20 +57,20 @@ class DiscoveryPhase:
                     json.dump(self._cache_payload(config_json), f)
             return config_json
 
-        logger.info("--- PHASE 1: Starting tiered architectural discovery ---")
-        self._write_progress("Tiered discovery: building repository manifest")
+        logger.info("--- PHASE 1: Starting architectural discovery ---")
+        self._write_progress("Discovery: building repository manifest")
         manifest = RepoDiscoverer.build_repo_manifest(target_directory)
-        self._write_progress("Tiered discovery: Tier 1 scanning files")
+        self._write_progress("Discovery: scanning files")
         tier1_artifacts = RepoDiscoverer.build_tier1_artifacts(
             target_directory,
             progress_callback=lambda count, path: self._write_progress(
-                f"Tiered discovery: Tier 1 scanning files ({count}) {path}"
+                f"Discovery: scanning files ({count}) {path}"
             ),
         )
         directory_inventory = RepoDiscoverer.build_directory_inventory(manifest)
         tier1_artifacts["directory_inventory"] = directory_inventory
         self._write_progress(
-            "Tiered discovery: Tier 1 LLM analysis "
+            "Discovery: LLM analysis "
             f"({len(tier1_artifacts['top_paths_sample'])} paths, "
             f"{len(tier1_artifacts['top_keyword_hits'])} hits)"
         )
@@ -84,12 +84,12 @@ class DiscoveryPhase:
             coarse.get("app_folders"), coarse.get("vendor_folders"),
         )
         self._write_progress(
-            "Tiered discovery: Tier 2 scanning selected folders "
+            "Discovery: scanning selected folders "
             f"({len(focused_folders)} folders)"
         )
         tier2_artifacts = RepoDiscoverer.build_tier2_artifacts(target_directory, focused_folders)
         self._write_progress(
-            "Tiered discovery: Tier 2 LLM analysis "
+            "Discovery: LLM analysis "
             f"({len(tier2_artifacts['hits'])} hits, {len(tier2_artifacts['snippets'])} snippets)"
         )
         focused = await self._execute_json(
@@ -163,18 +163,18 @@ class DiscoveryPhase:
             self._validate_application_domains(model_domains, target_directory, domain_roots, vendor_folder_candidates),
         )
         self._write_progress(
-            "Tiered discovery: Tier 3 scanning application folders "
+            "Discovery: scanning application folders "
             f"({len(application_folders)} folders)"
         )
         tier3_artifacts = RepoDiscoverer.build_tier3_artifacts(
             target_directory,
             application_folders,
             progress_callback=lambda folder: self._write_progress(
-                f"Tiered discovery: Tier 3 scanning application folder {folder}"
+                f"Discovery: scanning application folder {folder}"
             ),
         )
         self._write_progress(
-            "Tiered discovery: Tier 3 LLM confirmation "
+            "Discovery: LLM confirmation "
             f"({len(tier3_artifacts['hits'])} hits, {len(tier3_artifacts['snippets'])} snippets)"
         )
         confirmed = await self._execute_json(
@@ -358,8 +358,7 @@ class DiscoveryPhase:
         return config_json
 
     async def _execute_json(self, task_name: str, kwargs: dict, context_id: str) -> dict:
-        self._write_progress(f"Tiered discovery: waiting for {task_name} response")
-        self._finish_progress()
+        self._write_progress(f"Discovery: waiting for {task_name} response")
         response = await self.llm.execute_task(
             task_name=task_name,
             kwargs=kwargs,
