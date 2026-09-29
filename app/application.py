@@ -229,7 +229,14 @@ class ScanApplication:
 
         mcu = config_json.get("mcu_guess", "Unknown MCU")
         vendor = config_json.get("stack_vendor", "Generic AutoSAR")
-        platform_info = f"Hardware: {mcu}, Stack: {vendor}"
+        stack_product = config_json.get("autosar_stack_product")
+        ecu_role = config_json.get("ecu_role")
+        platform_bits = [f"Hardware: {mcu}", f"Stack: {vendor}"]
+        if stack_product and str(stack_product).strip().casefold() not in {"unknown", ""}:
+            platform_bits[-1] += f" ({stack_product})"
+        if ecu_role and str(ecu_role).strip().casefold() not in {"unknown", ""}:
+            platform_bits.append(f"ECU Role: {ecu_role}")
+        platform_info = ", ".join(platform_bits)
         orchestrator = ScanOrchestrator(
             self.context.llm,
             self.context.graph,
@@ -242,11 +249,13 @@ class ScanApplication:
         scan_service = ScanService(orchestrator)
         selected_domain = await self._resolve_interaction(
             self.domain_selector(
-                config_json.get("app_domains")
+                config_json.get("application_domains")
+                or config_json.get("app_domains")
                 or config_json.get("app_domain_guesses")
                 or config_json.get("application_roots", []),
                 request.scan_all,
                 request.target_file,
+                application_roots=config_json.get("application_roots", []),
             )
         )
         if (
@@ -295,6 +304,7 @@ class ScanApplication:
             graph_manager=self.context.graph,
             vendor_folders=config_json.get("vendor_folders", []),
             application_roots=config_json.get("application_roots", []),
+            discovery_context=discovery_context,
         )
         self._active_exploit_phase = exploit_phase
         scan_phase = ScanPhase(

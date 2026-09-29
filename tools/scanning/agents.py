@@ -10,9 +10,8 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_core.messages import AIMessage, ToolMessage
-from app.errors import is_retryable
 from llm.runtime import AgentRuntime
+from tools.agent_loop import agent_loop, build_tool_history
 from tools.scanning.contracts import Finding, TriageResponse, VulnerabilityClass, parse_object
 
 logger = logging.getLogger(__name__)
@@ -100,14 +99,14 @@ def _build_initial_tool_history(
     graph_summary: str,
     target_func: str,
     source_code: str,
-) -> list[Any]:
+) -> list[dict[str, Any]]:
     """Represent initial graph retrieval as completed tool calls in agent history."""
     try:
         payload = json.loads(graph_json) if graph_json else {}
     except json.JSONDecodeError:
         payload = {}
     manifest = payload.get("retrieval_manifest", {})
-    covered_tools = [
+    tool_calls = [
         ("get_function_metadata", {"function_name": target_func}, {
             "status": "found",
             "function": target_func,
@@ -154,26 +153,11 @@ def _build_initial_tool_history(
             "paths": payload.get("sinks", []),
         }),
     ]
-    tool_calls = []
-    tool_messages = []
-    for index, (name, arguments, result) in enumerate(covered_tools, 1):
-        call_id = f"initial-{index}-{name}"
-        tool_calls.append({
-            "name": name,
-            "args": arguments,
-            "id": call_id,
-            "type": "tool_call",
-        })
-        tool_messages.append(ToolMessage(
-            content=json.dumps({
-                **result,
-                "retrieval_manifest": manifest,
-                "already_supplied_in_initial_bundle": True,
-            }, ensure_ascii=False),
-            tool_call_id=call_id,
-            name=name,
-        ))
-    return [AIMessage(content="", tool_calls=tool_calls), *tool_messages]
+    return build_tool_history(
+        tool_calls,
+        id_prefix="initial",
+        extra_result_fields={"retrieval_manifest": manifest},
+    )
 
 async def run_triage(
     triage_agent: TriageAgent,
@@ -187,56 +171,51 @@ async def run_triage(
     discovery_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a triage agent with bounded contract-validation retries."""
-    last_error = "unknown triage failure"
-    retry_directive = directive
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return await triage_agent.run(
-                graph_json,
-                graph_summary,
-                source_code,
-                retry_directive,
-                follow_up_context,
-                target_func,
-                enable_tools=attempt == 1,
-                discovery_context=discovery_context,
-            )
-        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = str(exc)
-            logger.warning(
-                "Triage attempt %d/%d failed for '%s': %s",
-                attempt,
-                max_attempts,
-                target_func,
-                exc,
-            )
-            retry_directive = (
-                f"{directive}\n\nRETRY {attempt}: Your previous response failed contract validation. "
-                "The previous turn returned incomplete or non-final JSON. "
-                "Return the complete final decision envelope through the response text. "
-                "Do not call tools, do not return ran_tools/tool_calls metadata, and return one valid JSON object matching every required triage field. "
-                "Do not omit vulnerability_candidates or investigation_directive when escalating."
-            )
-        except Exception as exc:
-            if not is_retryable(exc):
-                raise
-            last_error = str(exc)
-            logger.warning(
-                "Triage attempt %d/%d failed for '%s' (transient provider error): %s",
-                attempt,
-                max_attempts,
-                target_func,
-                exc,
-            )
 
-    return {
-        "decision": "error",
-        "confidence": 0.0,
-        "reason": "Triage failed after bounded retries.",
-        "error": last_error,
-        "vulnerability_candidates": [],
-        "coverage": {},
-    }
+    async def step(attempt: int, current_directive: str) -> dict[str, Any]:
+        return await triage_agent.run(
+            graph_json,
+            graph_summary,
+            source_code,
+            current_directive,
+            follow_up_context,
+            target_func,
+            enable_tools=attempt == 1,
+            discovery_context=discovery_context,
+        )
+
+    def build_retry_directive(prev_directive: str, attempt: int, error: str) -> str:
+        return (
+            f"{directive}\n\nRETRY {attempt}: Your previous response failed contract validation. "
+            "The previous turn returned incomplete or non-final JSON. "
+            "Return the complete final decision envelope through the response text. "
+            "Do not call tools, do not return ran_tools/tool_calls metadata, and return one valid JSON object matching every required triage field. "
+            "Do not omit vulnerability_candidates or investigation_directive when escalating."
+        )
+
+    def build_fallback(error: str) -> dict[str, Any]:
+        return {
+            "decision": "error",
+            "confidence": 0.0,
+            "reason": "Triage failed after bounded retries.",
+            "error": error,
+            "vulnerability_candidates": [],
+            "coverage": {},
+        }
+
+    result: dict[str, Any] | None = None
+    async for event in agent_loop(
+        context_id=target_func,
+        max_attempts=max_attempts,
+        step=step,
+        initial_directive=directive,
+        build_retry_directive=build_retry_directive,
+        build_fallback=build_fallback,
+        on_attempt_start=None,  # preserve original: no per-attempt log line before the call
+    ):
+        if event.kind == "final":
+            result = event.data
+    return result
 
 
 class DeepScanAgent(ScanAgent):
@@ -304,44 +283,49 @@ class DeepScanAgent(ScanAgent):
         discovery_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retry only contract failures, preserving the same evidence scope."""
-        last_error = "unknown deep-scan failure"
-        for attempt in range(1, max(1, max_attempts) + 1):
-            try:
-                return await self.run(
-                    candidate, graph_json, graph_summary, source_code,
-                    directive, follow_up_context, target_func,
-                    enable_tools=attempt == 1,
-                    discovery_context=discovery_context,
-                )
-            except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
-                last_error = str(exc)
-                logger.warning(
-                    "Deep-scan attempt %d/%d failed for '%s': %s",
-                    attempt, max_attempts, target_func, exc,
-                )
-                follow_up_context = (
-                    f"{follow_up_context}\nRETRY {attempt}: Return one JSON object matching the Finding contract. "
-                    "Your previous response was incomplete or non-final. "
-                    "Return the complete final Finding JSON through the response text. "
-                    "Do not call tools or return tool-call metadata. Use status='unknown' and needs_human_review=true "
-                    "when graph evidence is insufficient."
-                )
-            except Exception as exc:
-                if not is_retryable(exc):
-                    raise
-                last_error = str(exc)
-                logger.warning(
-                    "Deep-scan attempt %d/%d failed for '%s' (transient provider error): %s",
-                    attempt, max_attempts, target_func, exc,
-                )
-        vulnerability_type = candidate.get("vulnerability_class", "other")
-        if vulnerability_type not in {member.value for member in VulnerabilityClass}:
-            vulnerability_type = "other"
-        return Finding(
-            vulnerability_type=vulnerability_type,
-            status="unknown",
-            vulnerability_found=False,
-            details=f"Deep scan returned no valid final response after bounded retries: {last_error}",
-            evidence="No contract-valid model verdict was returned.",
-            needs_human_review=True,
-        ).model_dump(mode="json")
+
+        async def step(attempt: int, current_follow_up: str) -> dict[str, Any]:
+            return await self.run(
+                candidate, graph_json, graph_summary, source_code,
+                directive, current_follow_up, target_func,
+                enable_tools=attempt == 1,
+                discovery_context=discovery_context,
+            )
+
+        def build_retry_directive(prev_follow_up: str, attempt: int, error: str) -> str:
+            # Matches the original: appended onto the *previous* follow_up_context,
+            # unlike TriageAgent's retry text which rebuilds from the fixed original.
+            return (
+                f"{prev_follow_up}\nRETRY {attempt}: Return one JSON object matching the Finding contract. "
+                "Your previous response was incomplete or non-final. "
+                "Return the complete final Finding JSON through the response text. "
+                "Do not call tools or return tool-call metadata. Use status='unknown' and needs_human_review=true "
+                "when graph evidence is insufficient."
+            )
+
+        def build_fallback(error: str) -> dict[str, Any]:
+            vulnerability_type = candidate.get("vulnerability_class", "other")
+            if vulnerability_type not in {member.value for member in VulnerabilityClass}:
+                vulnerability_type = "other"
+            return Finding(
+                vulnerability_type=vulnerability_type,
+                status="unknown",
+                vulnerability_found=False,
+                details=f"Deep scan returned no valid final response after bounded retries: {error}",
+                evidence="No contract-valid model verdict was returned.",
+                needs_human_review=True,
+            ).model_dump(mode="json")
+
+        result: dict[str, Any] | None = None
+        async for event in agent_loop(
+            context_id=target_func,
+            max_attempts=max(1, max_attempts),
+            step=step,
+            initial_directive=follow_up_context,
+            build_retry_directive=build_retry_directive,
+            build_fallback=build_fallback,
+            on_attempt_start=None,  # preserve original: no per-attempt log line before the call
+        ):
+            if event.kind == "final":
+                result = event.data
+        return result

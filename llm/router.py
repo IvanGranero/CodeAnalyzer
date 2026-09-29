@@ -18,9 +18,6 @@ class TieredLLMService:
 
     _LITE_TASKS = frozenset({
         "discovery",
-        "discovery_coarse",
-        "discovery_focused",
-        "discovery_confirm",
         "nl2cypher",
         "repl_action",
         "repl_suggestions",

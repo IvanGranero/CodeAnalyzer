@@ -6,6 +6,7 @@ from typing import Any
 
 from tools.scanning.tools import AnalyzerTools
 from tools.graph.manager import GraphManager
+from tools.agent_loop import AgentEvent, fan_out
 from tools.scanning.contracts import Candidate, ExploitContext, Finding, VulnerabilityClass
 from llm.runtime import AgentRuntime
 from tools.scanning.agents import DeepScanAgent, TriageAgent, run_triage
@@ -272,6 +273,16 @@ class ScanOrchestrator:
         logger.debug("Full Threat Model Directive:\n%s", deep_scan_directive)
         return triage, deep_scan_directive, candidates, incomplete
 
+    async def _candidate_branch(self, candidate, graph_json, graph_summary, source_code, directive, follow_up_context, target_func, discovery_context):
+        """Wrap one candidate's deep scan (with its own bounded retries and
+        error handling, unchanged in _deep_scan_candidate) as a one-event
+        agent stream so fan_out can run it alongside its siblings."""
+        finding = await self._deep_scan_candidate(
+            candidate, graph_json, graph_summary, source_code,
+            directive, follow_up_context, target_func, discovery_context,
+        )
+        yield AgentEvent("final", target_func, finding)
+
     async def _run_deep_scans(
         self,
         context: ScanContext,
@@ -279,8 +290,8 @@ class ScanOrchestrator:
         directive: str,
     ) -> list[dict[str, Any]]:
         """Run one bounded deep scan for each validated triage candidate."""
-        operations = [
-            self._run_candidate(
+        branches = [
+            self._candidate_branch(
                 candidate,
                 context.graph_json,
                 context.graph_summary,
@@ -295,14 +306,17 @@ class ScanOrchestrator:
         await self._progress(
             context.target_function_name,
             "deep scan: analyzing "
-            f"{len(operations)} candidates ("
+            f"{len(branches)} candidates ("
             f"{', '.join(str(candidate.get('vulnerability_class', 'unknown')) for candidate in candidates)}"
             ")",
         )
         scheduler = getattr(self, "candidate_scheduler", None)
-        if scheduler is None:
-            scheduler = CandidateScheduler()
-        return await scheduler.gather(operations)
+        max_candidates = scheduler.max_candidates_per_target if scheduler is not None else 12
+        results: list[dict[str, Any]] | None = None
+        async for event in fan_out(context.target_function_name, branches, max_branches=max_candidates):
+            if event.kind == "final_ordered":
+                results = event.data
+        return results if results is not None else []
 
     def _build_scan_report(
         self,

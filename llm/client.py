@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from app.errors import is_retryable
 logger = logging.getLogger(__name__)
 
 ToolDefinition = Mapping[str, Any]
-ToolHandler = Callable[[str, Mapping[str, Any]], str]
+ToolHandler = Callable[[str, Mapping[str, Any]], str | Awaitable[str]]
 UsageCallback = Callable[[Mapping[str, Any], float], None | Awaitable[None]]
 ChatMessage = Mapping[str, Any]
 
@@ -120,7 +121,7 @@ class LLMClient:
     def _build_request_kwargs(self, settings: Mapping[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self._request_model_name}
 
-        max_tokens = settings.get("max_completion_tokens", settings.get("max_tokens"))
+        max_tokens = settings.get("max_output_tokens")
         if max_tokens is not None:
             key = "max_output_tokens" if self.api_style == "responses" else "max_completion_tokens"
             kwargs[key] = max_tokens
@@ -215,9 +216,11 @@ class LLMClient:
             return {}
 
     @staticmethod
-    def _invoke_tool_handler(handler: ToolHandler, name: str, arguments: Mapping[str, Any]) -> str:
+    async def _invoke_tool_handler(handler: ToolHandler, name: str, arguments: Mapping[str, Any]) -> str:
         try:
             output = handler(name, arguments)
+            if inspect.isawaitable(output):
+                output = await output
             return output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
         except Exception as exc:
             logger.exception("Tool '%s' failed", name)
@@ -288,9 +291,12 @@ class LLMClient:
                     for call in message.tool_calls
                 ],
             })
-            for call in message.tool_calls:
-                args = self._safe_json_loads(call.function.arguments)
-                output = self._invoke_tool_handler(tool_handler, call.function.name, args)
+            parsed_args = [self._safe_json_loads(call.function.arguments) for call in message.tool_calls]
+            outputs = await asyncio.gather(*(
+                self._invoke_tool_handler(tool_handler, call.function.name, args)
+                for call, args in zip(message.tool_calls, parsed_args)
+            ))
+            for call, args, output in zip(message.tool_calls, parsed_args, outputs):
                 conversation.append({"role": "tool", "tool_call_id": call.id, "content": output})
                 tool_actions.append({
                     "name": call.function.name,
@@ -371,9 +377,12 @@ class LLMClient:
                 )
 
             current_input = []
-            for call in function_calls:
-                args = self._safe_json_loads(call.arguments)
-                output = self._invoke_tool_handler(tool_handler, call.name, args)
+            parsed_args = [self._safe_json_loads(call.arguments) for call in function_calls]
+            outputs = await asyncio.gather(*(
+                self._invoke_tool_handler(tool_handler, call.name, args)
+                for call, args in zip(function_calls, parsed_args)
+            ))
+            for call, args, output in zip(function_calls, parsed_args, outputs):
                 current_input.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
                 tool_actions.append({
                     "name": call.name,
@@ -519,11 +528,11 @@ class LLMClient:
             # The tool result is the useful output.
             text = "{}"
         if not isinstance(text, str) or not text.strip():
-            self._audit_log(messages, "", context_id, tool_actions, audit_metadata, response_obj=response_obj)
+            self._audit_log(messages, "", context_id, tool_actions, audit_metadata, response_obj=response_obj, request_kwargs=request_kwargs)
             raise EmptyLLMResponseError(f"empty_response: {self.model_name} returned no assistant content")
 
         usage = self._normalize_usage(getattr(response_obj, "usage", None))
-        self._audit_log(messages, text, context_id, tool_actions, audit_metadata, response_obj=response_obj)
+        self._audit_log(messages, text, context_id, tool_actions, audit_metadata, response_obj=response_obj, request_kwargs=request_kwargs)
         return text, usage
 
     def _audit_log(
@@ -534,6 +543,7 @@ class LLMClient:
         tool_actions: Sequence[Any],
         audit_metadata: Mapping[str, Any] | None,
         response_obj: Any = None,
+        request_kwargs: Mapping[str, Any] | None = None,        
     ) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         context = context_id or "unknown_target"
@@ -552,6 +562,11 @@ class LLMClient:
             "=== RAW OUTPUT (ASSISTANT TEXT) ===\n"
             f"{response_text}\n\n"
         )
+        if request_kwargs:
+            log_content += (
+                "=== REQUEST SETTINGS ===\n"
+                f"{json.dumps(_jsonable(dict(request_kwargs)), indent=2, ensure_ascii=False)}\n\n"
+            )
         if response_obj is not None:
             log_content += (
                 "=== RAW RESPONSE OBJECT ===\n"

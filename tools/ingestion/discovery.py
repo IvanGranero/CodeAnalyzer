@@ -1,5 +1,8 @@
+import asyncio
 import os
+import json
 import logging
+import threading
 import fnmatch
 import re
 from collections import Counter, defaultdict
@@ -434,3 +437,283 @@ class RepoDiscoverer:
             ),
             key=str.casefold,
         )
+
+    # ------------------------------------------------------------------
+    # Agent-callable tool primitives.
+    #
+    # These replace the three fixed, hand-tuned regex sweeps
+    # (build_tier1/2/3_artifacts) with general-purpose primitives an
+    # LLM agent drives itself: it starts from a 2-level tree and decides
+    # what to look at next, the same way a human (or Copilot, per the
+    # user's comparison) would explore an unfamiliar repository.
+    #
+    # Every method here takes target_dir as its first argument and
+    # resolves all paths against it, refusing anything that would escape
+    # the repository root -- this is the same containment check
+    # `_iter_files` already used for folder-scoped scanning, just made
+    # explicit and reusable for a single arbitrary path.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_within_root(target_dir: str, relative_path: str) -> Path | None:
+        root = Path(target_dir).resolve()
+        candidate = (root / str(relative_path or "").strip().strip("/\\")).resolve()
+        if candidate == root or root in candidate.parents:
+            return candidate
+        return None
+
+    @classmethod
+    def list_directory(
+        cls, target_dir: str, relative_path: str = "", max_depth: int = 1, max_entries: int = 300,
+    ) -> dict:
+        """List subdirectories and files under one path, to a bounded depth.
+
+        This is the agent's primary exploration tool: it lets it descend
+        into any directory named in the initial 2-level tree (or
+        discovered via a later list_directory/grep call) without ever
+        re-walking the whole repository the way tier1 did.
+        """
+        base = cls._resolve_within_root(target_dir, relative_path)
+        if base is None or not base.is_dir():
+            return {"error": f"not a directory inside the repository: {relative_path!r}"}
+        root = Path(target_dir).resolve()
+        max_depth = max(1, min(int(max_depth), 4))
+        entries: list[dict] = []
+        base_depth = str(base.relative_to(root)).count(os.sep) if base != root else -1
+        for path in sorted(base.rglob("*"), key=lambda item: item.relative_to(root).as_posix().casefold()):
+            relative = path.relative_to(root).as_posix()
+            depth = relative.count("/") - (str(relative_path).strip("/\\").count("/") if relative_path else -1)
+            if depth > max_depth:
+                continue
+            entries.append({
+                "path": relative,
+                "type": "dir" if path.is_dir() else "file",
+            })
+            if len(entries) >= max_entries:
+                entries.append({"truncated": True})
+                break
+        return {"path": relative_path or ".", "entries": entries}
+
+    @classmethod
+    def read_file(
+        cls, target_dir: str, relative_path: str, max_lines: int = 200, start_line: int = 1,
+    ) -> dict:
+        """Read a bounded window of one file's lines, for confirmatory evidence."""
+        path = cls._resolve_within_root(target_dir, relative_path)
+        if path is None or not path.is_file():
+            return {"error": f"not a file inside the repository: {relative_path!r}"}
+        if path.suffix.casefold() not in cls.TEXT_SCAN_SUFFIXES and path.name not in {"CMakeLists.txt", "Makefile"}:
+            return {"error": f"unsupported file type for reading: {path.suffix!r}"}
+        start_line = max(1, int(start_line))
+        max_lines = max(1, min(int(max_lines), 500))
+        lines: list[str] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as stream:
+                for line_number, line in enumerate(stream, 1):
+                    if line_number < start_line:
+                        continue
+                    if len(lines) >= max_lines:
+                        break
+                    lines.append(line.rstrip("\n")[:500])
+        except OSError as exc:
+            return {"error": f"could not read file: {exc}"}
+        return {"path": relative_path, "start_line": start_line, "lines": lines}
+
+    @classmethod
+    def grep_repository(
+        cls, target_dir: str, pattern: str, folders: list[str] | None = None, max_hits: int = 40,
+        should_stop=None,
+    ) -> dict:
+        """Search for a regex across the repository (or a folder subset),
+        returning file:line:text hits. Replaces the fixed TIER1/2/3
+        regexes with a pattern the agent itself chooses."""
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return {"error": f"invalid regex: {exc}"}
+        root = Path(target_dir).resolve()
+        max_hits = max(1, min(int(max_hits), 100))
+        hits: list[str] = []
+        for path in cls._iter_files(root, folders):
+            if should_stop is not None and should_stop():
+                return {"pattern": pattern, "hits": hits, "truncated": True, "stopped": "timeout"}
+            for line_number, line in cls._read_lines(path):
+                if compiled.search(line):
+                    relative = path.relative_to(root).as_posix()
+                    hits.append(f"{relative}:{line_number}:{line.strip()[:240]}")
+                    if len(hits) >= max_hits:
+                        return {"pattern": pattern, "hits": hits, "truncated": True}
+        return {"pattern": pattern, "hits": hits, "truncated": False}
+
+
+class DiscoveryToolRegistry:
+    """Tool definitions + dispatch for the single discovery agent loop.
+
+    Matches the ToolDefinition/ToolHandler contract already used by
+    tools/scanning/agents.py and llm/client.py: .definitions() returns
+    OpenAI-style {"type": "function", "function": {...}} specs, and
+    .call(name, arguments) -> str is a synchronous ToolHandler (the
+    filesystem operations here are all local and cheap, so no async
+    is needed even though the agent loop itself is async).
+    """
+
+    def __init__(
+        self, target_dir: str, max_concurrency: int = 4, timeout_seconds: float = 90.0,
+    ) -> None:
+        self.target_dir = target_dir
+        self.timeout_seconds = timeout_seconds
+        # Bounds simultaneous disk-heavy scans when the model emits several
+        # tool calls in one turn (client.py runs a turn's calls concurrently).
+        self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    def definitions(self) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_directory",
+                    "description": (
+                        "List subdirectories and files under one repository-relative path, "
+                        "up to a bounded depth. Use this to descend into folders named in the "
+                        "initial tree or surfaced by grep_repository."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "relative_path": {"type": "string", "description": "Repository-relative folder path, or '' for the root."},
+                            "max_depth": {"type": "integer", "description": "How many levels below relative_path to list.", "minimum": 1, "maximum": 4},
+                        },
+                        "required": ["relative_path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": (
+                        "Read a bounded window of lines from one source/config file, for "
+                        "confirmatory evidence (vendor headers, ECUC definitions, platform tokens)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "relative_path": {"type": "string", "description": "Repository-relative file path."},
+                            "start_line": {"type": "integer", "minimum": 1},
+                            "max_lines": {"type": "integer", "minimum": 1, "maximum": 500},
+                        },
+                        "required": ["relative_path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "grep_repository",
+                    "description": (
+                        "Search for a case-insensitive regex across the repository, or a subset "
+                        "of folders, returning matching file:line:text hits. Use this instead of "
+                        "reading whole files when you just need to confirm a keyword, module name, "
+                        "vendor string, or MCU family token exists somewhere."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "description": "A regular expression."},
+                            "folders": {
+                                "type": "array", "items": {"type": "string"},
+                                "description": "Optional repository-relative folders to restrict the search to. Omit to search the whole repository.",
+                            },
+                            "max_hits": {"type": "integer", "minimum": 1, "maximum": 100},
+                        },
+                        "required": ["pattern"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_config_files",
+                    "description": (
+                        "Find configuration-file candidates (ARXML, OIL, linker scripts, build "
+                        "files, etc.) by extension and filename pattern across the repository."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "extensions": {"type": "array", "items": {"type": "string"}},
+                            "filename_patterns": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    async def call(self, name: str, arguments) -> str:
+        """Async ToolHandler: the blocking filesystem work runs in a worker
+        thread so it never stalls the event loop, and concurrent calls from
+        the same model turn overlap (bounded by the semaphore)."""
+        arguments = dict(arguments or {})
+        cancel = threading.Event()
+        async with self._semaphore:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(self._dispatch, name, arguments, cancel),
+                    timeout=self.timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                cancel.set()
+                result = {
+                    "error": (
+                        f"tool '{name}' timed out after {self.timeout_seconds:.0f}s; "
+                        "narrow the query (restrict folders, use a more specific pattern) and retry"
+                    )
+                }
+            except asyncio.CancelledError:
+                cancel.set()
+                raise
+        return json.dumps(result, ensure_ascii=False)
+
+    @staticmethod
+    def _arg(arguments: dict, key: str, default):
+        # Strict tool schemas make optional params nullable, so the model may
+        # send an explicit null instead of omitting the key.
+        value = arguments.get(key)
+        return default if value is None else value
+
+    def _dispatch(self, name: str, arguments: dict, cancel: threading.Event) -> dict:
+        arg = self._arg
+        if name == "list_directory":
+            return RepoDiscoverer.list_directory(
+                self.target_dir,
+                relative_path=arg(arguments, "relative_path", ""),
+                max_depth=arg(arguments, "max_depth", 1),
+            )
+        if name == "read_file":
+            return RepoDiscoverer.read_file(
+                self.target_dir,
+                relative_path=arg(arguments, "relative_path", ""),
+                start_line=arg(arguments, "start_line", 1),
+                max_lines=arg(arguments, "max_lines", 200),
+            )
+        if name == "grep_repository":
+            return RepoDiscoverer.grep_repository(
+                self.target_dir,
+                pattern=arg(arguments, "pattern", ""),
+                folders=arguments.get("folders"),
+                max_hits=arg(arguments, "max_hits", 40),
+                should_stop=cancel.is_set,
+            )
+        if name == "search_config_files":
+            return {
+                "config_files": RepoDiscoverer.search_config_files(
+                    self.target_dir,
+                    extensions=arguments.get("extensions"),
+                    filename_patterns=arguments.get("filename_patterns"),
+                )
+            }
+        return {"error": f"unknown tool: {name!r}"}

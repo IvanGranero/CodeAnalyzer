@@ -9,8 +9,6 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-
 from app.context import AppContext
 from app.errors import format_repl_error, log_error_quietly
 from app.phases.exploit_phase import ExploitPhase
@@ -25,6 +23,78 @@ from tools.scanning.tool_registry import ReadOnlyToolRegistry
 from tools.scanning.tools import AnalyzerTools
 
 logger = logging.getLogger(__name__)
+
+
+def _api_style_for(llm: Any, _depth: int = 0) -> str:
+    """Best-effort resolution of the api_style the REPL's LLM calls will use, so
+    preloaded tool-call history is built in the right shape. Falls back to
+    "chat_completions" (the client's own default) if it can't be determined.
+    Handles context.llm being a raw LLMService, an AgentRuntime wrapping one
+    (see llm/runtime.py, which exposes the service as .llm, not .client), or a
+    tiered router exposing .services. Adjust this if context.llm resolves its
+    client some other way for 'repl_action'."""
+    if _depth > 3:
+        return "chat_completions"
+    client = getattr(llm, "client", None)
+    if client is not None and hasattr(client, "api_style"):
+        return client.api_style
+    services = getattr(llm, "services", None)
+    if services:
+        for service in services.values():
+            client = getattr(service, "client", None)
+            if client is not None and hasattr(client, "api_style"):
+                return client.api_style
+    wrapped = getattr(llm, "llm", None)
+    if wrapped is not None and wrapped is not llm:
+        return _api_style_for(wrapped, _depth + 1)
+    return "chat_completions"
+
+
+def _render_messages(history: list[dict[str, Any]], api_style: str) -> list[dict[str, Any]]:
+    """Convert the REPL's neutral message history into either chat_completions
+    or responses-style preloaded messages, matching client.py's expectations."""
+    rendered: list[dict[str, Any]] = []
+    for entry in history:
+        kind = entry["kind"]
+        if kind == "user":
+            rendered.append({"role": "user", "content": entry["text"]})
+        elif kind == "assistant":
+            rendered.append({"role": "assistant", "content": entry["text"]})
+        elif kind == "tool_call":
+            arguments_json = json.dumps(entry["arguments"], ensure_ascii=False)
+            if api_style == "responses":
+                rendered.append({
+                    "type": "function_call",
+                    "call_id": entry["id"],
+                    "name": entry["name"],
+                    "arguments": arguments_json,
+                })
+            else:
+                rendered.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": entry["id"],
+                        "type": "function",
+                        "function": {"name": entry["name"], "arguments": arguments_json},
+                    }],
+                })
+        elif kind == "tool_result":
+            if api_style == "responses":
+                rendered.append({
+                    "type": "function_call_output",
+                    "call_id": entry["id"],
+                    "output": entry["content"],
+                })
+            else:
+                rendered.append({
+                    "role": "tool",
+                    "tool_call_id": entry["id"],
+                    "content": entry["content"],
+                })
+        else:
+            raise ValueError(f"Unknown REPL message history entry kind: {kind!r}")
+    return rendered
 
 
 REPL_ACTION_TOOLS = [
@@ -329,7 +399,7 @@ class ApplicationRepl:
         handler(action.get("arguments", {}))
         if action["name"] != "query_graph":
             self._message_history.append(
-                AIMessage(content=f"Completed REPL action: {action['name']}.")
+                {"kind": "assistant", "text": f"Completed REPL action: {action['name']}."}
             )
         self._trim_message_history()
 
@@ -339,7 +409,7 @@ class ApplicationRepl:
             self._pending_action = None
             self._pending_tool_call = None
             self._last_router_output = ""
-            self._message_history.append(HumanMessage(content=text))
+            self._message_history.append({"kind": "user", "text": text})
             response = await self.context.llm.execute_task(
                 "repl_action",
                 {
@@ -349,7 +419,9 @@ class ApplicationRepl:
                 context_id="repl",
                 tools=REPL_ACTION_TOOLS + self.tool_registry.definitions(),
                 tool_handler=self._repl_tool_call,
-                preloaded_messages=self._message_history[:-1],
+                preloaded_messages=_render_messages(
+                    self._message_history[:-1], _api_style_for(self.context.llm)
+                ),
             )
         finally:
             self._set_status("Analyzing...")
@@ -359,22 +431,15 @@ class ApplicationRepl:
         if self._pending_tool_call is not None:
             call = self._pending_tool_call
             self._message_history.append(
-                AIMessage(
-                    content="",
-                    tool_calls=[{
-                        "name": call["name"],
-                        "args": call["args"],
-                        "id": call["id"],
-                        "type": "tool_call",
-                    }],
-                )
+                {"kind": "tool_call", "id": call["id"], "name": call["name"], "arguments": call["args"]}
             )
             self._message_history.append(
-                ToolMessage(
-                    content=json.dumps({"queued": call["name"]}),
-                    tool_call_id=call["id"],
-                    name=call["name"],
-                )
+                {
+                    "kind": "tool_result",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "content": json.dumps({"queued": call["name"]}),
+                }
             )
         if (
             self._pending_action["name"] == "query_graph"
@@ -474,7 +539,7 @@ class ApplicationRepl:
         print(answer)
         self._conversation_history.append({"user": question, "assistant": answer})
         self._conversation_history = self._conversation_history[-6:]
-        self._message_history.append(AIMessage(content=answer))
+        self._message_history.append({"kind": "assistant", "text": answer})
         self._trim_message_history()
         if result.get("status") == "success":
             graph = result.get("graph", {})
@@ -508,7 +573,7 @@ class ApplicationRepl:
         human_indexes = [
             index
             for index, message in enumerate(self._message_history)
-            if isinstance(message, HumanMessage)
+            if message["kind"] == "user"
         ]
         if len(human_indexes) <= self._MESSAGE_HISTORY_TURNS:
             return

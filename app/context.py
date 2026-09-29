@@ -19,9 +19,23 @@ class AppContext:
 
 def build_discovery_context(discovery: Mapping[str, Any]) -> dict[str, Any]:
     """Return bounded repository-level discovery facts for downstream agents."""
+
     def values(value: Any, limit: int = 24) -> list[str]:
         if isinstance(value, dict):
-            value = value.get("items", value.get("names", []))
+            if "items" in value or "names" in value:
+                value = value.get("items", value.get("names", []))
+            elif "value" in value:
+                # Single {value, evidence, confidence} classification (diagnostics/hsm/
+                # comms/swc/rte) rather than a list-of-items shape. Surface the value
+                # itself (and any cited evidence) instead of falling through to [].
+                label = str(value.get("value", "")).strip()
+                if not label or label.casefold() in {"unknown", "none", "null"}:
+                    return []
+                evidence = value.get("evidence")
+                value = [label, *(str(e).strip() for e in evidence if str(e).strip())] \
+                    if isinstance(evidence, list) else [label]
+            else:
+                value = []
         if not isinstance(value, list):
             return []
         result = []
@@ -36,6 +50,26 @@ def build_discovery_context(discovery: Mapping[str, Any]) -> dict[str, Any]:
         if len(result) > limit:
             return [*result[:limit], f"... (+{len(result) - limit} more)"]
         return result
+
+    def domain_scope(limit: int = 24) -> list[str]:
+        """Prefer the evidenced domain groupings; fall back to the flat folder list
+        only when no grouped structure is present."""
+        groups = discovery.get("application_domains")
+        if isinstance(groups, list) and groups and all(
+            isinstance(group, dict) and isinstance(group.get("folders"), list) for group in groups
+        ):
+            summaries = []
+            for group in groups:
+                name = str(group.get("name", "")).strip()
+                folders = [str(f).strip() for f in group.get("folders", []) if str(f).strip()]
+                if not folders:
+                    continue
+                summaries.append(f"{name}: {', '.join(folders)}" if name else ", ".join(folders))
+            if summaries:
+                if len(summaries) > limit:
+                    return [*summaries[:limit], f"... (+{len(summaries) - limit} more)"]
+                return summaries
+        return values(discovery.get("app_domain_guesses"))
 
     platform = {
         name: discovery[source]
@@ -65,13 +99,16 @@ def build_discovery_context(discovery: Mapping[str, Any]) -> dict[str, Any]:
         name: items
         for name, source in (
             ("application_roots", "application_roots"),
-            ("application_domains", "app_domain_guesses"),
             ("vendor_folders", "vendor_folders"),
             ("configuration_extensions", "config_file_extensions"),
             ("configuration_filename_patterns", "config_filename_patterns"),
         )
         if (items := values(discovery.get(source)))
     }
+    domain_items = domain_scope()
+    if domain_items:
+        scope["application_domains"] = domain_items
+
     manifest = discovery.get("repository_manifest")
     repository = {}
     if isinstance(manifest, dict):
@@ -80,9 +117,9 @@ def build_discovery_context(discovery: Mapping[str, Any]) -> dict[str, Any]:
             for key in ("root", "directory_count", "file_count")
             if manifest.get(key) is not None
         }
-        top_level_directories = values(manifest.get("top_level_directories"))
-        if top_level_directories:
-            repository["top_level_directories"] = top_level_directories
+    top_level_directories = values(manifest.get("top_level_directories")) if isinstance(manifest, dict) else []
+    if top_level_directories:
+        repository["top_level_directories"] = top_level_directories
     repository_name = discovery.get("repository_name")
     if repository_name and "root" not in repository:
         repository["root"] = repository_name

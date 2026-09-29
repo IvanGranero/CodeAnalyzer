@@ -4,8 +4,9 @@ import os
 import hashlib
 import sys
 
-from tools.ingestion.discovery import RepoDiscoverer
+from tools.ingestion.discovery import RepoDiscoverer, DiscoveryToolRegistry
 from llm.service import LLMService
+from tools.agent_loop import agent_loop
 from tools.scanning.response_parser import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ class DiscoveryPhase:
         "ecu_role", "device_guess", "stack_vendor", "stack_vendor_guess",
         "modules", "config_structures", "diagnostics", "hsm", "comms", "swc", "rte",
         "vendor_folders", "likely_vendor_folders", "application_roots",
-        "application_root_guesses", "app_domains", "app_domain_guesses",
+        "application_root_guesses", "application_domains", "app_domains", "app_domain_guesses",
         "confidence", "confidence_scores",
     )
 
@@ -60,151 +61,15 @@ class DiscoveryPhase:
         logger.info("--- PHASE 1: Starting architectural discovery ---")
         self._write_progress("Discovery: building repository manifest")
         manifest = RepoDiscoverer.build_repo_manifest(target_directory)
-        self._write_progress("Discovery: scanning files")
-        tier1_artifacts = RepoDiscoverer.build_tier1_artifacts(
-            target_directory,
-            progress_callback=lambda count, path: self._write_progress(
-                f"Discovery: scanning files ({count}) {path}"
-            ),
+        self._write_progress("Discovery: LLM agent exploring repository")
+        initial_tree = RepoDiscoverer.generate_directory_tree(target_directory, max_depth=2)
+        discovered = await self._run_discovery_agent(
+            target_directory, manifest, initial_tree,
         )
-        directory_inventory = RepoDiscoverer.build_directory_inventory(manifest)
-        tier1_artifacts["directory_inventory"] = directory_inventory
-        self._write_progress(
-            "Discovery: LLM analysis "
-            f"({len(tier1_artifacts['top_paths_sample'])} paths, "
-            f"{len(tier1_artifacts['top_keyword_hits'])} hits)"
-        )
-        coarse = await self._execute_json(
-            "discovery_coarse",
-            {"artifacts": json.dumps(tier1_artifacts, sort_keys=True)},
-            "discovery-coarse",
-        )
-        focused_folders = self._list_values(
-            coarse.get("interesting_folders"), coarse.get("next_dirs"),
-            coarse.get("app_folders"), coarse.get("vendor_folders"),
-        )
-        self._write_progress(
-            "Discovery: scanning selected folders "
-            f"({len(focused_folders)} folders)"
-        )
-        tier2_artifacts = RepoDiscoverer.build_tier2_artifacts(target_directory, focused_folders)
-        self._write_progress(
-            "Discovery: LLM analysis "
-            f"({len(tier2_artifacts['hits'])} hits, {len(tier2_artifacts['snippets'])} snippets)"
-        )
-        focused = await self._execute_json(
-            "discovery_focused",
-            {
-                "artifacts": json.dumps(tier2_artifacts, sort_keys=True),
-                "directory_inventory": json.dumps(directory_inventory, sort_keys=True),
-                "previous_guesses": json.dumps(coarse, sort_keys=True),
-            },
-            "discovery-focused",
-        )
-        vendor_folder_candidates = self._list_values(
-            focused.get("vendor_folders"), coarse.get("vendor_folders")
-        )
-        application_folders = self._list_values(focused.get("app_folders"))
-        if not application_folders:
-            application_folders = self._list_values(focused.get("application_folders"))
-        if not application_folders:
-            application_folders = focused_folders
-        inferred_roots = self._discover_application_roots(
-            target_directory, manifest, vendor_folder_candidates
-        )
-        model_roots = self._list_values(
-            focused.get("application_roots"), focused.get("application_root_guesses"),
-            coarse.get("application_roots"), coarse.get("application_root_guesses"),
-        )
-        if not model_roots:
-            model_roots = self._list_values(coarse.get("app_folders"))
-        conventional_roots = [
-            root for root in inferred_roots
-            if root.casefold() in {"app", "application", "src", "source", "swc", "swcs"}
-        ]
-        root_guesses = self._merge_folder_values(
-            model_roots,
-            conventional_roots if model_roots else inferred_roots,
-        )
-        coarse_roots = self._filter_application_roots(
-            root_guesses, vendor_folder_candidates, target_directory
-        )
-        application_folders = self._merge_folder_values(
-            application_folders,
-            coarse_roots if not self._has_conventional_application_root(coarse_roots) else self._discover_application_folders(
-                target_directory,
-                coarse_roots,
-                vendor_folder_candidates,
-            ),
-        )
-        application_folders = self._filter_application_folders(
-            application_folders,
-            vendor_folder_candidates,
-            target_directory,
-            coarse_roots,
-        )
-        domain_roots = coarse_roots
-        if self._has_conventional_application_root(domain_roots):
-            structural_domains = self._discover_application_domains(
-                target_directory,
-                domain_roots,
-                vendor_folder_candidates,
-            )
-        else:
-            structural_domains = self._merge_folder_values(
-                [folder.replace("\\", "/").split("/", 1)[0] for folder in domain_roots]
-            )
-        model_domains = self._list_values(
-            focused.get("application_domains"), focused.get("app_domain_guesses"), focused.get("app_domains"),
-            coarse.get("application_domains"), coarse.get("app_domain_guesses"), coarse.get("app_domains"),
-        )
-        application_domain_candidates = self._merge_folder_values(
-            structural_domains,
-            self._validate_application_domains(model_domains, target_directory, domain_roots, vendor_folder_candidates),
-        )
-        self._write_progress(
-            "Discovery: scanning application folders "
-            f"({len(application_folders)} folders)"
-        )
-        tier3_artifacts = RepoDiscoverer.build_tier3_artifacts(
-            target_directory,
-            application_folders,
-            progress_callback=lambda folder: self._write_progress(
-                f"Discovery: scanning application folder {folder}"
-            ),
-        )
-        self._write_progress(
-            "Discovery: LLM confirmation "
-            f"({len(tier3_artifacts['hits'])} hits, {len(tier3_artifacts['snippets'])} snippets)"
-        )
-        confirmed = await self._execute_json(
-            "discovery_confirm",
-            {
-                "artifacts": json.dumps(tier3_artifacts, sort_keys=True),
-                "previous_guesses": json.dumps(
-                    {
-                        **coarse,
-                        **focused,
-                        "application_domain_candidates": application_domain_candidates,
-                    },
-                    sort_keys=True,
-                ),
-            },
-            "discovery-confirm",
-        )
-        config_json = {**coarse, **focused, **confirmed}
-        for field in ("modules", "config_structures", "diagnostics", "hsm", "comms", "swc"):
-            config_json[field] = self._merge_evidence_lists(
-                coarse.get(field), focused.get(field), confirmed.get(field)
-            )
-        config_json["modules"] = self._filter_module_names(config_json["modules"])
-        if not config_json["modules"]:
-            config_json["modules"] = self._filter_module_names(tier2_artifacts.get("matched_terms", []))
-        if not config_json["config_structures"]:
-            config_json["config_structures"] = tier2_artifacts.get("config_terms", [])
+        config_json = dict(discovered)
+        config_json["modules"] = self._filter_module_names(config_json.get("modules", []))
         config_json["mcu"] = next(
-            (value for result in (confirmed, focused, coarse)
-             for value in (result.get("mcu"), result.get("mcu_candidates"))
+            (value for value in (config_json.get("mcu"), config_json.get("mcu_candidates"))
              if self._first_named_value(value)),
             config_json.get("mcu"),
         )
@@ -268,24 +133,29 @@ class DiscoveryPhase:
             config_json.get("application_folders"), config_json.get("vendor_folders", []), target_directory,
             config_json.get("application_roots", ["app"]),
         )
-        model_domains = self._list_values(
+        domain_roots = config_json.get("application_roots", [])
+        model_domain_groups = self._extract_domain_groups(
             config_json.get("application_domains"),
             config_json.get("app_domain_guesses"),
             config_json.get("app_domains"),
         )
-        derived_domains = self._derive_app_domains(
-            {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+        validated_domain_groups = self._validate_domain_groups(
+            model_domain_groups, domain_roots, config_json["vendor_folders"], target_directory,
         )
-        domain_roots = config_json.get("application_roots", [])
-        config_json["app_domain_guesses"] = self._merge_folder_values(
-            self._validate_application_domains(
-                model_domains,
-                target_directory,
-                domain_roots,
-                config_json["vendor_folders"],
-            ),
-            derived_domains,
-        )
+        if validated_domain_groups:
+            config_json["application_domains"] = validated_domain_groups
+            config_json["app_domain_guesses"] = self._merge_folder_values(
+                *[group["folders"] for group in validated_domain_groups]
+            )
+        else:
+            derived_domains = self._derive_app_domains(
+                {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+            )
+            config_json["app_domain_guesses"] = self._merge_folder_values(derived_domains)
+            config_json["application_domains"] = [
+                {"name": domain, "folders": [domain], "evidence": [], "confidence": 0.0}
+                for domain in config_json["app_domain_guesses"]
+            ]
         if not self._has_conventional_application_root(domain_roots):
             config_json["app_domain_guesses"] = self._merge_folder_values(
                 config_json["app_domain_guesses"], domain_roots
@@ -357,18 +227,61 @@ class DiscoveryPhase:
             logger.info(f"Discovery found {len(found_configs)} system configuration files.")
         return config_json
 
-    async def _execute_json(self, task_name: str, kwargs: dict, context_id: str) -> dict:
-        self._write_progress(f"Discovery: waiting for {task_name} response")
-        response = await self.llm.execute_task(
-            task_name=task_name,
-            kwargs=kwargs,
-            context_id=context_id,
-        )
-        try:
+    async def _run_discovery_agent(
+        self, target_directory: str, manifest: dict, initial_tree: str,
+    ) -> dict:
+        """Run one tool-calling agent loop that explores the repository itself
+        (list_directory / read_file / grep_repository / search_config_files)
+        starting from a 2-level tree, replacing the old fixed coarse -> focused
+        -> confirm regex sweeps. Bounded contract-validation retries are
+        provided by agent_loop, exactly like tools/scanning/agents.py's
+        triage/deep-scan agents.
+        """
+        registry = DiscoveryToolRegistry(target_directory)
+
+        async def step(attempt: int, directive: str) -> dict:
+            response = await self.llm.execute_task(
+                task_name="discovery_agent",
+                kwargs={
+                    "repo_root_name": manifest.get("root", ""),
+                    "initial_tree": initial_tree,
+                    "directive": directive,
+                },
+                context_id="discovery-agent",
+                tools=registry.definitions(),
+                tool_handler=registry.call,
+            )
             return extract_json_object(response)
-        except ValueError as exc:
-            logger.error("Discovery task %s did not return valid JSON", task_name)
-            raise ValueError(f"Discovery task {task_name} did not return valid JSON") from exc
+
+        def build_retry_directive(prev_directive: str, attempt: int, error: str) -> str:
+            return (
+                f"RETRY {attempt}: Your previous response failed contract validation ({error}). "
+                "Return one complete, final JSON object (no markdown fences, no prose) with every "
+                "required discovery field. Do not describe further tool calls in the response text "
+                "-- either call a tool, or return the final JSON."
+            )
+
+        def build_fallback(error: str) -> dict:
+            logger.error("Discovery agent failed after bounded retries: %s", error)
+            return {
+                "mcu": "Unknown", "silicon_vendor": "Unknown", "autosar_stack_vendor": "Unknown",
+                "autosar_stack_product": "Unknown", "ecu_role": "Unknown", "modules": [],
+                "application_roots": [], "application_domains": [], "vendor_folders": [],
+                "app_folders": [], "configs": {}, "confidence": 0.0, "error": error,
+            }
+
+        result: dict | None = None
+        async for event in agent_loop(
+            context_id="discovery-agent",
+            max_attempts=3,
+            step=step,
+            build_retry_directive=build_retry_directive,
+            build_fallback=build_fallback,
+        ):
+            if event.kind != "final":
+                self._write_progress(f"[{event.kind}] {event.data}")
+            else:
+                return event.data
 
     @staticmethod
     def _write_progress(message: str) -> None:
@@ -425,10 +338,23 @@ class DiscoveryPhase:
                     seen.add(name_key)
         return merged
 
+    @classmethod
+    def _merge_named_field(cls, *values, default_value: str = "Unknown") -> dict:
+        """Pick the first tier's {value, evidence, confidence}-style object that isn't an
+        empty Unknown placeholder, preferring the most-confirmed tier; used for fields like
+        diagnostics/hsm/comms/swc that are single classifications, not evidence lists."""
+        candidates = [value for value in values if isinstance(value, dict)]
+        for value in candidates:
+            if cls._first_named_value(value.get("value"), value.get("name")):
+                return value
+        if candidates:
+            return candidates[0]
+        return {"value": default_value, "evidence": [], "confidence": 0.0}
+
     @staticmethod
     def _filter_module_names(values) -> list[str]:
         excluded = {
-            "app", "application", "microsar", "rta-os", "mcal", "cdd",
+            "app", "application", "microsar", "rta-os", "cdd",
             "bsw", "vendor", "gendata", "output", "selftest", "avb",
         }
         return [
@@ -550,6 +476,76 @@ class DiscoveryPhase:
             if match is not None:
                 validated.append(match)
         return cls._merge_folder_values(validated)
+
+    @classmethod
+    def _extract_domain_groups(cls, *sources) -> list[dict]:
+        """Normalize application_domains-shaped inputs into {name, folders, evidence, confidence}
+        groups without collapsing a domain to its title string the way _list_values would
+        (item.get("name") on a domain object returns the domain's title, not its member
+        folders -- that is what previously caused every model-proposed domain to be dropped).
+
+        Sources are processed in order and a folder already claimed by an earlier group is
+        never re-added as its own standalone domain -- this matters because callers pass the
+        rich `application_domains` groups *and* the already-flattened `app_domain_guesses`/
+        `app_domains` lists together (the flat lists are derived FROM the groups), and without
+        this check every grouped folder would reappear a second time as a one-folder domain."""
+        groups = []
+        seen_names = set()
+        seen_folders = set()
+        for source in sources:
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                if isinstance(item, dict) and isinstance(item.get("folders"), list):
+                    folders = [f for f in cls._list_values(item.get("folders")) if f.casefold() not in seen_folders]
+                    if not folders:
+                        continue
+                    name = str(item.get("name") or item.get("domain") or "").strip() or folders[0]
+                    key = name.casefold()
+                    if key in seen_names:
+                        continue
+                    seen_names.add(key)
+                    seen_folders.update(f.casefold() for f in folders)
+                    evidence = item.get("evidence")
+                    confidence = item.get("confidence")
+                    groups.append({
+                        "name": name,
+                        "folders": folders,
+                        "evidence": evidence if isinstance(evidence, list) else [],
+                        "confidence": confidence if isinstance(confidence, (int, float)) else 0.0,
+                    })
+                else:
+                    # Legacy shape: a bare folder name/path with no explicit grouping.
+                    folder = next(iter(cls._list_values([item])), "")
+                    if not folder:
+                        continue
+                    key = folder.casefold()
+                    if key in seen_names or key in seen_folders:
+                        continue
+                    seen_names.add(key)
+                    seen_folders.add(key)
+                    groups.append({"name": folder, "folders": [folder], "evidence": [], "confidence": 0.0})
+        return groups
+
+    @classmethod
+    def _validate_domain_groups(
+        cls, groups: list[dict], roots, vendor_folders, target_directory: str
+    ) -> list[dict]:
+        """Keep a model-proposed domain only if its member folders are real, filtered
+        application roots -- validated by the group's *folders*, not by whether the domain's
+        display name happens to match a folder name (a multi-root domain like "Fuel supply
+        and injection" is never itself a folder, so name-matching rejected every valid
+        grouped domain the model produced)."""
+        valid_roots = {
+            root.casefold() for root in cls._filter_application_roots(roots, vendor_folders, target_directory)
+        }
+        validated = []
+        for group in groups:
+            kept = [folder for folder in group.get("folders", []) if folder.casefold() in valid_roots]
+            if not kept:
+                continue
+            validated.append({**group, "folders": kept})
+        return validated
 
     @classmethod
     def _filter_application_folders(
@@ -722,23 +718,28 @@ class DiscoveryPhase:
             config_json["application_roots"],
         )
         config_json["modules"] = DiscoveryPhase._filter_module_names(config_json.get("modules", []))
-        model_domains = DiscoveryPhase._list_values(
+        model_domain_groups = DiscoveryPhase._extract_domain_groups(
             config_json.get("application_domains"),
             config_json.get("app_domain_guesses"),
             config_json.get("app_domains"),
         )
-        derived_domains = DiscoveryPhase._derive_app_domains(
-            {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+        validated_domain_groups = DiscoveryPhase._validate_domain_groups(
+            model_domain_groups, config_json["application_roots"], config_json["vendor_folders"], target_directory,
         )
-        config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
-            DiscoveryPhase._validate_application_domains(
-                model_domains,
-                target_directory,
-                config_json["application_roots"],
-                config_json["vendor_folders"],
-            ),
-            derived_domains,
-        )
+        if validated_domain_groups:
+            config_json["application_domains"] = validated_domain_groups
+            config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
+                *[group["folders"] for group in validated_domain_groups]
+            )
+        else:
+            derived_domains = DiscoveryPhase._derive_app_domains(
+                {**config_json, "application_domains": [], "app_domain_guesses": [], "app_domains": []}
+            )
+            config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(derived_domains)
+            config_json["application_domains"] = [
+                {"name": domain, "folders": [domain], "evidence": [], "confidence": 0.0}
+                for domain in config_json["app_domain_guesses"]
+            ]
         if not DiscoveryPhase._has_conventional_application_root(config_json["application_roots"]):
             config_json["app_domain_guesses"] = DiscoveryPhase._merge_folder_values(
                 config_json["app_domain_guesses"],
